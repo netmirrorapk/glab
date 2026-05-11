@@ -791,32 +791,51 @@ class ExtensionWorker:
                 except Exception as e:
                     return None, f"Reference upload failed: {str(e)[:200]}"
 
-            # Image gen — restored to the EXACT pattern from the user's
-            # original working zip (extension v1.0.0). aiohttp direct,
-            # bare headers (no origin/referer), recaptchaContext only
-            # if a token came back from the bridge. This is the build
-            # the user confirmed handled image generation perfectly.
-            # Sticking with EXECUTE_FETCH for video — that path needs
-            # signed Chrome headers — but image goes the simple aiohttp
-            # route here. Uses _make_aiohttp_session so the certifi SSL
-            # fix from today's d2ccce2 still applies.
-            client_context = {
+            # Image gen — May 2026: Google tightened reCAPTCHA score
+            # threshold on the image endpoint to match video's level.
+            # The old "aiohttp direct + cached-pool token" route now
+            # gets uniformly rejected with "Score Too Low" because:
+            #   1. Cached pool tokens are minted by the background
+            #      warmup loop with no real DOM interaction signal,
+            #      so Google scores them at the floor.
+            #   2. aiohttp can't reproduce Chrome's signed headers
+            #      (x-browser-validation, x-client-data, sec-fetch-*),
+            #      so the server-side validator treats the request
+            #      as bot-origin even if the token itself is valid.
+            # Switching to the same EXECUTE_FETCH route the video
+            # endpoint uses fixes both: extension MAIN world mints
+            # a fresh token at submit time (high score, mirrors what
+            # labs.google's own UI does on Submit click) and Chrome
+            # auto-attaches all the right headers because the fetch
+            # originates from inside the labs.google tab.
+            #
+            # Token placeholder is required at both injection paths —
+            # the extension's setAtPath skips paths whose parent
+            # object doesn't exist, so we pre-create recaptchaContext
+            # at both root and requests[0] for the inject to land.
+            recaptcha_placeholder = {
+                "token": "",
+                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+            }
+            client_context_root = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
                 "sessionId": f";{int(time.time() * 1000)}",
+                "recaptchaContext": dict(recaptcha_placeholder),
             }
-            if token:
-                client_context["recaptchaContext"] = {
-                    "token": token,
-                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                }
+            client_context_req = {
+                "projectId": project_id,
+                "tool": "PINHOLE",
+                "sessionId": client_context_root["sessionId"],
+                "recaptchaContext": dict(recaptcha_placeholder),
+            }
 
             body = {
-                "clientContext": client_context,
+                "clientContext": client_context_root,
                 "mediaGenerationContext": {"batchId": batch_id},
                 "useNewMedia": True,
                 "requests": [{
-                    "clientContext": client_context,
+                    "clientContext": client_context_req,
                     "imageModelName": api_model,
                     "imageAspectRatio": api_ratio,
                     "structuredPrompt": {"parts": [{"text": prompt_text}]},
@@ -830,25 +849,35 @@ class ExtensionWorker:
             }
 
             url = IMAGE_API_URL.format(project_id=project_id)
-            async with _make_aiohttp_session() as session:
-                async with session.post(
-                    url,
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                    },
-                    data=json.dumps(body),
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    resp_text = await resp.text()
+            fetch_result = await self._bridge.request_api_fetch(
+                account=self.account_email,
+                url=url,
+                method="POST",
+                body=json.dumps(body),
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                recaptcha_action="IMAGE_GENERATION",
+                inject_recaptcha_path=(
+                    "clientContext.recaptchaContext.token;"
+                    "requests.0.clientContext.recaptchaContext.token"
+                ),
+                timeout=120,
+            )
+            if fetch_result.get("error"):
+                return None, f"Bridge error: {fetch_result['error']}"
 
-                    if not resp.ok:
-                        return None, _parse_api_error(resp.status, resp_text)
+            status = fetch_result.get("status") or 0
+            resp_text = fetch_result.get("body", "")
 
-                    try:
-                        data = json.loads(resp_text)
-                    except json.JSONDecodeError:
-                        return None, f"Invalid JSON response: {resp_text[:200]}"
+            if status < 200 or status >= 300:
+                return None, _parse_api_error(status, resp_text)
+
+            try:
+                data = json.loads(resp_text)
+            except json.JSONDecodeError:
+                return None, f"Invalid JSON response: {resp_text[:200]}"
 
             self.jobs_completed += 1
             return data, None
