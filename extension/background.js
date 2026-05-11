@@ -2117,18 +2117,42 @@ async function installFlowRecaptchaWarmup() {
           window.__glabsRecaptchaWarmupActive = true;
 
           const ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
-          // Fast warmup cadence — Google's reCAPTCHA Enterprise scores
-          // a tab based on recent activity. With a slow loop (20-40s)
-          // the baseline score decays between real requests and Google
-          // returns 429 "reCAPTCHA evaluation failed" or 400 "Score Too
-          // Low" for the actual image/video API calls even when the
-          // token itself is freshly minted. 1.5-3.5s matches real
-          // labs.google page behavior (execute() fires in tight
-          // clusters throughout normal UI interaction) and keeps the
-          // score above threshold during bulk runs. This was the
-          // original cadence that supported 15-20 parallel image gen.
-          const MIN_DELAY_MS = 1500;
-          const MAX_DELAY_MS = 3500;
+          // Slowed warmup cadence — UPDATED May 2026.
+          //
+          // Original cadence (1.5-3.5s) was chosen back when:
+          //   1) Tokens went into a cached pool that submission code
+          //      consumed via Python aiohttp, and
+          //   2) The API call originated outside the labs.google tab
+          //      so Google's score model rejected isolated/cold tokens.
+          // In that world the loop kept the tab's per-session score
+          // primed so cached pool tokens passed validation.
+          //
+          // Both preconditions are gone now. After the 2026-05-11 fix,
+          // every real submission mints its own fresh reCAPTCHA token
+          // at submit time INSIDE the labs.google tab via the same
+          // EXECUTE_FETCH path the video endpoint uses, with full
+          // Chrome-signed headers. So the warmup pool tokens are no
+          // longer used by submission code at all.
+          //
+          // Meanwhile the high cadence is now actively harmful: ~25-40
+          // execute() calls per minute per tab, with almost none of
+          // those tokens consumed, looks like a bot signature to
+          // Google's reCAPTCHA Enterprise model. Production logs from
+          // a 41-image run showed pool sizes hitting 54 IMAGE + 140
+          // VIDEO captures (≈194 wasted execute() calls vs 41 real
+          // submissions) — a 5× ratio of unused-to-used token mints.
+          // Right after that imbalance accumulated, Google flipped the
+          // account into a "reCAPTCHA evaluation failed" 429 cooldown.
+          //
+          // 30-60s matches roughly how often a real labs.google user's
+          // own page code naturally re-runs execute() during active
+          // use (hovers, focus changes, model picks) — high enough to
+          // signal "this tab is alive" but low enough that we're not
+          // overwhelmingly out of distribution. Fresh-mint at submit
+          // time handles the actual score requirement for the real
+          // POST.
+          const MIN_DELAY_MS = 30000;
+          const MAX_DELAY_MS = 60000;
 
           // Resolve the site key the same way our token code does, but
           // lazy — don't crash if the page hasn't fully loaded yet.
