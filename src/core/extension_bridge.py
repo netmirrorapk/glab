@@ -65,16 +65,39 @@ class ExtensionBridge:
         # the same warm account.
         self._token_pool: Dict[tuple, deque] = {}     # (account, action) -> deque of {token, access_token, project_id, ts}
         self._prefetch_requests: Dict[str, tuple] = {}  # prefetch_request_id -> (account, action)
-        # Restored from Apr 19 working build (db900f5) that processed
-        # 150+ videos cleanly. Target=10 is the proven value — today's
-        # 0/3/5 detours were all wrong. Pool tokens + the background
-        # warmup loop are how Google's reCAPTCHA score stays primed.
-        self.TOKEN_POOL_TARGET = 10
+        # Per-(account, action) last-used timestamp. Pre-fetch only refills
+        # actions that have been used recently — keeping VIDEO pool warm
+        # during an image-only batch (and vice versa) just leaks execute()
+        # calls to Google's risk model while never consuming the tokens.
+        # See PREFETCH_RECENCY_S below for the gating window.
+        self._action_last_used: Dict[tuple, float] = {}  # (account, action) -> ts
+        # Pool sizing — UPDATED May 2026.
+        #
+        # Was 10 (set Apr 19) to keep tokens hot for the old aiohttp-direct
+        # submission path. That path was retired on 2026-05-11 in favor of
+        # extension MAIN-world fresh-mint at submit time, so the pool is
+        # now consulted only for cached access_token + project_id; its
+        # reCAPTCHA token is discarded by callers. A high target therefore
+        # forces background refills (one execute() per refill) for tokens
+        # nobody will use — production logs from a 37-image run showed the
+        # VIDEO pool refilling itself to ~90 entries (cycling through 90s
+        # expiries) while zero video jobs ran. That waste is exactly the
+        # "isolated execute() spam" signature reCAPTCHA Enterprise flags.
+        #
+        # Target=2 keeps a small just-in-time pool so first-request latency
+        # stays low for either action, while letting unused-action pools
+        # decay to zero between bursts.
+        self.TOKEN_POOL_TARGET = 2
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
-        # Which actions to keep prefetched. Both image and video are common
-        # enough to benefit from a hot pool; less-common actions fall through
-        # to live token requests.
+        # Which actions are ELIGIBLE for pre-fetch — actual refill also
+        # gated on per-(account, action) recency via _action_last_used.
         self.PREFETCH_ACTIONS = ("IMAGE_GENERATION", "VIDEO_GENERATION")
+        # Pre-fetch is skipped for actions whose last-used timestamp is
+        # older than this. 5 minutes is long enough that a mid-batch
+        # cadence of image and video jobs keeps both pools alive, short
+        # enough that a single-mode batch (image-only or video-only) lets
+        # the unused pool go cold within a few minutes.
+        self.PREFETCH_RECENCY_S = 300.0
 
         # Stats
         self._tokens_received = 0
@@ -193,6 +216,13 @@ class ExtensionBridge:
                 "seconds_remaining": info["seconds_remaining"],
             }
 
+        # Mark this (account, action) as recently active so the pre-fetch
+        # loop in _handle_poll knows to keep its pool warm. Actions that
+        # nobody asks for don't get pre-fetched and the unused-pool refill
+        # cycle (which leaks execute() calls to Google for tokens we never
+        # use) stops accumulating.
+        self._action_last_used[(account, action)] = time.time()
+
         # ─── Check token pool first ───
         # Action-scoped lookup — IMAGE_GENERATION and VIDEO_GENERATION
         # tokens live in separate pools so we never serve the wrong type.
@@ -275,6 +305,14 @@ class ExtensionBridge:
                 "error": f"account_held:{info['seconds_remaining']}s_remaining",
                 "held": True,
             }
+
+        # Mark this (account, action) as recently active for the same
+        # reason as in request_token() — but only when the fetch actually
+        # involves a fresh-mint at submit time (recaptcha_action set).
+        # Otherwise the call is just a passthrough fetch (e.g. video
+        # status poll) that doesn't need pre-fetched pool tokens.
+        if recaptcha_action:
+            self._action_last_used[(account, str(recaptcha_action))] = time.time()
 
         # Acquire the per-account EXECUTE_FETCH slot — prevents burst
         # traffic from choking the single Chrome scripting channel per
@@ -427,9 +465,14 @@ class ExtensionBridge:
 
         # ─── Token Pool Pre-fetch ───
         # If no real work pending, pre-fetch tokens to keep the pool topped
-        # up. Loop over both image and video actions per account so the
-        # video pool isn't permanently empty (which would force every video
-        # job through a slow live token request).
+        # up — but ONLY for (account, action) pairs that have been used in
+        # the last PREFETCH_RECENCY_S seconds. Without that gate the bridge
+        # spends every quiet poll refilling pools that nobody consumes
+        # (e.g. the VIDEO pool during an image-only batch), which leaks
+        # one execute() call per refill cycle to Google's risk model for
+        # tokens nobody will use. Each unused execute() is a load-bearing
+        # bot signal — eliminating them dropped the pre-429 image budget
+        # significantly in production testing.
         if response_data["work"] is None:
             now = time.time()
             picked = False
@@ -437,6 +480,13 @@ class ExtensionBridge:
                 if picked:
                     break
                 for action in self.PREFETCH_ACTIONS:
+                    last_used = self._action_last_used.get((account, action), 0.0)
+                    if now - last_used > self.PREFETCH_RECENCY_S:
+                        # Action hasn't been requested in a while — let its
+                        # pool decay naturally. When the next real call to
+                        # request_token() lands, _action_last_used is set
+                        # and the very next poll resumes pre-fetch.
+                        continue
                     pool = self._token_pool.get((account, action), deque())
                     valid_count = sum(
                         1 for t in pool if (now - t["ts"]) < self.TOKEN_MAX_AGE
