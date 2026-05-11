@@ -204,10 +204,14 @@ def _ensure_db_schema(conn):
         )
 
     legacy_default_updates = {
-        # Migration: old defaults of 2 or 3 (before the Fluent UI
-        # redesign) now bump to 5. Users who explicitly chose other
-        # values (1, 4, 6, etc.) are left alone.
-        "slots_per_account": {("2", "2.0", "3", "3.0"): "5"},
+        # NOTE: slots_per_account migration was REMOVED here. The intent
+        # was to push pre-Fluent-UI users from the old default of 2/3 to
+        # the new default of 5, but ensure_db() runs on every DB
+        # connection — so explicitly-chosen 2/3 from the UI slider got
+        # silently overwritten to 5 right after the user saved it.
+        # Result: Parallel slider was non-functional for any value of
+        # 2 or 3. Removed entirely — old-default users stay at 2/3
+        # (still functional), new installs get 5 via DEFAULT_APP_SETTINGS.
         "same_account_stagger_seconds": {("1.5", "3", "3.0"): "1.0"},
         "global_stagger_min_seconds": {("0.5", "1", "1.0"): "0.3"},
         "global_stagger_max_seconds": {("1.0", "3", "3.0"): "0.6"},
