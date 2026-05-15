@@ -848,36 +848,87 @@ class ExtensionWorker:
                 }],
             }
 
-            url = IMAGE_API_URL.format(project_id=project_id)
-            fetch_result = await self._bridge.request_api_fetch(
-                account=self.account_email,
-                url=url,
-                method="POST",
-                body=json.dumps(body),
-                headers={
-                    "content-type": "text/plain;charset=UTF-8",
-                    "authorization": f"Bearer {access_token}",
-                },
-                recaptcha_action="IMAGE_GENERATION",
-                inject_recaptcha_path=(
-                    "clientContext.recaptchaContext.token;"
-                    "requests.0.clientContext.recaptchaContext.token"
-                ),
-                timeout=120,
-            )
-            if fetch_result.get("error"):
-                return None, f"Bridge error: {fetch_result['error']}"
+            # We submit through EXECUTE_FETCH and, on a 429, fall through
+            # to a single in-place retry against a fresh project. The
+            # outer queue's retry/backoff still wraps this call, but
+            # transparent project rotation avoids surfacing the user-
+            # visible "429 strike" cascade for the well-understood
+            # case of "this project's quota is just exhausted".
+            attempts_left = 2
+            data = None
+            err_msg = None
+            while attempts_left > 0:
+                attempts_left -= 1
 
-            status = fetch_result.get("status") or 0
-            resp_text = fetch_result.get("body", "")
+                # client_context_root + _req both already reference the
+                # current project_id from outer scope. On retry after a
+                # burn we update project_id below and rebuild the body
+                # once before re-issuing the POST.
 
-            if status < 200 or status >= 300:
-                return None, _parse_api_error(status, resp_text)
+                url = IMAGE_API_URL.format(project_id=project_id)
+                fetch_result = await self._bridge.request_api_fetch(
+                    account=self.account_email,
+                    url=url,
+                    method="POST",
+                    body=json.dumps(body),
+                    headers={
+                        "content-type": "text/plain;charset=UTF-8",
+                        "authorization": f"Bearer {access_token}",
+                    },
+                    recaptcha_action="IMAGE_GENERATION",
+                    inject_recaptcha_path=(
+                        "clientContext.recaptchaContext.token;"
+                        "requests.0.clientContext.recaptchaContext.token"
+                    ),
+                    timeout=120,
+                )
+                if fetch_result.get("error"):
+                    return None, f"Bridge error: {fetch_result['error']}"
 
-            try:
-                data = json.loads(resp_text)
-            except json.JSONDecodeError:
-                return None, f"Invalid JSON response: {resp_text[:200]}"
+                status = fetch_result.get("status") or 0
+                resp_text = fetch_result.get("body", "")
+
+                if status == 429 and attempts_left > 0:
+                    # Per-project quota exhausted. Burn this project so
+                    # the rest of the worker pool stops using it, resolve
+                    # a fresh project (skipping burned ones, or creating
+                    # a new one if all are cool-down), rebuild the body
+                    # with the new projectId, and retry once.
+                    self._log(
+                        f"[{self.slot_id}] 429 on project {project_id} — "
+                        "burning and rotating to a fresh project."
+                    )
+                    self._bridge.burn_project(self.account_email, project_id)
+                    new_project_id = await self._resolve_project_id(access_token)
+                    if not new_project_id or new_project_id == project_id:
+                        # Couldn't rotate — surface the 429 to outer retry
+                        err_msg = _parse_api_error(status, resp_text)
+                        break
+                    project_id = new_project_id
+                    # Update both clientContext copies to point at the
+                    # fresh project. The body dict is otherwise unchanged
+                    # so the fresh reCAPTCHA token slot stays in place.
+                    client_context_root["projectId"] = project_id
+                    client_context_req["projectId"] = project_id
+                    body["requests"][0]["clientContext"] = client_context_req
+                    continue
+
+                if status < 200 or status >= 300:
+                    err_msg = _parse_api_error(status, resp_text)
+                    break
+
+                try:
+                    data = json.loads(resp_text)
+                    err_msg = None
+                    break
+                except json.JSONDecodeError:
+                    err_msg = f"Invalid JSON response: {resp_text[:200]}"
+                    break
+
+            if err_msg:
+                return None, err_msg
+            if data is None:
+                return None, "Image submission returned no data after rotation."
 
             self.jobs_completed += 1
             return data, None
@@ -1199,7 +1250,34 @@ class ExtensionWorker:
             return project_id
 
     async def _create_project(self, access_token):
-        """Get or create a Labs project via multiple API fallbacks."""
+        """Get or create a Labs project via multiple API fallbacks.
+
+        IMPORTANT (May 2026): Flow's rate limit is per-PROJECT, not
+        per-account. Once a project burns through its quota, every
+        subsequent submission on it returns 429 — but the SAME account
+        with a freshly created project starts working immediately.
+        Users were doing this dance manually (close app → new project
+        in UI → restart → another 30-100 images), so we automate it
+        here: each candidate from the projects list is checked against
+        bridge.is_project_burned(), and if all known projects are
+        cooling down the extension is asked to create a fresh one.
+        """
+        import re as _re
+
+        def _extract_pid(raw):
+            if not raw:
+                return ""
+            m = _re.search(r"([a-z0-9-]{16,})", str(raw), _re.IGNORECASE)
+            return m.group(1) if m else ""
+
+        def _pick_unburned(pids):
+            for pid in pids:
+                if not pid:
+                    continue
+                if not self._bridge.is_project_burned(self.account_email, pid):
+                    return pid
+            return ""
+
         headers = {"authorization": f"Bearer {access_token}"}
 
         # ── Method 1: List projects via aisandbox API ──
@@ -1214,13 +1292,22 @@ class ExtensionWorker:
                         data = await resp.json()
                         projects = data.get("projects", data.get("project", []))
                         if isinstance(projects, list) and projects:
-                            import re as _re
-                            pname = projects[0].get("name", "") or projects[0].get("projectId", "")
-                            m = _re.search(r"([a-z0-9-]{16,})", pname, _re.IGNORECASE)
-                            if m:
-                                pid = m.group(1)
-                                self._log(f"[{self.slot_id}] Project from API: {pid}")
+                            candidates = [
+                                _extract_pid(p.get("name", "") or p.get("projectId", ""))
+                                for p in projects
+                            ]
+                            pid = _pick_unburned(candidates)
+                            if pid:
+                                self._log(
+                                    f"[{self.slot_id}] Project from API: {pid} "
+                                    f"(skipped {sum(1 for c in candidates if c and c != pid and self._bridge.is_project_burned(self.account_email, c))} burned)"
+                                )
                                 return pid
+                            if candidates:
+                                self._log(
+                                    f"[{self.slot_id}] All {len([c for c in candidates if c])} listed project(s) "
+                                    "are in 429 cooldown — creating fresh project."
+                                )
         except Exception as e:
             self._log(f"[{self.slot_id}] Projects API error: {str(e)[:80]}")
 
@@ -1236,7 +1323,8 @@ class ExtensionWorker:
                         data = await resp.json()
                         flows = data.get("result", {}).get("data", {}).get("flows", [])
                         if flows:
-                            pid = flows[0].get("name", "")
+                            candidates = [str(f.get("name", "")) for f in flows]
+                            pid = _pick_unburned(candidates)
                             if pid:
                                 self._log(f"[{self.slot_id}] Project from listFlows: {pid}")
                                 return pid
@@ -1244,6 +1332,8 @@ class ExtensionWorker:
             pass
 
         # ── Method 3: Ask extension to click "New project" ──
+        # Clear bridge's cached project_id so the post-back from extension
+        # overwrites the stale (potentially burned) value cleanly.
         self._bridge.send_command("new_project", self.account_email)
         await asyncio.sleep(5)
         return self._bridge.get_project_id(self.account_email)

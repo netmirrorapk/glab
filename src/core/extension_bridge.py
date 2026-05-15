@@ -47,6 +47,15 @@ class ExtensionBridge:
 
         # Project IDs from extension
         self._project_ids: Dict[str, str] = {}  # account_email -> project_id
+        # Per-account dict of {project_id: burned_at_ts}. A project enters
+        # this map when Flow returns 429 against a submission using it —
+        # see burn_project() / get_project_id() for rotation behavior.
+        self._burned_projects: Dict[str, Dict[str, float]] = {}
+        # How long a burned project stays quarantined. Google's per-project
+        # quota appears to refill within ~30-60 minutes in production
+        # testing; 30 min is the conservative choice. Burned projects past
+        # this window become eligible again on the next resolve cycle.
+        self.PROJECT_BURN_COOLDOWN_S = 30 * 60
 
         # Pending commands for extension
         self._pending_commands = []
@@ -366,12 +375,53 @@ class ExtensionBridge:
         return dict(self._connected_accounts)
 
     def get_project_id(self, account: str) -> Optional[str]:
-        """Get cached project ID for an account."""
-        return self._project_ids.get(account)
+        """Get cached project ID for an account, or None if the cached one
+        is currently in 429-cooldown.
+
+        Empirical finding (May 2026 user report): Google Labs Flow's
+        rate limit is scoped to projectId, not to the user account.
+        When a project hits ~30-150 successful submissions Google starts
+        429-ing every subsequent request on THAT project regardless of
+        score — but creating a fresh project on the same account
+        immediately starts working again. burn_project() captures that
+        behavior so the dispatch loop rotates projects automatically.
+        """
+        pid = self._project_ids.get(account)
+        if not pid:
+            return None
+        burn_ts = self._burned_projects.get(account, {}).get(pid, 0.0)
+        if burn_ts and (time.time() - burn_ts) < self.PROJECT_BURN_COOLDOWN_S:
+            return None
+        return pid
 
     def set_project_id(self, account: str, project_id: str):
         """Cache a project ID for an account."""
         self._project_ids[account] = project_id
+
+    def burn_project(self, account: str, project_id: str):
+        """Mark a project as rate-limit-exhausted for PROJECT_BURN_COOLDOWN_S.
+
+        Called when a submission returns 429 — the project that's
+        currently associated with this account gets quarantined so the
+        next request_token / _resolve_project_id call picks a different
+        one (or triggers extension to create a fresh project via the
+        "new_project" command).
+        """
+        if not account or not project_id:
+            return
+        bucket = self._burned_projects.setdefault(account, {})
+        bucket[project_id] = time.time()
+        # Drop the cached pointer so the next get_project_id() returns
+        # None and the caller routes through _resolve_project_id().
+        if self._project_ids.get(account) == project_id:
+            self._project_ids.pop(account, None)
+
+    def is_project_burned(self, account: str, project_id: str) -> bool:
+        """True if project_id is within its 429 cooldown window."""
+        if not account or not project_id:
+            return False
+        burn_ts = self._burned_projects.get(account, {}).get(project_id, 0.0)
+        return bool(burn_ts and (time.time() - burn_ts) < self.PROJECT_BURN_COOLDOWN_S)
 
     @property
     def is_extension_connected(self) -> bool:
