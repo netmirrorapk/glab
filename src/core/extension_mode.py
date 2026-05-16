@@ -880,7 +880,17 @@ class ExtensionWorker:
                         "clientContext.recaptchaContext.token;"
                         "requests.0.clientContext.recaptchaContext.token"
                     ),
-                    timeout=120,
+                    # 180s (was 120s) to absorb Chrome's background-tab
+                    # JS throttling. When the user's automation tabs sit
+                    # in the background, Chrome's energy saver throttles
+                    # JS execution + fetch() handling — a normally-25s
+                    # image submission can stretch to 90-150s on the
+                    # throttled tab. With multi-worker queueing the slow
+                    # tab piles up and hits the 120s ceiling. Bumping to
+                    # 180s catches the long tail without changing the
+                    # safety semantics (still a hard upper bound for a
+                    # genuinely stuck request).
+                    timeout=180,
                 )
                 if fetch_result.get("error"):
                     return None, f"Bridge error: {fetch_result['error']}"
