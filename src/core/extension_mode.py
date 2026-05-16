@@ -908,6 +908,11 @@ class ExtensionWorker:
                     #     next attempt. Definitely pre-Google failure — safe to retry.
                     #   - "no_recaptcha_enterprise"    — tab's grecaptcha global is gone
                     #     (page navigated). Will be present again on the alt tab.
+                    #   - "no_script_result"           — chrome.scripting.executeScript
+                    #     returned an empty results array, which happens when the injected
+                    #     MAIN-world async function never resolved (frame removed mid-
+                    #     execute, page navigated before the fetch resolved). Same class
+                    #     as the above — Google never received the request.
                     #
                     # Anything else (timeout, account_held, no_sitekey, etc.) is treated
                     # as "Google may have received the request" and surfaced to the outer
@@ -919,6 +924,7 @@ class ExtensionWorker:
                         or "execute_fetch_threw" in err_lower
                         or "frame with id" in err_lower
                         or "no_recaptcha_enterprise" in err_lower
+                        or "no_script_result" in err_lower
                     )
                     if safe_to_retry and attempts_left > 0:
                         self._log(
