@@ -854,7 +854,10 @@ class ExtensionWorker:
             # transparent project rotation avoids surfacing the user-
             # visible "429 strike" cascade for the well-understood
             # case of "this project's quota is just exhausted".
-            attempts_left = 2
+            # 3 attempts so we have room for one 429-burn rotation AND one
+            # transient-bridge-error retry on top of the initial try without
+            # running out of budget. Each branch below consumes one attempt.
+            attempts_left = 3
             data = None
             err_msg = None
             while attempts_left > 0:
@@ -892,8 +895,39 @@ class ExtensionWorker:
                     # genuinely stuck request).
                     timeout=180,
                 )
-                if fetch_result.get("error"):
-                    return None, f"Bridge error: {fetch_result['error']}"
+                err = fetch_result.get("error") or ""
+                if err:
+                    # Classify the bridge-side failure:
+                    #   - "fetch_failed: ..."           — native fetch() in MAIN world threw
+                    #     before the request ever left the browser. Google did NOT receive
+                    #     the request — safe to retry on a different tab.
+                    #   - "execute_fetch_threw: Frame with ID 0 was removed."
+                    #                                  — the labs.google tab was discarded
+                    #     by Chrome (energy saver / memory) or crashed mid-execute. The
+                    #     extension's findLabsTab() will pick a different tab on the
+                    #     next attempt. Definitely pre-Google failure — safe to retry.
+                    #   - "no_recaptcha_enterprise"    — tab's grecaptcha global is gone
+                    #     (page navigated). Will be present again on the alt tab.
+                    #
+                    # Anything else (timeout, account_held, no_sitekey, etc.) is treated
+                    # as "Google may have received the request" and surfaced to the outer
+                    # queue's retry/dedup logic — DON'T retry transparently because that
+                    # risks duplicate generation.
+                    err_lower = err.lower()
+                    safe_to_retry = (
+                        "fetch_failed" in err_lower
+                        or "execute_fetch_threw" in err_lower
+                        or "frame with id" in err_lower
+                        or "no_recaptcha_enterprise" in err_lower
+                    )
+                    if safe_to_retry and attempts_left > 0:
+                        self._log(
+                            f"[{self.slot_id}] Transient bridge error "
+                            f"({err[:100]}) — retrying in 2s..."
+                        )
+                        await asyncio.sleep(2)
+                        continue
+                    return None, f"Bridge error: {err}"
 
                 status = fetch_result.get("status") or 0
                 resp_text = fetch_result.get("body", "")
