@@ -2381,25 +2381,6 @@ async function installFlowAntiThrottle() {
           window.__glabsFlowAntiThrottleInstalled = true;
 
           // ─── Silent audio loop to keep the tab "audible" ───
-          //
-          // NOTE (May 2026): we used to ALSO override document.hidden /
-          // visibilityState to force "visible" — copied from
-          // grokInstallAntiThrottle where it works fine. On labs.google
-          // this caused a different problem: production logs showed
-          // every reCAPTCHA token immediately scoring below threshold
-          // ("reCAPTCHA Score Too Low" cascade) after the override was
-          // installed, even though manual generation from the same tab
-          // still worked. Hypothesis: reCAPTCHA Enterprise fingerprints
-          // the page's visibility-state behavior — natural pages
-          // alternate between hidden/visible as the user backgrounds
-          // the tab, but our override locks "visible" forever, which
-          // is inconsistent with other signals (focus/blur events,
-          // requestAnimationFrame throttling, etc.) and looks like a
-          // synthetic environment.
-          //
-          // Removed the override. Silent audio alone is enough to
-          // prevent Memory Saver discard and is what Discord / Slack /
-          // Meet / Spotify Web use without the visibility hack.
           try {
             const Ctor = window.AudioContext || window.webkitAudioContext;
             if (Ctor) {
@@ -2425,8 +2406,31 @@ async function installFlowAntiThrottle() {
               );
             }
           } catch (e) {
-            // Audio creation failed — nothing else to do; tab stays
-            // discardable as it was before this commit landed.
+            // Audio path failed — visibility override below still helps
+            // some throttle paths (page-level visibility-based pausing).
+          }
+
+          // ─── Override visibility so page code thinks tab is visible ───
+          try {
+            Object.defineProperty(document, "hidden", {
+              configurable: true,
+              get: () => false,
+            });
+            Object.defineProperty(document, "visibilityState", {
+              configurable: true,
+              get: () => "visible",
+            });
+            Object.defineProperty(document, "webkitHidden", {
+              configurable: true,
+              get: () => false,
+            });
+            Object.defineProperty(document, "webkitVisibilityState", {
+              configurable: true,
+              get: () => "visible",
+            });
+            document.dispatchEvent(new Event("visibilitychange"));
+          } catch (e) {
+            // Already overridden — fine.
           }
 
           return { ok: true };
