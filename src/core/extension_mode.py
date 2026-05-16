@@ -1334,8 +1334,20 @@ class ExtensionWorker:
         # ── Method 3: Ask extension to click "New project" ──
         # Clear bridge's cached project_id so the post-back from extension
         # overwrites the stale (potentially burned) value cleanly.
+        # Extension flow now navigates tab → dashboard, waits for hydration,
+        # clicks, then waits for URL transition. Worst-case timing:
+        #   ~1s extension poll wait + ~15s tab navigation + ~1.5s settle +
+        #   up to 8s button-find poll + up to 8s URL transition wait
+        #   = ~33s ceiling. We wait 20s and let the extension finish
+        #   asynchronously; if the post-back lands later, the next
+        #   _resolve_project_id pass will pick it up.
+        pre_existing = self._bridge.get_project_id(self.account_email) or ""
         self._bridge.send_command("new_project", self.account_email)
-        await asyncio.sleep(5)
+        for _ in range(20):
+            await asyncio.sleep(1)
+            current = self._bridge.get_project_id(self.account_email) or ""
+            if current and current != pre_existing:
+                return current
         return self._bridge.get_project_id(self.account_email)
 
 

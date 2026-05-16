@@ -996,32 +996,138 @@ async function handleCommand(cmd) {
     case "new_project":
       if (tabId) {
         try {
+          // PROBLEM (May 2026 production diagnosis): the original
+          // implementation clicked whatever button on the page had
+          // text "New project". That worked when the tab was sitting
+          // on the flow dashboard, but our normal automation flow
+          // leaves the tab inside a project URL
+          // (https://labs.google/fx/tools/flow/project/<id>) where
+          // the "New project" CTA isn't surfaced in the same scope.
+          // The click then either no-oped (returning the same project
+          // ID) or hit some unrelated button, leaving the tab in a
+          // weird DOM state that cascaded into reCAPTCHA failures.
+          //
+          // Robust version: navigate the tab to the flow tool's home
+          // (the project picker), wait for the page to settle, try a
+          // ranked list of button-text variants, then wait for the URL
+          // to transition into a NEW project. Capture the new project
+          // ID from the URL and post it to the bridge. The tab will
+          // remain on the new project's URL — which is the right state
+          // for the next round of submissions.
+          const beforeUrl = await (async () => {
+            try {
+              const t = await chrome.tabs.get(tabId);
+              return String(t?.url || "");
+            } catch { return ""; }
+          })();
+          const beforeMatch = beforeUrl.match(/\/project\/([a-z0-9-]{16,})/i);
+          const oldPid = beforeMatch ? beforeMatch[1] : "";
+
+          // Step 1: navigate to the flow dashboard if we're not
+          // already there. We bail out of project-scoped URLs since
+          // the New-project CTA only renders on the picker.
+          if (!/\/fx\/tools\/flow\/?(\?|$)/i.test(beforeUrl)) {
+            try {
+              await chrome.tabs.update(tabId, {
+                url: "https://labs.google/fx/tools/flow",
+              });
+              // Wait for "complete" status. Cap at 15s.
+              const navDeadline = Date.now() + 15000;
+              while (Date.now() < navDeadline) {
+                await new Promise((r) => setTimeout(r, 400));
+                try {
+                  const t = await chrome.tabs.get(tabId);
+                  if (t?.status === "complete") break;
+                } catch { break; }
+              }
+              // Extra settle time — Next.js hydration etc.
+              await new Promise((r) => setTimeout(r, 1500));
+            } catch {}
+          }
+
+          // Step 2: click the New-project button inside the tab.
           const results = await chrome.scripting.executeScript({
             target: { tabId },
             world: "MAIN",
             func: async () => {
-              // Click "New project" button
-              const btn = document.querySelector('[data-testid="new-project"], button');
-              const allBtns = Array.from(document.querySelectorAll("button"));
-              const newProj = allBtns.find((b) => b.textContent?.trim() === "New project");
-              if (newProj) {
-                newProj.click();
-                await new Promise((r) => setTimeout(r, 3000));
-                const m = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
-                return m ? m[1] : null;
+              const visible = (el) => {
+                if (!el) return false;
+                if (el.offsetParent === null) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 4 && r.height > 4;
+              };
+              const buttonTextMatches = (b) => {
+                const t = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+                return (
+                  t === "new project"
+                  || t === "+ new project"
+                  || t === "create new project"
+                  || t === "create project"
+                  || t === "new flow"
+                  || t === "+ new"
+                  || t.startsWith("new project")
+                );
+              };
+              const findBtn = () => {
+                const direct = document.querySelector(
+                  '[data-testid="new-project"], [data-testid="create-project"], '
+                  + '[aria-label="New project"], [aria-label="Create new project"]'
+                );
+                if (direct && visible(direct)) return direct;
+                const all = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                return all.find((b) => visible(b) && buttonTextMatches(b)) || null;
+              };
+
+              let btn = findBtn();
+              // If not found immediately, poll for up to 8s — page may
+              // still be hydrating React after the navigation.
+              const findDeadline = Date.now() + 8000;
+              while (!btn && Date.now() < findDeadline) {
+                await new Promise((r) => setTimeout(r, 250));
+                btn = findBtn();
               }
-              return null;
+              if (!btn) return { error: "new_project_button_not_found" };
+              btn.click();
+
+              // Wait for URL to transition into a NEW project (different
+              // from any pre-existing project id in the URL). 8 second
+              // budget covers slow networks.
+              const oldMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+              const oldId = oldMatch ? oldMatch[1] : "";
+              const urlDeadline = Date.now() + 8000;
+              while (Date.now() < urlDeadline) {
+                await new Promise((r) => setTimeout(r, 250));
+                const m = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+                if (m && m[1] && m[1] !== oldId) {
+                  return { ok: true, pid: m[1] };
+                }
+              }
+              const final = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+              return final
+                ? { error: "url_no_transition", pid: final[1] }
+                : { error: "no_project_in_url" };
             },
           });
-          const pid = results?.[0]?.result;
+
+          const result = results?.[0]?.result;
+          const pid = result?.pid && result.pid !== oldPid ? result.pid : "";
           if (pid) {
             await fetch(`${BRIDGE_URL}/project`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ account, project_id: pid }),
             });
+            console.log(`[G-Labs Helper] new_project: created ${pid} for ${account}`);
+          } else {
+            console.warn(
+              `[G-Labs Helper] new_project failed for ${account}: `
+              + (result?.error || "unknown")
+              + (result?.pid ? ` (pid=${result.pid}, oldPid=${oldPid})` : "")
+            );
           }
-        } catch {}
+        } catch (e) {
+          console.warn(`[G-Labs Helper] new_project exception:`, e?.message || e);
+        }
       }
       break;
   }
