@@ -2338,110 +2338,6 @@ async function installFlowRecaptchaWarmup() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Flow anti-throttle — keep labs.google tabs from being discarded
-// ═══════════════════════════════════════════════════════════════════
-//
-// Symptom in production logs: after ~30-50 successful image submissions,
-// one of the labs.google tabs would silently die mid-batch. Bridge
-// would start returning "execute_fetch_threw: Frame with ID 0 was
-// removed." (Chrome discarded the tab) and "fetch_failed: Failed to
-// fetch" (page reload while a request was in flight). With the dead
-// tab gone, the surviving tab piled up all 4 workers' worth of
-// fetches and timed out on the slowest ones.
-//
-// Chrome aggressively discards background tabs in Memory Saver / energy
-// saver mode and freezes background tab JS after a few minutes of
-// inactivity. Our automation looks "inactive" to Chrome — there's no
-// keypress, no mousemove, no focus.
-//
-// Workaround (same trick Discord/Slack/Meet use): play a fully-silent
-// Web Audio loop in the page. Chrome flags tabs with active audio as
-// "audible" and exempts them from freeze + discard. Also override
-// document.hidden/visibilityState so any page code that self-pauses
-// based on visibility keeps running.
-//
-// Idempotent — re-running on an already-installed tab returns
-// immediately via the window flag. We re-run after every navigation
-// because the page reload wipes the flag.
-async function installFlowAntiThrottle() {
-  let tabs;
-  try {
-    tabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
-  } catch {
-    return;
-  }
-  for (const tab of tabs) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        world: "MAIN",
-        func: () => {
-          if (window.__glabsFlowAntiThrottleInstalled) return { already: true };
-          window.__glabsFlowAntiThrottleInstalled = true;
-
-          // ─── Silent audio loop to keep the tab "audible" ───
-          try {
-            const Ctor = window.AudioContext || window.webkitAudioContext;
-            if (Ctor) {
-              const ctx = new Ctor();
-              const osc = ctx.createOscillator();
-              const gain = ctx.createGain();
-              gain.gain.value = 0;          // truly silent
-              osc.frequency.value = 20;     // sub-audible anyway
-              osc.connect(gain).connect(ctx.destination);
-              osc.start();
-              window.__glabsFlowAntiThrottleCtx = ctx;
-              // AudioContext starts "suspended" until a user gesture in
-              // some Chrome configs. Try resume() now and again on the
-              // first interaction we can latch onto.
-              const tryResume = () => {
-                if (ctx.state !== "running") ctx.resume().catch(() => {});
-              };
-              tryResume();
-              ["click", "keydown", "touchstart", "visibilitychange"].forEach(
-                (ev) => document.addEventListener(ev, tryResume, {
-                  capture: true, passive: true,
-                })
-              );
-            }
-          } catch (e) {
-            // Audio path failed — visibility override below still helps
-            // some throttle paths (page-level visibility-based pausing).
-          }
-
-          // ─── Override visibility so page code thinks tab is visible ───
-          try {
-            Object.defineProperty(document, "hidden", {
-              configurable: true,
-              get: () => false,
-            });
-            Object.defineProperty(document, "visibilityState", {
-              configurable: true,
-              get: () => "visible",
-            });
-            Object.defineProperty(document, "webkitHidden", {
-              configurable: true,
-              get: () => false,
-            });
-            Object.defineProperty(document, "webkitVisibilityState", {
-              configurable: true,
-              get: () => "visible",
-            });
-            document.dispatchEvent(new Event("visibilitychange"));
-          } catch (e) {
-            // Already overridden — fine.
-          }
-
-          return { ok: true };
-        },
-      });
-    } catch {
-      // Tab not scriptable (chrome:// URL, closed mid-call, etc.) — skip.
-    }
-  }
-}
-
 // Re-run the installer every 30s so newly opened labs tabs pick up the
 // warmup. Idempotent because of the window.__glabsRecaptchaWarmupActive
 // flag — re-injecting an already-warm tab is a no-op.
@@ -2455,13 +2351,6 @@ async function installFlowAntiThrottle() {
 setInterval(installFlowRecaptchaWarmup, 30000);
 // First run after 5s so Chrome finishes loading the tab + reCAPTCHA SDK
 setTimeout(installFlowRecaptchaWarmup, 5000);
-
-// Anti-throttle: same cadence as warmup. Idempotent; re-runs become
-// no-ops after the first install in each tab, but pick up newly opened
-// tabs and re-install after navigations (the page reload wipes the
-// window flag, so the next interval re-attaches the silent audio).
-setInterval(installFlowAntiThrottle, 30000);
-setTimeout(installFlowAntiThrottle, 5000);
 
 // Also install warmup right after a labs.google tab finishes loading
 // (caught by the existing onUpdated listener below — see line ~1875).
@@ -2488,11 +2377,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     setTimeout(() => detectAccounts(), 3000);
     // Re-install warmup loop after reload (window flag was wiped).
     setTimeout(installFlowRecaptchaWarmup, 4000);
-    // Re-install the silent-audio anti-throttle too — the window flag
-    // got wiped by the navigation, so the tab is back to "discardable"
-    // until we re-attach. 2 second delay so the page's own AudioContext
-    // setup (if any) has settled.
-    setTimeout(installFlowAntiThrottle, 2000);
   }
 });
 
