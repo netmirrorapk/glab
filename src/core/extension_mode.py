@@ -1422,6 +1422,21 @@ class ExtensionModeManager:
         self._recaptcha_streak: Dict[str, int] = {}  # account -> consecutive recaptcha failures
         self.RECAPTCHA_HOLD_THRESHOLD = 3  # hold account after this many consecutive failures
 
+        # reCAPTCHA AUTO-RETRY cooldown — for users with rotating-IP VPNs
+        # (Surfshark, NordVPN, etc.). When Google flags an account, the flag
+        # is usually scoped to the current IP — once the VPN rotates to a
+        # fresh IP, the next reCAPTCHA call typically scores fine again.
+        # Old behavior was to PERMANENTLY disable the account on 3 strikes,
+        # which wasted the natural recovery from VPN rotation. New flow:
+        # set a short cooldown, auto-clear when it expires, retry. Track
+        # consecutive cooldown cycles so a genuinely flagged account
+        # (no VPN rotation helping) eventually falls back to the old
+        # permanent-hold behavior instead of looping forever.
+        self._recaptcha_cooldown_until: Dict[str, float] = {}  # account -> unix ts
+        self._recaptcha_cooldown_cycles: Dict[str, int] = {}   # account -> consecutive cycles
+        self.RECAPTCHA_COOLDOWN_SECONDS = 60        # 1-min cooldown between retries
+        self.RECAPTCHA_MAX_COOLDOWN_CYCLES = 30     # ~30 min of retries before giving up
+
         # ─── Auto tracking cleanup — keeps reCAPTCHA score healthy ───
         self._account_gen_count: Dict[str, int] = {}   # account -> generations since last cleanup
         self._account_last_cleanup: Dict[str, float] = {}  # account -> timestamp of last cleanup
@@ -1683,18 +1698,39 @@ class ExtensionModeManager:
             # Check account disabled (hard hold for auth errors etc.)
             # If account was reCAPTCHA-held AND user force-enabled it, bridge
             # returns is_account_held=False — allow dispatch despite qm flag.
+            #
+            # NEW (May 2026): if a reCAPTCHA cooldown was set and has now
+            # expired, clear the disable flag + reset streak so this
+            # dispatch goes through. Designed for VPN rotating-IP users
+            # where the flag was IP-scoped and the new IP usually scores
+            # fine. If the retry fails again, the 3-strike path below
+            # will re-arm cooldown for another cycle (up to MAX_CYCLES).
             if self.qm.account_disabled.get(account_email):
-                try:
-                    if not self._bridge.is_account_held(account_email):
-                        # Check if this is a force-enable override
-                        hold_info = self._bridge.get_hold_info(account_email)
-                        if hold_info.get("force_enabled"):
-                            pass  # user allowed it — fall through
+                cooldown_until = self._recaptcha_cooldown_until.get(account_email, 0.0)
+                if cooldown_until and time.time() >= cooldown_until:
+                    cycles = self._recaptcha_cooldown_cycles.get(account_email, 0)
+                    self._log(
+                        f"[ExtMode] {account_email}: reCAPTCHA cooldown expired "
+                        f"(cycle {cycles}/{self.RECAPTCHA_MAX_COOLDOWN_CYCLES}) — "
+                        f"auto-retrying. If your VPN rotated IP, next call should succeed."
+                    )
+                    self._recaptcha_cooldown_until.pop(account_email, None)
+                    self.qm.account_disabled[account_email] = False
+                    self._recaptcha_streak[account_email] = 0
+                    # Fall through to normal dispatch below.
+                else:
+                    try:
+                        if not self._bridge.is_account_held(account_email):
+                            # Check if this is a force-enable override
+                            hold_info = self._bridge.get_hold_info(account_email)
+                            if hold_info.get("force_enabled"):
+                                pass  # user allowed it — fall through
+                            else:
+                                continue
                         else:
                             continue
-                    else:
+                    except Exception:
                         continue
-                except Exception:
                     continue
 
             for worker in workers:
@@ -2093,6 +2129,11 @@ class ExtensionModeManager:
                         self.qm._record_throttle_success(worker.account_email)
                         # Reset reCAPTCHA streak on success
                         self._recaptcha_streak.pop(worker.account_email, None)
+                        # Reset the auto-retry cooldown cycle counter too —
+                        # a successful generation means whatever was failing
+                        # has cleared (e.g. VPN rotated to a clean IP).
+                        self._recaptcha_cooldown_cycles.pop(worker.account_email, None)
+                        self._recaptcha_cooldown_until.pop(worker.account_email, None)
                         # Reset 429 streak — account is back to normal
                         self.qm.clear_429_streak(worker.account_email)
                         # Track generation count for auto cleanup
@@ -2167,44 +2208,73 @@ class ExtensionModeManager:
                     )
 
                     if streak >= self.RECAPTCHA_HOLD_THRESHOLD:
-                        already_held = self.qm.account_disabled.get(worker.account_email, False)
-                        # Account is flagged — hold it and reassign jobs
-                        self.qm.account_disabled[worker.account_email] = True
-                        # Also hold ecosystem activity for this account (48h default)
-                        # Using warmup on a flagged account makes things worse.
-                        try:
-                            self._bridge.hold_ecosystem_account(
-                                worker.account_email, duration_seconds=172800
-                            )
-                        except Exception:
-                            pass
-                        if not already_held:
-                            # First slot to detect — log, warn, reassign
-                            self._log(
-                                f"[ExtMode] ⛔ Account {worker.account_email} hit {streak} consecutive "
-                                f"reCAPTCHA failures — HOLDING account and reassigning jobs."
-                            )
-                            self.qm.signals.account_auth_status.emit(
-                                worker.account_email, "expired",
-                                f"reCAPTCHA flagged ({streak} failures)"
-                            )
-                            # Show warning popup
-                            self.qm.signals.show_warning.emit(
-                                f"Account '{worker.account_email}' has {streak} consecutive reCAPTCHA failures.\n"
-                                f"Google has likely flagged this account.\n"
-                                f"Close this account's extension tab and use a different account."
-                            )
-                            # Reassign this account's pending/running jobs to other accounts
+                        cycles = self._recaptcha_cooldown_cycles.get(worker.account_email, 0) + 1
+                        self._recaptcha_cooldown_cycles[worker.account_email] = cycles
+
+                        if cycles >= self.RECAPTCHA_MAX_COOLDOWN_CYCLES:
+                            # Many cycles failed in a row — assume VPN rotation
+                            # is NOT happening (or IP changes aren't helping).
+                            # Fall back to the original permanent-hold behavior
+                            # so the user gets a clear notification + jobs are
+                            # reassigned to working accounts.
+                            already_held = self.qm.account_disabled.get(worker.account_email, False)
+                            self.qm.account_disabled[worker.account_email] = True
+                            self._recaptcha_cooldown_until.pop(worker.account_email, None)
                             try:
-                                from src.db.db_manager import reassign_account_jobs
-                                count = reassign_account_jobs(worker.account_email)
-                                if count > 0:
-                                    self._log(
-                                        f"[ExtMode] Reassigned {count} job(s) from {worker.account_email} to other accounts."
-                                    )
+                                self._bridge.hold_ecosystem_account(
+                                    worker.account_email, duration_seconds=172800
+                                )
                             except Exception:
                                 pass
-                        # Re-queue current job too
+                            if not already_held:
+                                self._log(
+                                    f"[ExtMode] ⛔ Account {worker.account_email}: "
+                                    f"{cycles} reCAPTCHA cooldown cycles all failed — "
+                                    f"HOLDING permanently (VPN rotation not recovering this one)."
+                                )
+                                self.qm.signals.account_auth_status.emit(
+                                    worker.account_email, "expired",
+                                    f"reCAPTCHA flagged ({cycles} cycles)"
+                                )
+                                self.qm.signals.show_warning.emit(
+                                    f"Account '{worker.account_email}' tried {cycles} reCAPTCHA "
+                                    f"cooldown cycles without success.\n"
+                                    f"Google has likely flagged this account.\n"
+                                    f"Close this account's extension tab and use a different account."
+                                )
+                                try:
+                                    from src.db.db_manager import reassign_account_jobs
+                                    count = reassign_account_jobs(worker.account_email)
+                                    if count > 0:
+                                        self._log(
+                                            f"[ExtMode] Reassigned {count} job(s) from "
+                                            f"{worker.account_email} to other accounts."
+                                        )
+                                except Exception:
+                                    pass
+                            update_job_status(job_id, "pending", account="")
+                            self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                            return
+
+                        # Normal cooldown path — disable account temporarily,
+                        # set a wake-up timestamp, reset streak so the dispatch
+                        # loop's cooldown-expiry check picks it up. On VPN
+                        # rotating IPs the next attempt typically succeeds on
+                        # the fresh IP and the cycle counter (line above) will
+                        # be cleared by the success path.
+                        self.qm.account_disabled[worker.account_email] = True
+                        self._recaptcha_cooldown_until[worker.account_email] = (
+                            time.time() + self.RECAPTCHA_COOLDOWN_SECONDS
+                        )
+                        self._recaptcha_streak[worker.account_email] = 0
+                        self._log(
+                            f"[ExtMode] {worker.account_email}: {streak} reCAPTCHA "
+                            f"failures — cooldown {self.RECAPTCHA_COOLDOWN_SECONDS}s "
+                            f"(cycle {cycles}/{self.RECAPTCHA_MAX_COOLDOWN_CYCLES}). "
+                            f"Auto-retry after wait. If your VPN rotates IP soon, "
+                            f"generation should resume on the new IP."
+                        )
+                        # Re-queue current job; worker picks it up after cooldown
                         update_job_status(job_id, "pending", account="")
                         self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                         return
