@@ -20,13 +20,84 @@ Endpoints (served to extension):
 """
 
 import asyncio
+import base64
+import io
 import json
 import logging
+import mimetypes
+import os
 import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from aiohttp import web
+
+# ─── Reference-image cache (path → base64-encoded data URL payload) ───
+# Pick-once-reuse-forever: app reads & encodes each ref file ONCE, then keeps
+# the base64 payload in memory keyed by (path, mtime, size). Subsequent jobs
+# that point at the same file reuse the cached payload without disk I/O or
+# re-encoding. Cache is reset on app restart.
+_REF_CACHE: Dict[str, Dict[str, Any]] = {}
+_REF_CACHE_MAX_ITEMS = 32              # ~32 refs * ~3MB each = ~100MB max RAM
+_REF_MAX_BYTES_BEFORE_RESIZE = 2 * 1024 * 1024   # 2MB → resize to fit Genspark body
+_REF_RESIZE_MAX_DIM = 1536             # px — keeps quality good, body < 3MB after b64
+
+def _encode_ref_file(path: str) -> Optional[Dict[str, str]]:
+    """Read a reference image from disk, return {mime, data_url, b64}.
+
+    Auto-resizes images >2MB to fit Genspark's ~5MB body cap. Uses an
+    (path, mtime, size) keyed in-memory cache so the same file is encoded
+    only once per app session — multiple jobs reusing the same reference
+    image pay zero disk + zero CPU cost after the first read.
+    """
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        st = os.stat(path)
+        cache_key = f"{path}|{st.st_mtime_ns}|{st.st_size}"
+        hit = _REF_CACHE.get(cache_key)
+        if hit:
+            return hit
+
+        mime = mimetypes.guess_type(path)[0] or "image/png"
+        if mime not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+            mime = "image/png"
+
+        with open(path, "rb") as fh:
+            raw = fh.read()
+
+        # Resize if too large — keeps the multipart payload reasonable
+        if len(raw) > _REF_MAX_BYTES_BEFORE_RESIZE:
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(raw))
+                img.thumbnail((_REF_RESIZE_MAX_DIM, _REF_RESIZE_MAX_DIM), Image.LANCZOS)
+                out = io.BytesIO()
+                save_fmt = "JPEG" if mime == "image/jpeg" else "PNG"
+                if save_fmt == "JPEG" and img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                img.save(out, format=save_fmt, quality=85, optimize=True)
+                raw = out.getvalue()
+                mime = "image/jpeg" if save_fmt == "JPEG" else "image/png"
+            except Exception:
+                # PIL not available — send original anyway; Genspark might reject it
+                pass
+
+        b64 = base64.b64encode(raw).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
+        entry = {"mime": mime, "data_url": data_url, "b64": b64,
+                 "size_bytes": str(len(raw))}
+
+        # Evict oldest if cache full (simple FIFO)
+        if len(_REF_CACHE) >= _REF_CACHE_MAX_ITEMS:
+            try:
+                _REF_CACHE.pop(next(iter(_REF_CACHE)))
+            except StopIteration:
+                pass
+        _REF_CACHE[cache_key] = entry
+        return entry
+    except Exception:
+        return None
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +213,7 @@ class GensparkBridge:
         auto_prompt: bool = False,
         background_mode: bool = True,
         timeout: float = 300.0,
+        ref_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Submit a generation request to the extension.
 
@@ -161,6 +233,30 @@ class GensparkBridge:
         loop = asyncio.get_event_loop()
         future: asyncio.Future = loop.create_future()
 
+        # Pre-encode reference images to data URLs. The cache means a queue
+        # of N jobs that all point at the same file pays exactly 1 read + 1
+        # encode in total (pick-once-reuse-forever, per user spec).
+        ref_images_b64: List[Dict[str, str]] = []
+        ref_paths = ref_paths or []
+        for p in ref_paths:
+            entry = _encode_ref_file(str(p))
+            if not entry:
+                self._log(f"[GensparkBridge] Skipping missing/unreadable ref: {p}")
+                continue
+            ref_images_b64.append({
+                "mime": entry["mime"],
+                "data_url": entry["data_url"],
+            })
+            # Hard cap at 3 — Genspark's body cap is ~5MB and we don't want
+            # multiple full-res images stacked. Most use-cases are 1 ref.
+            if len(ref_images_b64) >= 3:
+                break
+        if ref_images_b64:
+            self._log(
+                f"[GensparkBridge] Reference images attached: "
+                f"{len(ref_images_b64)} (cached={len(_REF_CACHE)})"
+            )
+
         self._pending_requests[request_id] = {
             "account": account,
             "action": "IMAGE_GENERATION",
@@ -175,6 +271,11 @@ class GensparkBridge:
                 "background_mode": background_mode,
                 "camera_control": None,
             },
+            # ref_images_b64 is sent in a sibling field, NOT inside
+            # model_params, because Genspark's server validates model_params
+            # against a schema and rejects unknown keys. The extension
+            # picks this up and weaves the data URLs into the messages array.
+            "ref_images_b64": ref_images_b64,
             "future": future,
             "created": time.time(),
             "_failed_ext_keys": set(),
@@ -248,6 +349,7 @@ class GensparkBridge:
                     "action": req["action"],
                     "prompt": req["prompt"],
                     "model_params": req["model_params"],
+                    "ref_images_b64": req.get("ref_images_b64", []),
                     "recaptcha_site_key": GENSPARK_RECAPTCHA_SITE_KEY,
                 }
                 self._dispatched_to[req_id] = {"ext_key": ext_key, "ts": now}

@@ -287,7 +287,11 @@ async function gensparkPollBridge() {
 // ═══════════════════════════════════════════════════════════════════
 
 async function gensparkHandleWork(work) {
-  const { request_id, account, prompt, model_params, recaptcha_site_key } = work;
+  const {
+    request_id, account, prompt, model_params, recaptcha_site_key,
+    ref_images_b64,
+  } = work;
+  const refImages = Array.isArray(ref_images_b64) ? ref_images_b64 : [];
   if (submittedRequestIds.has(request_id)) {
     console.warn(`[Genspark] already submitted, skipping ${request_id}`);
     return;
@@ -365,7 +369,11 @@ async function gensparkHandleWork(work) {
 
   // Step 2: POST /api/agent/ask_proxy with prompt + token — SSE response.
   // We do this INSIDE the tab so cookies + same-origin rules apply correctly.
-  await gensparkReportProgress(request_id, "ask_proxy_start", `prompt="${prompt.slice(0, 40)}"`);
+  await gensparkReportProgress(
+    request_id,
+    "ask_proxy_start",
+    `prompt="${prompt.slice(0, 40)}" refs=${refImages.length}`
+  );
   let taskInfo;
   try {
     const askResult = await chrome.scripting.executeScript({
@@ -667,10 +675,30 @@ async function gensparkHandleWork(work) {
       },
       args: [(() => {
         const userMsgId = _gensparkUuid();
+        // Reference-image branch: build OpenAI-style multimodal content
+        // array — captured from real genspark.ai POST when the user dropped
+        // an image into the chat. Order matters: image parts first, text
+        // part last. Otherwise stick with the leaner string-content shape.
+        let userContent;
+        if (refImages.length > 0) {
+          const parts = [];
+          for (const ref of refImages) {
+            if (ref && ref.data_url) {
+              parts.push({
+                type: "image_url",
+                image_url: { url: ref.data_url },
+              });
+            }
+          }
+          parts.push({ type: "text", text: prompt });
+          userContent = parts;
+        } else {
+          userContent = prompt;
+        }
         const messages = [{
           role: "user",
           id: userMsgId,
-          content: prompt,
+          content: userContent,
         }];
         // Body shape captured from a real genspark.ai POST (Nano Banana Pro).
         // Includes is_private + push_token + session_state which the newer

@@ -469,9 +469,41 @@ class GensparkModeManager:
 
         ratio = _resolve_aspect_ratio(job.get("aspect_ratio") or "auto")
         image_size = size_from_job or self._default_image_size
+
+        # Reference images — job stores them as either a list (modern path)
+        # or a semicolon-separated string (legacy path, shared with Flow's
+        # bulk-add code). Accept both. Files that no longer exist on disk
+        # are filtered out silently.
+        raw_refs = job.get("ref_paths")
+        ref_paths_list: List[str] = []
+        if isinstance(raw_refs, (list, tuple)):
+            ref_paths_list = [str(p).strip() for p in raw_refs if str(p or "").strip()]
+        elif isinstance(raw_refs, str) and raw_refs.strip():
+            ref_paths_list = [p.strip() for p in raw_refs.split(";") if p.strip()]
+        # Fallback to single `ref_path` field if list is empty
+        if not ref_paths_list:
+            single_ref = str(job.get("ref_path") or "").strip()
+            if single_ref:
+                ref_paths_list = [single_ref]
+        # Existence filter — broken paths silently dropped
+        ref_paths_list = [p for p in ref_paths_list if os.path.exists(p)]
+
+        # When refs are attached, Pro+auto can produce 4k images which
+        # combined with the inline base64 of the ref easily exceeds
+        # Genspark's request body cap. The HAR captures showed Pro requests
+        # with refs running at image_size="1k". Auto-downgrade to keep the
+        # request small. User can still override by picking 2k/4k explicitly.
+        if ref_paths_list and model == "nano-banana-pro" and image_size == "auto":
+            image_size = "1k"
+            self._log(
+                f"[GensparkMode] Job {job_id[:6]}… auto-downgrading Pro size "
+                f"to 1k because reference images are attached"
+            )
+
         self._log(
             f"[GensparkMode] Job {job_id[:6]}… settings: "
-            f"model={model}, ratio={ratio}, size={image_size}"
+            f"model={model}, ratio={ratio}, size={image_size}, "
+            f"refs={len(ref_paths_list)}"
         )
 
         max_retries = int(self.qm.max_auto_retries_per_job or 2)
@@ -491,6 +523,7 @@ class GensparkModeManager:
                         aspect_ratio=ratio,
                         image_size=image_size,
                         auto_prompt=self._auto_prompt,
+                        ref_paths=ref_paths_list,
                     )
                 except Exception as e:
                     last_error = f"bridge_error: {e}"
