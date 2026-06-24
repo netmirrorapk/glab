@@ -82,8 +82,10 @@ from src.db.db_manager import (
     get_bool_setting,
     get_setting,
     get_int_setting,
+    get_job_model,
     get_output_directory,
     set_setting,
+    update_job_model,
     update_job_status,
     update_job_runtime_state,
     get_cached_media_id,
@@ -1735,6 +1737,53 @@ class ExtensionModeManager:
             self._account_gen_count[account_email] = 0
             self._account_last_cleanup[account_email] = now
 
+    def _try_swap_image_model(self, job_id: str):
+        """Swap a job's image model between Nano Banana and Nano Banana Pro
+        when the current model hits a daily/per-model quota. Returns the
+        new model name on success, or None if we can't / shouldn't swap.
+
+        Tracks which models have been tried for each job in
+        self._job_models_tried so we never ping-pong between the same
+        two models forever — once both have been tried for a given job,
+        further calls return None and the normal 429 pause path kicks in.
+        """
+        # Lazy-init the tracking dict
+        if not hasattr(self, "_job_models_tried"):
+            self._job_models_tried = {}
+
+        try:
+            current = str(get_job_model(job_id) or "").strip()
+        except Exception:
+            return None
+        if not current:
+            return None
+
+        low = current.lower()
+        # Determine the alternate model. "pro" check first because "Nano
+        # Banana Pro" also contains "nano banana".
+        if "pro" in low and "nano" in low:
+            alternate = "Nano Banana 2"
+        elif "nano" in low or "narwhal" in low:
+            alternate = "Nano Banana Pro"
+        elif "imagen" in low:
+            # Imagen-family all maps to NARWHAL — Pro is the alternate
+            alternate = "Nano Banana Pro"
+        else:
+            # Unknown model — can't infer the swap target
+            return None
+
+        tried = self._job_models_tried.setdefault(job_id, set())
+        if alternate.lower() in tried:
+            return None  # Already tried the alternate too — give up
+        tried.add(low)
+        tried.add(alternate.lower())
+
+        try:
+            update_job_model(job_id, alternate)
+        except Exception:
+            return None
+        return alternate
+
     async def _run_pipeline_job(self, worker: ExtensionWorker, job: dict):
         """Execute a pipeline job: Step 1 = generate image, Step 2 = generate video from it."""
         job_id = job["id"]
@@ -2129,6 +2178,52 @@ class ExtensionModeManager:
                 #      the queue moves on to other prompts.
                 err_lower = last_error.lower()
                 if any(p in err_lower for p in ("429", "rate limit", "too many requests")):
+                    # Recovery strategy 1 — Cache cleanup. Some 429s "stick"
+                    # in client-side state (IndexedDB, service worker cache).
+                    # Manually clearing browser data on labs.google often
+                    # gets the account working again immediately. Fire-and-
+                    # forget so the work item isn't blocked by it.
+                    try:
+                        self._bridge.send_command("clean_tracking", worker.account_email)
+                        self._log(
+                            f"[{worker.slot_id}] 🧹 Sent clean_tracking to "
+                            f"refresh labs.google session state — sometimes "
+                            f"clears the rate-limit without needing the pause."
+                        )
+                    except Exception:
+                        pass
+
+                    # Recovery strategy 2 — Model fallback on per-model
+                    # quota exhaustion. Daily quota is PER model on the
+                    # Flow side too: Nano Banana (NARWHAL) and Nano Banana
+                    # Pro (GEM_PIX_2) have separate quotas. If the user has
+                    # access to both, swapping models lets the queue keep
+                    # moving on the alternate model instead of pausing the
+                    # whole account.
+                    quota_exhausted = (
+                        "exhausted" in err_lower
+                        or "check quota" in err_lower
+                        or "daily limit" in err_lower
+                        or "different model" in err_lower
+                    )
+                    if quota_exhausted:
+                        swapped_to = self._try_swap_image_model(job_id)
+                        if swapped_to:
+                            self._log(
+                                f"[{worker.slot_id}] 🔄 Quota exhausted on "
+                                f"current model — swapped to '{swapped_to}' "
+                                f"and re-queuing. Account NOT paused; other "
+                                f"workers can keep using the same account on "
+                                f"the alternate model."
+                            )
+                            update_job_status(job_id, "pending", account="")
+                            self.qm.signals.job_updated.emit(
+                                job_id, "pending", "", ""
+                            )
+                            # IMPORTANT: skip the pause cascade below —
+                            # the swap path is the recovery for this job.
+                            return
+
                     # Keep the legacy slot throttle running too — it provides
                     # the gradual ramp-up if the pause expires successfully.
                     self.qm._throttle_account_for_429(worker.account_email)

@@ -782,7 +782,23 @@ async function gensparkHandleWork(work) {
               return { ok: true, task: t };
             }
             if (lastStatus === "FAILED" || lastStatus === "ERROR") {
-              return { ok: false, reason: `task_status_${lastStatus}`, task: t };
+              // Capture the human-readable error text so the Python side
+              // can detect daily-limit / different-model messages and
+              // auto-fallback to the other model. Genspark surfaces these
+              // in task.error_message OR task.message OR a nested field.
+              const errMsg = (
+                t.error_message ||
+                t.message ||
+                t.failed_reason ||
+                t.error ||
+                ""
+              );
+              return {
+                ok: false,
+                reason: `task_status_${lastStatus}`,
+                error_message: String(errMsg || "").slice(0, 500),
+                task: t,
+              };
             }
             await new Promise((res) => setTimeout(res, 2500));
           } catch (e) {
@@ -795,9 +811,15 @@ async function gensparkHandleWork(work) {
     });
     const r = pollResult?.[0]?.result;
     if (!r || !r.ok) {
-      await gensparkReportProgress(request_id, "error", "poll: " + (r?.reason || "failed"));
+      // Prefer the human-readable error_message (when FAILED) over the
+      // generic reason code — that's how the Python side detects
+      // "daily limit" / "different model" patterns for auto-fallback.
+      const errPayload = r?.error_message
+        ? `${r.reason}: ${r.error_message}`
+        : (r?.reason || "poll_failed");
+      await gensparkReportProgress(request_id, "error", "poll: " + errPayload);
       await gensparkSubmitResult(request_id, {
-        error: r?.reason || "poll_failed",
+        error: errPayload,
       });
       return;
     }

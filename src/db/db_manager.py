@@ -789,6 +789,36 @@ def update_job_prompt(job_id, prompt):
     )
 
 
+def update_job_model(job_id, model):
+    """Overwrite the `model` field on a job. Used by the auto-fallback
+    path that swaps Nano Banana ↔ Nano Banana Pro when a daily quota
+    is hit on the current model."""
+    _run_write(
+        lambda conn: conn.execute(
+            "UPDATE jobs SET model = ? WHERE id = ?",
+            (str(model or ""), job_id),
+        )
+    )
+
+
+def get_job_model(job_id):
+    """Read the current `model` field for a job. Returns empty string
+    if not found or on error."""
+    try:
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT model FROM jobs WHERE id = ?", (job_id,))
+            row = cursor.fetchone()
+            if row:
+                return str(row[0] or "")
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return ""
+
+
 def retry_failed_jobs_to_top(job_updates, retry_source="failed_tab"):
     updates = []
     for item in list(job_updates or []):

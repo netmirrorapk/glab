@@ -972,6 +972,47 @@ async function handleCommand(cmd) {
       }
       break;
 
+    case "clean_genspark_tracking": {
+      // Same as clean_tracking but for genspark.ai. Triggered by the
+      // bridge after a daily-limit / 429 cascade — clears client-side
+      // caches that sometimes "stick" the limited state, while keeping
+      // cookies (so the account stays logged in). Reloads the tab.
+      // Note: `tabId` from findLabsTab(account) won't find the genspark
+      // tab — look it up via gensparkAccounts (populated by genspark.js).
+      let gensparkTabId = null;
+      try {
+        const info = (typeof gensparkAccounts !== "undefined")
+          ? gensparkAccounts[account]
+          : null;
+        gensparkTabId = info?.tab_id || null;
+      } catch {}
+      try {
+        await chrome.browsingData.remove(
+          {
+            origins: [
+              "https://www.genspark.ai",
+              "https://genspark.ai",
+            ],
+          },
+          {
+            serviceWorkers: true,
+            indexedDB: true,
+            cacheStorage: true,
+            localStorage: true,  // genspark stores some session state here
+          }
+        );
+        console.log(
+          `[G-Labs Helper] Genspark tracking cleaned for ${account || "all accounts"}`
+        );
+      } catch (e) {
+        console.warn("[G-Labs Helper] clean_genspark_tracking failed:", e.message);
+      }
+      if (gensparkTabId) {
+        try { await chrome.tabs.reload(gensparkTabId); } catch {}
+      }
+      break;
+    }
+
     case "clean_recaptcha_cookie":
       // Delete _GRECAPTCHA cookie only — keeps login session intact
       try {
