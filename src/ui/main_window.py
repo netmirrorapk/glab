@@ -5010,6 +5010,10 @@ class MainWindow(QMainWindow):
         if gen_mode_idx < 0:
             gen_mode_idx = 0
         self.cmb_generation_mode.setCurrentIndex(gen_mode_idx)
+        # Initialize the "last mode" tracker so the Genspark-exit handler
+        # can detect a switch away on the very first user action — even
+        # after an app restart where Genspark was the active mode.
+        self._last_generation_mode = saved_gen_mode
         # Re-sync the video sub-tabs whenever generation mode flips, so
         # the Upscale/Resolution/Duration combos swap without needing a
         # restart. Only bound if the combo isn't already wired (guards
@@ -10207,6 +10211,82 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    def _snapshot_pre_genspark_settings(self):
+        """Save current slots/stagger/speed values to persistent storage
+        as a 'pre-Genspark' backup. Called right before applying the
+        Genspark defaults so the user's previous Flow/Grok/Browser pacing
+        can be restored when they switch away from Genspark."""
+        try:
+            if hasattr(self, "spin_slots_per_account"):
+                set_setting("pre_genspark_slots_per_account",
+                            str(int(self.spin_slots_per_account.value())))
+            if hasattr(self, "spin_same_account_stagger"):
+                set_setting("pre_genspark_same_stagger",
+                            str(float(self.spin_same_account_stagger.value())))
+            if hasattr(self, "spin_global_stagger_min"):
+                set_setting("pre_genspark_global_min",
+                            str(float(self.spin_global_stagger_min.value())))
+            if hasattr(self, "spin_global_stagger_max"):
+                set_setting("pre_genspark_global_max",
+                            str(float(self.spin_global_stagger_max.value())))
+            if hasattr(self, "cmb_speed_profile"):
+                set_setting("pre_genspark_speed_profile",
+                            str(self.cmb_speed_profile.currentData() or "fast"))
+        except Exception:
+            pass
+
+    def _restore_pre_genspark_settings(self):
+        """Restore the pacing settings that were active before Genspark
+        defaults overwrote them. Called when the user switches away from
+        Genspark Generation Mode."""
+        applied = []
+        try:
+            saved_slots_str = str(get_setting("pre_genspark_slots_per_account", "") or "").strip()
+            if saved_slots_str and hasattr(self, "spin_slots_per_account"):
+                slots = max(1, min(40, int(float(saved_slots_str))))
+                self.spin_slots_per_account.setValue(slots)
+                set_setting("slots_per_account", str(slots))
+                applied.append(f"parallel={slots}")
+
+            saved_same_str = str(get_setting("pre_genspark_same_stagger", "") or "").strip()
+            if saved_same_str and hasattr(self, "spin_same_account_stagger"):
+                v = max(0.0, min(60.0, float(saved_same_str)))
+                self.spin_same_account_stagger.setValue(v)
+                set_setting("same_account_stagger_seconds", str(v))
+                applied.append(f"per-account stagger={v}s")
+
+            saved_gmin = str(get_setting("pre_genspark_global_min", "") or "").strip()
+            saved_gmax = str(get_setting("pre_genspark_global_max", "") or "").strip()
+            if saved_gmin and hasattr(self, "spin_global_stagger_min"):
+                v = max(0.0, min(60.0, float(saved_gmin)))
+                self.spin_global_stagger_min.setValue(v)
+                set_setting("global_stagger_min_seconds", str(v))
+            if saved_gmax and hasattr(self, "spin_global_stagger_max"):
+                v = max(0.0, min(120.0, float(saved_gmax)))
+                self.spin_global_stagger_max.setValue(v)
+                set_setting("global_stagger_max_seconds", str(v))
+            if saved_gmin and saved_gmax:
+                applied.append(f"global stagger={saved_gmin}-{saved_gmax}s")
+
+            saved_speed = str(get_setting("pre_genspark_speed_profile", "") or "").strip().lower()
+            if saved_speed and hasattr(self, "cmb_speed_profile"):
+                idx = self.cmb_speed_profile.findData(saved_speed)
+                if idx >= 0:
+                    self.cmb_speed_profile.setCurrentIndex(idx)
+                    set_setting("speed_profile", saved_speed)
+                    applied.append(f"speed={saved_speed}")
+
+            if applied:
+                self.append_log(
+                    "[SETTINGS] Restored pre-Genspark pacing settings: "
+                    + ", ".join(applied) + "."
+                )
+        except Exception as e:
+            try:
+                self.append_log(f"[SETTINGS] Could not restore pre-Genspark settings: {e}")
+            except Exception:
+                pass
+
     def _apply_genspark_recommended_settings(self):
         """Apply Genspark-optimized pacing defaults to prevent the 5-hour
         session limit from being hit too quickly. Triggered when the user
@@ -10250,8 +10330,8 @@ class MainWindow(QMainWindow):
                     "[SETTINGS] Genspark recommended defaults applied: "
                     + ", ".join(applied) + ". "
                     "These pacing values prevent the 5-hour session-limit "
-                    "from triggering on Plus plan. Adjust manually if you "
-                    "want different speed/safety tradeoff."
+                    "from triggering on Plus plan. Switch back to another "
+                    "mode to auto-restore your previous settings."
                 )
         except Exception as e:
             try:
@@ -10260,11 +10340,34 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_generation_mode_changed(self):
-        """Handle Generation Mode dropdown change. Runs UI sync and applies
-        mode-specific pacing defaults (Genspark only, for now)."""
+        """Handle Generation Mode dropdown change. Runs UI sync and:
+          - Entering Genspark from another mode → snapshot current pacing
+            + apply Genspark defaults.
+          - Leaving Genspark to another mode → restore pacing snapshot.
+        """
         self._sync_generation_mode_ui()
-        if self._is_genspark_generation_mode():
+        is_now_genspark = self._is_genspark_generation_mode()
+        was_genspark = (
+            str(getattr(self, "_last_generation_mode", "") or "").lower()
+            == "chrome_extension_genspark"
+        )
+        current_mode = ""
+        cmb = getattr(self, "cmb_generation_mode", None)
+        if cmb is not None:
+            try:
+                current_mode = str(cmb.currentData() or "").lower()
+            except Exception:
+                current_mode = ""
+
+        if is_now_genspark and not was_genspark:
+            # Entering Genspark — snapshot then apply defaults
+            self._snapshot_pre_genspark_settings()
             self._apply_genspark_recommended_settings()
+        elif was_genspark and not is_now_genspark:
+            # Leaving Genspark — restore previous pacing
+            self._restore_pre_genspark_settings()
+
+        self._last_generation_mode = current_mode
 
     def _sync_generation_mode_ui(self):
         frame_mode = self._current_video_sub_mode()
