@@ -5016,7 +5016,7 @@ class MainWindow(QMainWindow):
         # against double-connect on settings dialog re-open).
         try:
             self.cmb_generation_mode.currentIndexChanged.connect(
-                lambda _=None: self._sync_generation_mode_ui()
+                lambda _=None: self._on_generation_mode_changed()
             )
         except Exception:
             pass
@@ -10196,6 +10196,75 @@ class MainWindow(QMainWindow):
             return str(cmb.currentData() or "").lower() == "chrome_extension_grok"
         except Exception:
             return False
+
+    def _is_genspark_generation_mode(self) -> bool:
+        """True when Genspark is the selected Generation Mode."""
+        cmb = getattr(self, "cmb_generation_mode", None)
+        if cmb is None:
+            return False
+        try:
+            return str(cmb.currentData() or "").lower() == "chrome_extension_genspark"
+        except Exception:
+            return False
+
+    def _apply_genspark_recommended_settings(self):
+        """Apply Genspark-optimized pacing defaults to prevent the 5-hour
+        session limit from being hit too quickly. Triggered when the user
+        switches Generation Mode TO Genspark — overwrites slots, stagger,
+        and speed-profile settings in both the UI and persistent storage.
+
+        Why these values: empirically tuned. With parallel=4 + fast stagger,
+        Genspark Plus throttles around ~70 images. With these values, runs
+        sustain 3-4 hours without throttle stalls.
+        """
+        SLOTS = 2
+        SAME_ACC_STAGGER = 3.0
+        GLOBAL_MIN = 2.5
+        GLOBAL_MAX = 4.0
+        SPEED_PROFILE = "stable"  # "Slow Stable" — closest to balanced
+        applied = []
+        try:
+            if hasattr(self, "spin_slots_per_account"):
+                self.spin_slots_per_account.setValue(SLOTS)
+                set_setting("slots_per_account", str(SLOTS))
+                applied.append(f"parallel={SLOTS}")
+            if hasattr(self, "spin_same_account_stagger"):
+                self.spin_same_account_stagger.setValue(SAME_ACC_STAGGER)
+                set_setting("same_account_stagger_seconds", str(SAME_ACC_STAGGER))
+                applied.append(f"per-account stagger={SAME_ACC_STAGGER}s")
+            if hasattr(self, "spin_global_stagger_min"):
+                self.spin_global_stagger_min.setValue(GLOBAL_MIN)
+                set_setting("global_stagger_min_seconds", str(GLOBAL_MIN))
+            if hasattr(self, "spin_global_stagger_max"):
+                self.spin_global_stagger_max.setValue(GLOBAL_MAX)
+                set_setting("global_stagger_max_seconds", str(GLOBAL_MAX))
+                applied.append(f"global stagger={GLOBAL_MIN}-{GLOBAL_MAX}s")
+            if hasattr(self, "cmb_speed_profile"):
+                idx = self.cmb_speed_profile.findData(SPEED_PROFILE)
+                if idx >= 0:
+                    self.cmb_speed_profile.setCurrentIndex(idx)
+                    set_setting("speed_profile", SPEED_PROFILE)
+                    applied.append("speed=Slow Stable")
+            if applied:
+                self.append_log(
+                    "[SETTINGS] Genspark recommended defaults applied: "
+                    + ", ".join(applied) + ". "
+                    "These pacing values prevent the 5-hour session-limit "
+                    "from triggering on Plus plan. Adjust manually if you "
+                    "want different speed/safety tradeoff."
+                )
+        except Exception as e:
+            try:
+                self.append_log(f"[SETTINGS] Could not apply Genspark defaults: {e}")
+            except Exception:
+                pass
+
+    def _on_generation_mode_changed(self):
+        """Handle Generation Mode dropdown change. Runs UI sync and applies
+        mode-specific pacing defaults (Genspark only, for now)."""
+        self._sync_generation_mode_ui()
+        if self._is_genspark_generation_mode():
+            self._apply_genspark_recommended_settings()
 
     def _sync_generation_mode_ui(self):
         frame_mode = self._current_video_sub_mode()
