@@ -2089,6 +2089,10 @@ class GoogleLabsBot:
         lower = str(model or "").lower()
         # Flow image generation currently routes these image models through the
         # same Flow endpoint, using recovered model keys from HAR captures.
+        # HARBOR_SEAL = Nano Banana 2 Lite (added 2026-07-01 from HAR capture).
+        # "lite" check must come before generic "nano banana 2" match below.
+        if "lite" in lower and "nano banana" in lower:
+            return "HARBOR_SEAL"
         if "nano banana pro" in lower:
             return "GEM_PIX_2"
         if "nano banana 2" in lower:
@@ -2248,7 +2252,12 @@ class GoogleLabsBot:
         # Reference-image jobs are API eligible; only unsupported/video models stay blocked.
         _ = ref_path
         lower = str(model or "").lower()
-        is_flow_image_model = ("nano banana 2" in lower) or ("nano banana pro" in lower) or ("imagen" in lower)
+        is_flow_image_model = (
+            ("nano banana 2" in lower)
+            or ("nano banana pro" in lower)
+            or ("nano banana" in lower and "lite" in lower)
+            or ("imagen" in lower)
+        )
         return is_flow_image_model and ("veo" not in lower)
 
     def _resolve_mime_type(self, file_path):

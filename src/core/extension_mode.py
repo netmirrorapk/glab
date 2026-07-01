@@ -187,7 +187,12 @@ def _parse_api_error(status_code: int, resp_text: str) -> str:
 def _resolve_image_model(model_name):
     """Map UI model name to API model identifier."""
     lower = str(model_name or "").strip().lower()
-    # Nano Banana models (must check "pro" first — it also contains "nano banana")
+    # Nano Banana models — order matters here. "lite" MUST be checked before
+    # the generic "nano banana" match below, and "pro" before generic too.
+    # HARBOR_SEAL is the API name for the new Nano Banana 2 Lite variant
+    # (confirmed via HAR capture 2026-07-01).
+    if "lite" in lower and "nano banana" in lower:
+        return "HARBOR_SEAL"
     if "nano banana pro" in lower:
         return "GEM_PIX_2"
     if "nano banana" in lower:

@@ -102,6 +102,10 @@ def _parse_api_error_string(error_str: str) -> str:
 
 def _resolve_image_model(model):
     lower = str(model or "").lower()
+    # HARBOR_SEAL = Nano Banana 2 Lite (added 2026-07-01 from HAR capture).
+    # "lite" check must come before generic "nano banana" match below.
+    if "lite" in lower and "nano banana" in lower:
+        return "HARBOR_SEAL"
     if "nano banana pro" in lower:
         return "GEM_PIX_2"
     if "nano banana" in lower:
