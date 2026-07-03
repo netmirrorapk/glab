@@ -52,10 +52,14 @@ class ExtensionBridge:
         # see burn_project() / get_project_id() for rotation behavior.
         self._burned_projects: Dict[str, Dict[str, float]] = {}
         # How long a burned project stays quarantined. Google's per-project
-        # quota appears to refill within ~30-60 minutes in production
-        # testing; 30 min is the conservative choice. Burned projects past
-        # this window become eligible again on the next resolve cycle.
-        self.PROJECT_BURN_COOLDOWN_S = 30 * 60
+        # quota often refills faster than 30 minutes — especially when the
+        # user rotates VPN externally (Google's 429 attribution is
+        # account+project+IP; an IP change effectively releases the burn
+        # server-side even though our local timer hasn't expired). Ten
+        # minutes is aggressive enough to bring old projects back into
+        # rotation quickly while still preventing rapid re-burn on the
+        # exact project that just failed.
+        self.PROJECT_BURN_COOLDOWN_S = 10 * 60
 
         # Pending commands for extension
         self._pending_commands = []
@@ -422,6 +426,25 @@ class ExtensionBridge:
             return False
         burn_ts = self._burned_projects.get(account, {}).get(project_id, 0.0)
         return bool(burn_ts and (time.time() - burn_ts) < self.PROJECT_BURN_COOLDOWN_S)
+
+    def get_oldest_burned_project(self, account: str) -> Optional[str]:
+        """Return the project_id with the OLDEST burn timestamp for this
+        account (i.e. the one whose 429 attribution is most likely to have
+        expired on Google's side). Used as a last-resort fallback in
+        _create_project when every rotation method has come up empty —
+        especially valuable when the user has rotated their VPN/IP
+        externally, since a burned project often works again on a fresh
+        IP without waiting out the full local cooldown."""
+        if not account:
+            return None
+        burns = self._burned_projects.get(account, {})
+        if not burns:
+            return None
+        try:
+            oldest_pid = min(burns.items(), key=lambda kv: kv[1])[0]
+            return oldest_pid or None
+        except Exception:
+            return None
 
     @property
     def is_extension_connected(self) -> bool:

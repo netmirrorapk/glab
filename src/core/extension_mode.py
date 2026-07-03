@@ -1404,7 +1404,29 @@ class ExtensionWorker:
             current = self._bridge.get_project_id(self.account_email) or ""
             if current and current != pre_existing:
                 return current
-        return self._bridge.get_project_id(self.account_email)
+
+        after_new = self._bridge.get_project_id(self.account_email)
+        if after_new:
+            return after_new
+
+        # ── Method 4: Last-resort — oldest burned project ──
+        # If Methods 1-3 all came up empty, fall back to the project whose
+        # 429 attribution is most likely to have expired server-side. When
+        # the user rotates IP externally (Surfshark, VPN cycle, etc.), a
+        # burned project often works again on the fresh IP even though our
+        # local burn timer hasn't run out. If it still returns 429, the
+        # normal burn+rotate flow will just mark it again — no worse than
+        # returning null and forcing a strike-cascade pause.
+        oldest_burned = self._bridge.get_oldest_burned_project(self.account_email)
+        if oldest_burned:
+            self._log(
+                f"[{self.slot_id}] All rotation methods exhausted — "
+                f"retrying oldest burned project {oldest_burned[:16]}… "
+                f"(IP may have changed; server-side 429 attribution may "
+                f"have expired even though local cooldown hasn't)."
+            )
+            return oldest_burned
+        return None
 
 
 class ExtensionModeManager:
