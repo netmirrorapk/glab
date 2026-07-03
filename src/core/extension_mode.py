@@ -1344,28 +1344,42 @@ class ExtensionWorker:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
-                    if resp.ok:
+                    if not resp.ok:
+                        self._log(
+                            f"[{self.slot_id}] Method 1 (aisandbox API): "
+                            f"HTTP {resp.status} — skipping"
+                        )
+                    else:
                         data = await resp.json()
                         projects = data.get("projects", data.get("project", []))
-                        if isinstance(projects, list) and projects:
+                        if not isinstance(projects, list) or not projects:
+                            self._log(
+                                f"[{self.slot_id}] Method 1 (aisandbox API): "
+                                f"returned 0 projects — account may have none"
+                            )
+                        else:
                             candidates = [
                                 _extract_pid(p.get("name", "") or p.get("projectId", ""))
                                 for p in projects
                             ]
+                            valid = [c for c in candidates if c]
+                            burned_count = sum(
+                                1 for c in valid
+                                if self._bridge.is_project_burned(self.account_email, c)
+                            )
                             pid = _pick_unburned(candidates)
                             if pid:
                                 self._log(
-                                    f"[{self.slot_id}] Project from API: {pid} "
-                                    f"(skipped {sum(1 for c in candidates if c and c != pid and self._bridge.is_project_burned(self.account_email, c))} burned)"
+                                    f"[{self.slot_id}] Method 1 OK: {pid} "
+                                    f"(of {len(valid)} listed, {burned_count} burned)"
                                 )
                                 return pid
-                            if candidates:
-                                self._log(
-                                    f"[{self.slot_id}] All {len([c for c in candidates if c])} listed project(s) "
-                                    "are in 429 cooldown — creating fresh project."
-                                )
+                            self._log(
+                                f"[{self.slot_id}] Method 1: all {len(valid)} "
+                                f"listed project(s) in 10-min cooldown — trying Method 2"
+                            )
         except Exception as e:
-            self._log(f"[{self.slot_id}] Projects API error: {str(e)[:80]}")
+            self._log(f"[{self.slot_id}] Method 1 exception: {str(e)[:120]}")
 
         # ── Method 2: listFlows via trpc ──
         try:
@@ -1375,17 +1389,33 @@ class ExtensionWorker:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
-                    if resp.ok:
+                    if not resp.ok:
+                        self._log(
+                            f"[{self.slot_id}] Method 2 (listFlows): "
+                            f"HTTP {resp.status} — trying Method 3"
+                        )
+                    else:
                         data = await resp.json()
                         flows = data.get("result", {}).get("data", {}).get("flows", [])
-                        if flows:
+                        if not flows:
+                            self._log(
+                                f"[{self.slot_id}] Method 2 (listFlows): "
+                                f"no flows returned — trying Method 3"
+                            )
+                        else:
                             candidates = [str(f.get("name", "")) for f in flows]
                             pid = _pick_unburned(candidates)
                             if pid:
-                                self._log(f"[{self.slot_id}] Project from listFlows: {pid}")
+                                self._log(
+                                    f"[{self.slot_id}] Method 2 OK: {pid}"
+                                )
                                 return pid
-        except Exception:
-            pass
+                            self._log(
+                                f"[{self.slot_id}] Method 2: all {len(candidates)} "
+                                f"flow(s) burned — trying Method 3"
+                            )
+        except Exception as e:
+            self._log(f"[{self.slot_id}] Method 2 exception: {str(e)[:120]}")
 
         # ── Method 3: Ask extension to click "New project" ──
         # Clear bridge's cached project_id so the post-back from extension
@@ -1397,17 +1427,31 @@ class ExtensionWorker:
         #   = ~33s ceiling. We wait 20s and let the extension finish
         #   asynchronously; if the post-back lands later, the next
         #   _resolve_project_id pass will pick it up.
+        self._log(
+            f"[{self.slot_id}] Method 3 (extension 'New project' click): "
+            f"dispatching command, waiting up to 20s for new project ID..."
+        )
         pre_existing = self._bridge.get_project_id(self.account_email) or ""
         self._bridge.send_command("new_project", self.account_email)
         for _ in range(20):
             await asyncio.sleep(1)
             current = self._bridge.get_project_id(self.account_email) or ""
             if current and current != pre_existing:
+                self._log(f"[{self.slot_id}] Method 3 OK: {current}")
                 return current
 
         after_new = self._bridge.get_project_id(self.account_email)
         if after_new:
+            self._log(
+                f"[{self.slot_id}] Method 3 late arrival: {after_new}"
+            )
             return after_new
+        self._log(
+            f"[{self.slot_id}] Method 3 timed out — extension could not "
+            f"create a new project (button not found, tab stuck in a "
+            f"project URL, or rate-limit modal blocking click). Falling "
+            f"through to Method 4."
+        )
 
         # ── Method 4: Last-resort — oldest burned project ──
         # If Methods 1-3 all came up empty, fall back to the project whose
@@ -1420,12 +1464,17 @@ class ExtensionWorker:
         oldest_burned = self._bridge.get_oldest_burned_project(self.account_email)
         if oldest_burned:
             self._log(
-                f"[{self.slot_id}] All rotation methods exhausted — "
-                f"retrying oldest burned project {oldest_burned[:16]}… "
-                f"(IP may have changed; server-side 429 attribution may "
-                f"have expired even though local cooldown hasn't)."
+                f"[{self.slot_id}] Method 4 OK: retrying oldest burned "
+                f"project {oldest_burned[:16]}… (IP may have changed; "
+                f"server-side 429 attribution may have expired even "
+                f"though local cooldown hasn't)."
             )
             return oldest_burned
+        self._log(
+            f"[{self.slot_id}] Method 4: no burned projects to retry — "
+            f"account has NO projects at all. User must open "
+            f"labs.google/fx/tools/flow and create one manually."
+        )
         return None
 
 

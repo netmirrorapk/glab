@@ -1087,70 +1087,119 @@ async function handleCommand(cmd) {
           }
 
           // Step 2: click the New-project button inside the tab.
-          const results = await chrome.scripting.executeScript({
-            target: { tabId },
-            world: "MAIN",
-            func: async () => {
-              const visible = (el) => {
-                if (!el) return false;
-                if (el.offsetParent === null) return false;
-                const r = el.getBoundingClientRect();
-                return r.width > 4 && r.height > 4;
-              };
-              const buttonTextMatches = (b) => {
-                const t = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-                return (
-                  t === "new project"
-                  || t === "+ new project"
-                  || t === "create new project"
-                  || t === "create project"
-                  || t === "new flow"
-                  || t === "+ new"
-                  || t.startsWith("new project")
-                );
-              };
-              const findBtn = () => {
-                const direct = document.querySelector(
-                  '[data-testid="new-project"], [data-testid="create-project"], '
-                  + '[aria-label="New project"], [aria-label="Create new project"]'
-                );
-                if (direct && visible(direct)) return direct;
-                const all = Array.from(document.querySelectorAll('button, [role="button"], a'));
-                return all.find((b) => visible(b) && buttonTextMatches(b)) || null;
-              };
+          // Attempt loop: modal dismissal → button find → click → URL wait.
+          // If URL doesn't transition on the first attempt, reload the
+          // tab and retry once — a rate-limit or auth modal often
+          // overlays the picker on stuck tabs and blocks clicks silently.
+          const runClickPass = async () => {
+            return await chrome.scripting.executeScript({
+              target: { tabId },
+              world: "MAIN",
+              func: async () => {
+                const visible = (el) => {
+                  if (!el) return false;
+                  if (el.offsetParent === null) return false;
+                  const r = el.getBoundingClientRect();
+                  return r.width > 4 && r.height > 4;
+                };
+                // Dismiss any overlaying modal (rate-limit warning, first-
+                // visit tour, etc). Two strategies: Escape key + click on
+                // any "Close" / "Got it" / "Dismiss" button.
+                try {
+                  document.body.dispatchEvent(new KeyboardEvent("keydown", {
+                    key: "Escape", code: "Escape", keyCode: 27, which: 27,
+                    bubbles: true, cancelable: true,
+                  }));
+                  const dismissTexts = ["close", "got it", "dismiss", "ok", "okay", "understood"];
+                  const closeBtn = Array.from(
+                    document.querySelectorAll('button, [role="button"]')
+                  ).find((b) => {
+                    const t = (b.textContent || "").trim().toLowerCase();
+                    return visible(b) && dismissTexts.includes(t);
+                  });
+                  if (closeBtn) closeBtn.click();
+                  // Also click any explicit close icon (aria-label="Close")
+                  const closeIcon = document.querySelector('[aria-label="Close"]');
+                  if (closeIcon && visible(closeIcon)) closeIcon.click();
+                } catch (_e) {}
+                await new Promise((r) => setTimeout(r, 400));
 
-              let btn = findBtn();
-              // If not found immediately, poll for up to 8s — page may
-              // still be hydrating React after the navigation.
-              const findDeadline = Date.now() + 8000;
-              while (!btn && Date.now() < findDeadline) {
-                await new Promise((r) => setTimeout(r, 250));
-                btn = findBtn();
-              }
-              if (!btn) return { error: "new_project_button_not_found" };
-              btn.click();
+                const buttonTextMatches = (b) => {
+                  const t = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+                  return (
+                    t === "new project"
+                    || t === "+ new project"
+                    || t === "create new project"
+                    || t === "create project"
+                    || t === "new flow"
+                    || t === "+ new"
+                    || t.startsWith("new project")
+                  );
+                };
+                const findBtn = () => {
+                  const direct = document.querySelector(
+                    '[data-testid="new-project"], [data-testid="create-project"], '
+                    + '[aria-label="New project"], [aria-label="Create new project"]'
+                  );
+                  if (direct && visible(direct)) return direct;
+                  const all = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                  return all.find((b) => visible(b) && buttonTextMatches(b)) || null;
+                };
 
-              // Wait for URL to transition into a NEW project (different
-              // from any pre-existing project id in the URL). 8 second
-              // budget covers slow networks.
-              const oldMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
-              const oldId = oldMatch ? oldMatch[1] : "";
-              const urlDeadline = Date.now() + 8000;
-              while (Date.now() < urlDeadline) {
-                await new Promise((r) => setTimeout(r, 250));
-                const m = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
-                if (m && m[1] && m[1] !== oldId) {
-                  return { ok: true, pid: m[1] };
+                let btn = findBtn();
+                const findDeadline = Date.now() + 8000;
+                while (!btn && Date.now() < findDeadline) {
+                  await new Promise((r) => setTimeout(r, 250));
+                  btn = findBtn();
                 }
-              }
-              const final = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
-              return final
-                ? { error: "url_no_transition", pid: final[1] }
-                : { error: "no_project_in_url" };
-            },
-          });
+                if (!btn) return { error: "new_project_button_not_found" };
+                btn.click();
 
-          const result = results?.[0]?.result;
+                const oldMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+                const oldId = oldMatch ? oldMatch[1] : "";
+                const urlDeadline = Date.now() + 8000;
+                while (Date.now() < urlDeadline) {
+                  await new Promise((r) => setTimeout(r, 250));
+                  const m = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+                  if (m && m[1] && m[1] !== oldId) {
+                    return { ok: true, pid: m[1] };
+                  }
+                }
+                const final = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+                return final
+                  ? { error: "url_no_transition", pid: final[1] }
+                  : { error: "no_project_in_url" };
+              },
+            });
+          };
+
+          let results = await runClickPass();
+          let result = results?.[0]?.result;
+          // Retry once with a fresh tab reload if the first pass gave any
+          // non-ok outcome. This clears any modal overlay, aborts pending
+          // fetches, and hydrates the picker from scratch.
+          if (!result?.ok) {
+            console.log(
+              `[G-Labs Helper] new_project first pass failed for ${account}: `
+              + (result?.error || "unknown")
+              + ` — reloading tab and retrying once.`
+            );
+            try {
+              await chrome.tabs.reload(tabId);
+              const navDeadline = Date.now() + 15000;
+              while (Date.now() < navDeadline) {
+                await new Promise((r) => setTimeout(r, 400));
+                try {
+                  const t = await chrome.tabs.get(tabId);
+                  if (t?.status === "complete") break;
+                } catch { break; }
+              }
+              await new Promise((r) => setTimeout(r, 1500));
+              results = await runClickPass();
+              result = results?.[0]?.result;
+            } catch (_e) {}
+          }
+
           const pid = result?.pid && result.pid !== oldPid ? result.pid : "";
           if (pid) {
             await fetch(`${BRIDGE_URL}/project`, {
