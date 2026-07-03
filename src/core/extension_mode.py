@@ -18,6 +18,7 @@ import mimetypes
 import os
 import random
 import time
+import urllib.parse
 import uuid
 from typing import Optional, Dict, Any, List
 
@@ -1336,31 +1337,50 @@ class ExtensionWorker:
 
         headers = {"authorization": f"Bearer {access_token}"}
 
-        # ── Method 1: List projects via aisandbox API ──
+        # ── Method 1: List projects via tRPC (new endpoint, July 2026) ──
+        # Google migrated Flow's project APIs to labs.google/fx/api/trpc.
+        # The old aisandbox-pa endpoint (v1/projects) now returns 404.
+        # New endpoint: project.searchUserProjects — tRPC-style GET with
+        # url-encoded JSON input in the ?input= query param.
         try:
+            input_json = (
+                '{"json":{"pageSize":50,"toolName":"PINHOLE","cursor":null},'
+                '"meta":{"values":{"cursor":["undefined"]}}}'
+            )
+            input_encoded = urllib.parse.quote(input_json, safe="")
+            list_url = (
+                "https://labs.google/fx/api/trpc/project.searchUserProjects"
+                f"?input={input_encoded}"
+            )
             async with _make_aiohttp_session() as session:
                 async with session.get(
-                    "https://aisandbox-pa.googleapis.com/v1/projects",
+                    list_url,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if not resp.ok:
                         self._log(
-                            f"[{self.slot_id}] Method 1 (aisandbox API): "
-                            f"HTTP {resp.status} — skipping"
+                            f"[{self.slot_id}] Method 1 (searchUserProjects): "
+                            f"HTTP {resp.status} — trying Method 2"
                         )
                     else:
                         data = await resp.json()
-                        projects = data.get("projects", data.get("project", []))
+                        # Shape: result.data.json.result.projects[].projectId
+                        projects = (
+                            data.get("result", {})
+                                .get("data", {})
+                                .get("json", {})
+                                .get("result", {})
+                                .get("projects", [])
+                        )
                         if not isinstance(projects, list) or not projects:
                             self._log(
-                                f"[{self.slot_id}] Method 1 (aisandbox API): "
-                                f"returned 0 projects — account may have none"
+                                f"[{self.slot_id}] Method 1: returned 0 projects "
+                                f"— account has none, will create one via Method 2"
                             )
                         else:
                             candidates = [
-                                _extract_pid(p.get("name", "") or p.get("projectId", ""))
-                                for p in projects
+                                str(p.get("projectId", "")) for p in projects
                             ]
                             valid = [c for c in candidates if c]
                             burned_count = sum(
@@ -1376,44 +1396,59 @@ class ExtensionWorker:
                                 return pid
                             self._log(
                                 f"[{self.slot_id}] Method 1: all {len(valid)} "
-                                f"listed project(s) in 10-min cooldown — trying Method 2"
+                                f"listed project(s) in cooldown — trying Method 2"
                             )
         except Exception as e:
             self._log(f"[{self.slot_id}] Method 1 exception: {str(e)[:120]}")
 
-        # ── Method 2: listFlows via trpc ──
+        # ── Method 2: Create a fresh project via tRPC API (July 2026) ──
+        # Direct POST to project.createProject. This replaces the fragile
+        # extension button-click flow — creates a project server-side
+        # without needing the tab to be on the dashboard or the "New
+        # project" CTA to be clickable. Returns the new projectId directly.
         try:
+            # Title is cosmetic; use a timestamp so multiple auto-created
+            # projects on the same account remain distinguishable.
+            title = time.strftime("Auto %b %d, %H:%M")
+            create_body = {
+                "json": {
+                    "projectTitle": title,
+                    "toolName": "PINHOLE",
+                }
+            }
             async with _make_aiohttp_session() as session:
-                async with session.get(
-                    "https://labs.google/fx/api/trpc/backbone.listFlows",
-                    headers=headers,
+                async with session.post(
+                    "https://labs.google/fx/api/trpc/project.createProject",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json=create_body,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if not resp.ok:
                         self._log(
-                            f"[{self.slot_id}] Method 2 (listFlows): "
-                            f"HTTP {resp.status} — trying Method 3"
+                            f"[{self.slot_id}] Method 2 (createProject API): "
+                            f"HTTP {resp.status} — trying Method 3 (extension)"
                         )
                     else:
                         data = await resp.json()
-                        flows = data.get("result", {}).get("data", {}).get("flows", [])
-                        if not flows:
+                        pid = (
+                            data.get("result", {})
+                                .get("data", {})
+                                .get("json", {})
+                                .get("result", {})
+                                .get("projectId", "")
+                        )
+                        if pid:
                             self._log(
-                                f"[{self.slot_id}] Method 2 (listFlows): "
-                                f"no flows returned — trying Method 3"
+                                f"[{self.slot_id}] Method 2 OK: created fresh "
+                                f"project {pid} via API (no button click needed)"
                             )
-                        else:
-                            candidates = [str(f.get("name", "")) for f in flows]
-                            pid = _pick_unburned(candidates)
-                            if pid:
-                                self._log(
-                                    f"[{self.slot_id}] Method 2 OK: {pid}"
-                                )
-                                return pid
-                            self._log(
-                                f"[{self.slot_id}] Method 2: all {len(candidates)} "
-                                f"flow(s) burned — trying Method 3"
-                            )
+                            # Post it back to the bridge so other workers see it
+                            self._bridge.set_project_id(self.account_email, pid)
+                            return pid
+                        self._log(
+                            f"[{self.slot_id}] Method 2: response OK but no "
+                            f"projectId in payload — trying Method 3"
+                        )
         except Exception as e:
             self._log(f"[{self.slot_id}] Method 2 exception: {str(e)[:120]}")
 
