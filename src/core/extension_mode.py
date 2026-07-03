@@ -1512,6 +1512,16 @@ class ExtensionModeManager:
             self._log("[ExtMode] ERROR: aiohttp not installed. Run: pip install aiohttp")
             return
 
+        # Reset class-level asyncio locks. asyncio.Lock objects are bound to
+        # the event loop that was current when they were created. When the
+        # queue manager is stopped and restarted, a NEW event loop starts
+        # but the class-level dicts still hold locks from the OLD loop —
+        # every acquire then throws "bound to a different event loop" and
+        # every job fails. Clearing here forces fresh locks in the current
+        # loop on the next _resolve_project_id / _upload_reference call.
+        ExtensionWorker._project_locks.clear()
+        ExtensionWorker._reference_cache_locks.clear()
+
         # Start bridge server
         await self._bridge.start()
 
