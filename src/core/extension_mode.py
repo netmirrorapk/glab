@@ -2284,6 +2284,23 @@ class ExtensionModeManager:
                     )
                     if dl_error:
                         last_error = dl_error
+                        # 403 on the download step means Google's CDN
+                        # rejected our request — either the Bearer token
+                        # expired between generation and download or the
+                        # account has been silently throttled. Force a
+                        # token refresh on the next attempt by discarding
+                        # the worker's cached one, and wait a bit longer
+                        # so a transient throttle can lift.
+                        if "403" in str(dl_error):
+                            self._log(
+                                f"[{worker.slot_id}] Download 403 — likely stale "
+                                f"Bearer token or CDN throttle. Discarding cached "
+                                f"token; next attempt will fetch a fresh one."
+                            )
+                            worker.last_access_token = None
+                            if attempt < max_retries:
+                                await asyncio.sleep(20)
+                                continue
                         self._log(f"[{worker.slot_id}] Download failed: {dl_error[:200]}")
                         if attempt < max_retries:
                             await asyncio.sleep(5)
@@ -2605,6 +2622,13 @@ class ExtensionModeManager:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
             "referer": "https://labs.google/",
         }
+        # Google started returning 403 on fifeUrl / backbone.redirect for
+        # anonymous requests (mid-2026). Attach the Bearer token so the CDN
+        # sees an authenticated principal and serves the bytes. Same for
+        # images and videos — video path adds cookies below, image path
+        # (the common one) needs at least the Authorization header.
+        if access_token:
+            dl_headers["authorization"] = f"Bearer {access_token}"
 
         # ── VIDEO: direct HTTP with browser cookies (fast) ──
         if is_video:
