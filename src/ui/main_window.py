@@ -10597,9 +10597,27 @@ class MainWindow(QMainWindow):
 
         current_settings = self._current_generation_settings()
         pending_count = self._cached_pending_count()
+
+        # On (re)start of the queue, propagate the CURRENT UI settings —
+        # especially model + aspect ratio — to any pending jobs whose fields
+        # were saved with older values. Previously the queue would honor
+        # each job's saved model even if the user had since changed the
+        # dropdown, so a stop → change model → start cycle appeared to do
+        # nothing. This fires the same background sync that runs on live
+        # settings changes so no per-job override survives a restart.
+        if pending_count > 0:
+            try:
+                self._sync_pending_queue_jobs_to_current_settings()
+                self.append_log(
+                    f"[SETTINGS] Syncing {pending_count} pending job(s) to "
+                    f"current UI: model={current_settings['model']}, "
+                    f"ratio={current_settings['aspect_ratio']}."
+                )
+            except Exception as exc:
+                self.append_log(f"[SETTINGS] Pending sync skipped: {exc}")
+
         self.append_log(
-            f"[SETTINGS] Pending queue keeps per-job settings for {pending_count} task(s). "
-            f"Current panel default: {current_settings['job_type']}, "
+            f"[SETTINGS] Current panel default: {current_settings['job_type']}, "
             f"{current_settings['model']}, {current_settings['aspect_ratio']}, "
             f"x{current_settings['output_count']}, "
             f"references={len(current_settings.get('ref_paths') or [])}, "

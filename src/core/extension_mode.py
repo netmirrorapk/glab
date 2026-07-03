@@ -1859,14 +1859,23 @@ class ExtensionModeManager:
             self._account_last_cleanup[account_email] = now
 
     def _try_swap_image_model(self, job_id: str):
-        """Swap a job's image model between Nano Banana and Nano Banana Pro
-        when the current model hits a daily/per-model quota. Returns the
-        new model name on success, or None if we can't / shouldn't swap.
+        """Rotate a job's image model through Standard → Lite → Pro (or any
+        starting model) when the current model hits a daily/per-model quota.
+        Returns the new model name on success, or None if every model has
+        already been tried for this job.
 
-        Tracks which models have been tried for each job in
-        self._job_models_tried so we never ping-pong between the same
-        two models forever — once both have been tried for a given job,
-        further calls return None and the normal 429 pause path kicks in.
+        The three Flow image models have INDEPENDENT quotas on Google's side:
+          - Nano Banana 2         → NARWHAL
+          - Nano Banana 2 Lite    → HARBOR_SEAL
+          - Nano Banana Pro       → GEM_PIX_2
+        so exhausting one still leaves the other two available. This method
+        picks whichever of the three hasn't been tried yet for THIS job,
+        preferring same-family siblings first (Standard ↔ Lite, both are
+        ~similar quality) and Pro as the last resort (highest quality, slower).
+
+        Ping-pong prevention: self._job_models_tried[job_id] is a set of the
+        UI-name strings already attempted. Once all 3 are in the set, this
+        method returns None and the normal 429 pause cascade kicks in.
         """
         # Lazy-init the tracking dict
         if not hasattr(self, "_job_models_tried"):
@@ -1879,26 +1888,48 @@ class ExtensionModeManager:
         if not current:
             return None
 
+        # Classify the current model into a canonical bucket. Order matters:
+        # "lite" before generic "nano" (Lite contains "nano banana"), and
+        # "pro" before generic "nano".
         low = current.lower()
-        # Determine the alternate model. "pro" check first because "Nano
-        # Banana Pro" also contains "nano banana".
-        if "pro" in low and "nano" in low:
-            alternate = "Nano Banana 2"
+        if "lite" in low and "nano" in low:
+            current_bucket = "lite"
+        elif "pro" in low and "nano" in low:
+            current_bucket = "pro"
         elif "nano" in low or "narwhal" in low:
-            alternate = "Nano Banana Pro"
+            current_bucket = "standard"
         elif "imagen" in low:
-            # Imagen-family all maps to NARWHAL — Pro is the alternate
-            alternate = "Nano Banana Pro"
+            # Imagen-family currently resolves to NARWHAL server-side, so
+            # treat it as the Standard bucket for rotation purposes.
+            current_bucket = "standard"
         else:
-            # Unknown model — can't infer the swap target
+            # Unknown starting model — can't safely rotate.
             return None
 
-        tried = self._job_models_tried.setdefault(job_id, set())
-        if alternate.lower() in tried:
-            return None  # Already tried the alternate too — give up
-        tried.add(low)
-        tried.add(alternate.lower())
+        # Preferred rotation order per starting bucket. Same-family sibling
+        # first, Pro (premium) last.
+        rotation_map = {
+            "standard": ["Nano Banana 2 Lite", "Nano Banana Pro"],
+            "lite":     ["Nano Banana 2",      "Nano Banana Pro"],
+            "pro":      ["Nano Banana 2",      "Nano Banana 2 Lite"],
+        }
+        candidates = rotation_map.get(current_bucket, [])
 
+        tried = self._job_models_tried.setdefault(job_id, set())
+        tried.add(low)  # Mark the current one as tried
+
+        # Pick the first candidate not yet attempted for this job.
+        alternate = None
+        for cand in candidates:
+            if cand.lower() not in tried:
+                alternate = cand
+                break
+
+        if alternate is None:
+            # All three models exhausted for this job — surrender to pause.
+            return None
+
+        tried.add(alternate.lower())
         try:
             update_job_model(job_id, alternate)
         except Exception:
