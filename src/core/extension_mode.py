@@ -1358,6 +1358,25 @@ class ExtensionWorker:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
+                    if resp.status == 401:
+                        # 401 on the tRPC endpoints means Google is telling
+                        # us this account hasn't finished Flow onboarding
+                        # yet (fresh Gmail that's never opened Flow) OR
+                        # the Bearer token doesn't have the scope this
+                        # endpoint requires. No amount of retrying will
+                        # fix it — the user must open labs.google/fx/tools/
+                        # flow for this account manually, accept ToS, and
+                        # create at least one project. Fail fast so we
+                        # don't waste 3×20s on Method 3 timeouts.
+                        self._log(
+                            f"[{self.slot_id}] ⚠ Method 1 returned HTTP 401 — "
+                            f"account '{self.account_email}' has not completed "
+                            f"Flow onboarding. Open labs.google/fx/tools/flow "
+                            f"for this account, accept ToS, click 'New project' "
+                            f"once, then restart automation. Skipping Methods "
+                            f"2-4 to save time."
+                        )
+                        return None
                     if not resp.ok:
                         self._log(
                             f"[{self.slot_id}] Method 1 (searchUserProjects): "
