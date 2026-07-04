@@ -1541,6 +1541,12 @@ class ExtensionModeManager:
         self._recaptcha_recovery_attempts: Dict[str, int] = {}
         self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS = 3
         self._recovery_in_progress: Dict[str, float] = {}  # account -> lock timestamp
+        # Track last-success time per account so recovery can decide
+        # whether to rotate the VPN (a global action that briefly
+        # interrupts every account) or skip it because other accounts
+        # are still generating fine — proving the IP is healthy and
+        # the cascade is account-specific.
+        self._account_last_success: Dict[str, float] = {}
 
         # ─── Auto tracking cleanup — keeps reCAPTCHA score healthy ───
         self._account_gen_count: Dict[str, int] = {}   # account -> generations since last cleanup
@@ -2324,6 +2330,11 @@ class ExtensionModeManager:
                         # MAX_RECAPTCHA_RECOVERY_ATTEMPTS budget instead
                         # of jumping straight to HOLD.
                         self._recaptcha_recovery_attempts.pop(worker.account_email, None)
+                        # Record last-success timestamp — a peer account's
+                        # recovery uses this to decide whether the shared
+                        # VPN IP is still healthy (skip rotation) or if
+                        # everyone is failing (rotation warranted).
+                        self._account_last_success[worker.account_email] = time.time()
                         # Reset 429 streak — account is back to normal
                         self.qm.clear_429_streak(worker.account_email)
                         # Track generation count for auto cleanup
@@ -2534,34 +2545,56 @@ class ExtensionModeManager:
                             )
                             await asyncio.sleep(2)
 
-                            # Step 3a: Ask Surfshark-Rotate.ps1 to rotate the
-                            # VPN NOW by touching its trigger file. The
-                            # script polls this file every 3s and rotates
-                            # the adapter immediately when it appears
-                            # (falls back to no-op if the script isn't
-                            # running — worst case is the old timing-
-                            # coincidence behaviour, not a regression).
-                            try:
-                                import tempfile as _tempfile
-                                trigger_path = os.path.join(
-                                    _tempfile.gettempdir(),
-                                    "glabs_vpn_rotate.trigger",
+                            # Step 3a: SMART VPN rotation — only trigger the
+                            # Surfshark restart if peer accounts on the same
+                            # PC are ALSO failing. If someone else generated
+                            # successfully in the last 60 seconds, the
+                            # shared IP is fine and this cascade is
+                            # reputation-specific to the one account; a
+                            # global adapter restart would just interrupt
+                            # the healthy accounts for no benefit.
+                            peer_recent_success = False
+                            now_check = time.time()
+                            for peer_email, last_ok in self._account_last_success.items():
+                                if peer_email == worker.account_email:
+                                    continue
+                                if now_check - last_ok < 60:
+                                    peer_recent_success = True
+                                    break
+
+                            if peer_recent_success:
+                                self._log(
+                                    f"[ExtMode] 🌐 Skipping VPN rotation — a peer "
+                                    f"account generated successfully in the last "
+                                    f"60s, so the shared IP is healthy. This "
+                                    f"cascade is account-specific; cache clear + "
+                                    f"reCAPTCHA cookie drop + tab reload will "
+                                    f"handle it without interrupting the peers."
                                 )
-                                with open(trigger_path, "w", encoding="utf-8") as _f:
-                                    _f.write(
-                                        f"rotate requested by {worker.account_email} "
-                                        f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            else:
+                                try:
+                                    import tempfile as _tempfile
+                                    trigger_path = os.path.join(
+                                        _tempfile.gettempdir(),
+                                        "glabs_vpn_rotate.trigger",
                                     )
-                                self._log(
-                                    f"[ExtMode] 🌐 VPN rotation trigger written "
-                                    f"({trigger_path}). Surfshark-Rotate.ps1 will "
-                                    f"restart the adapter within ~3s if running."
-                                )
-                            except Exception as _e:
-                                self._log(
-                                    f"[ExtMode] VPN trigger write failed "
-                                    f"({str(_e)[:80]}) — recovery still proceeds."
-                                )
+                                    with open(trigger_path, "w", encoding="utf-8") as _f:
+                                        _f.write(
+                                            f"rotate requested by {worker.account_email} "
+                                            f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                        )
+                                    self._log(
+                                        f"[ExtMode] 🌐 No peer has succeeded in the "
+                                        f"last 60s — likely an IP-level issue. VPN "
+                                        f"rotation trigger written ({trigger_path}). "
+                                        f"Surfshark-Rotate.ps1 will restart the "
+                                        f"adapter within ~3s if running."
+                                    )
+                                except Exception as _e:
+                                    self._log(
+                                        f"[ExtMode] VPN trigger write failed "
+                                        f"({str(_e)[:80]}) — recovery still proceeds."
+                                    )
 
                             # Step 3b: Reload the Flow tab. Fresh page = fresh
                             # reCAPTCHA context, and the VPN trigger above
