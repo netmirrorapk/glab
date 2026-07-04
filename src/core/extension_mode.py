@@ -2534,17 +2534,40 @@ class ExtensionModeManager:
                             )
                             await asyncio.sleep(2)
 
-                            # Step 3: Reload the Flow tab. Fresh page = fresh
-                            # reCAPTCHA context, and (if the user has an
-                            # external VPN rotator like Surfshark running)
-                            # the request will go out on whichever IP is
-                            # current after the reload settles.
+                            # Step 3a: Ask Surfshark-Rotate.ps1 to rotate the
+                            # VPN NOW by touching its trigger file. The
+                            # script polls this file every 3s and rotates
+                            # the adapter immediately when it appears
+                            # (falls back to no-op if the script isn't
+                            # running — worst case is the old timing-
+                            # coincidence behaviour, not a regression).
+                            try:
+                                import tempfile as _tempfile
+                                trigger_path = os.path.join(
+                                    _tempfile.gettempdir(),
+                                    "glabs_vpn_rotate.trigger",
+                                )
+                                with open(trigger_path, "w", encoding="utf-8") as _f:
+                                    _f.write(
+                                        f"rotate requested by {worker.account_email} "
+                                        f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                    )
+                                self._log(
+                                    f"[ExtMode] 🌐 VPN rotation trigger written "
+                                    f"({trigger_path}). Surfshark-Rotate.ps1 will "
+                                    f"restart the adapter within ~3s if running."
+                                )
+                            except Exception as _e:
+                                self._log(
+                                    f"[ExtMode] VPN trigger write failed "
+                                    f"({str(_e)[:80]}) — recovery still proceeds."
+                                )
+
+                            # Step 3b: Reload the Flow tab. Fresh page = fresh
+                            # reCAPTCHA context, and the VPN trigger above
+                            # should have handed us a new IP by the time
+                            # the tab finishes loading.
                             self._bridge.send_command("reload_tab", worker.account_email)
-                            self._log(
-                                f"[ExtMode] 🔄 If using a VPN, this is the moment "
-                                f"to rotate IP — recovery waits 45s for tab reload "
-                                f"and reCAPTCHA to re-initialise."
-                            )
 
                             # Step 4: Wait for the tab reload + reCAPTCHA to settle.
                             # Longer wait than the 5s the old code used because
