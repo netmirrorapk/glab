@@ -2768,6 +2768,48 @@ class ExtensionModeManager:
                                 slot_id=worker.slot_id,
                             )
                     tier1_status = resp.status
+                    # On non-2xx, capture the response body and a few
+                    # diagnostic headers so we can see WHY Google's CDN
+                    # rejected the request. Signed-URL 403s usually
+                    # include an XML error body or a header like
+                    # x-goog-error / server=UploadServer with hints
+                    # about signature mismatch, expired timestamp, or
+                    # IP-based throttling.
+                    try:
+                        body_preview = (await resp.text())[:500]
+                    except Exception:
+                        body_preview = "<body-read-failed>"
+                    diag_headers = {
+                        k: v for k, v in resp.headers.items()
+                        if k.lower() in (
+                            "server", "x-goog-error", "x-guploader-uploadid",
+                            "www-authenticate", "content-type", "content-length",
+                            "x-content-type-options", "x-frame-options",
+                        )
+                    }
+                    now_ts = int(time.time())
+                    # Extract Expires= from the URL so we can see if the
+                    # signature has expired vs current time.
+                    exp_match = None
+                    try:
+                        import re as _re
+                        m = _re.search(r"Expires=(\d+)", fife_url)
+                        if m:
+                            exp_match = int(m.group(1))
+                    except Exception:
+                        pass
+                    exp_note = ""
+                    if exp_match:
+                        delta = exp_match - now_ts
+                        exp_note = (
+                            f", Expires={exp_match} (now={now_ts}, "
+                            f"{'expired' if delta < 0 else f'valid for {delta}s'})"
+                        )
+                    self._log(
+                        f"[{worker.slot_id}] Tier-1 {tier1_status} — "
+                        f"headers={diag_headers}{exp_note} — "
+                        f"body[:500]={body_preview!r}"
+                    )
         except Exception as e:
             tier1_status = f"exception: {str(e)[:80]}"
 
