@@ -2572,6 +2572,15 @@ class ExtensionModeManager:
                             # reputation-specific to the one account; a
                             # global adapter restart would just interrupt
                             # the healthy accounts for no benefit.
+                            #
+                            # EXCEPTION: on the LAST recovery attempt (i.e.
+                            # attempts 1-2 already failed with cache clear
+                            # alone), force the VPN rotation regardless of
+                            # peer health. Two rounds of soft recovery
+                            # didn't help — the account will be HELD if
+                            # this one fails too, so it's worth the brief
+                            # peer disruption to try the one thing that
+                            # historically WORKS in this state (IP change).
                             peer_recent_success = False
                             now_check = time.time()
                             for peer_email, last_ok in self._account_last_success.items():
@@ -2581,16 +2590,34 @@ class ExtensionModeManager:
                                     peer_recent_success = True
                                     break
 
-                            if peer_recent_success:
+                            is_final_attempt = (
+                                recovery_count + 1 >= self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS
+                            )
+
+                            if peer_recent_success and not is_final_attempt:
                                 self._log(
                                     f"[ExtMode] 🌐 Skipping VPN rotation — a peer "
                                     f"account generated successfully in the last "
                                     f"60s, so the shared IP is healthy. This "
                                     f"cascade is account-specific; cache clear + "
                                     f"reCAPTCHA cookie drop + tab reload will "
-                                    f"handle it without interrupting the peers."
+                                    f"handle it without interrupting the peers. "
+                                    f"(VPN will be forced on the final recovery "
+                                    f"attempt if this one doesn't succeed.)"
                                 )
                             else:
+                                if peer_recent_success and is_final_attempt:
+                                    self._log(
+                                        f"[ExtMode] 🌐 FINAL recovery attempt "
+                                        f"({recovery_count + 1}/"
+                                        f"{self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS}) — "
+                                        f"forcing VPN rotation even though a peer "
+                                        f"account is healthy. Previous 2 attempts "
+                                        f"didn't fix the reputation with cache "
+                                        f"clear alone; brief peer interruption is "
+                                        f"worth the chance of a fresh IP unlocking "
+                                        f"this account before HOLD."
+                                    )
                                 try:
                                     import tempfile as _tempfile
                                     trigger_path = os.path.join(
@@ -2600,14 +2627,22 @@ class ExtensionModeManager:
                                     with open(trigger_path, "w", encoding="utf-8") as _f:
                                         _f.write(
                                             f"rotate requested by {worker.account_email} "
-                                            f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                            f"at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                            f"(recovery {recovery_count + 1}/"
+                                            f"{self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS})\n"
                                         )
+                                    reason = (
+                                        "final recovery attempt"
+                                        if is_final_attempt
+                                        else "no peer has succeeded in the last 60s"
+                                    )
                                     self._log(
-                                        f"[ExtMode] 🌐 No peer has succeeded in the "
-                                        f"last 60s — likely an IP-level issue. VPN "
-                                        f"rotation trigger written ({trigger_path}). "
-                                        f"Surfshark-Rotate.ps1 will restart the "
-                                        f"adapter within ~3s if running."
+                                        f"[ExtMode] 🌐 VPN rotation trigger written "
+                                        f"({reason}). Surfshark-Rotate.ps1 will "
+                                        f"restart the adapter within ~3s if "
+                                        f"running. If not running, start it now: "
+                                        f"powershell -File "
+                                        f"'C:\\Users\\PC\\Desktop\\Surfshark-Rotate.ps1'"
                                     )
                                 except Exception as _e:
                                     self._log(
