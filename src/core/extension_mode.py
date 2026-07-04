@@ -2596,13 +2596,30 @@ class ExtensionModeManager:
             is_video = True
 
         # ── IMAGE: extract fifeUrl or build backbone.redirect URL ──
+        # Historical shapes we've seen from Google:
+        #   media[].image.generatedImage.fifeUrl    (original)
+        #   media[].image.imageUrl                  (new, mid-2026)
+        #   media[].image.url                       (some variants)
+        #   Plus name-based fallback via backbone.redirect
         if not fife_url:
             media_list = api_data.get("media", []) if isinstance(api_data, dict) else []
             media_name = None
             for item in media_list:
-                url = (item.get("image", {}).get("generatedImage", {}).get("fifeUrl", "")
-                       if isinstance(item, dict) else "")
-                name = item.get("name", "") if isinstance(item, dict) else ""
+                if not isinstance(item, dict):
+                    continue
+                img = item.get("image", {}) if isinstance(item.get("image"), dict) else {}
+                gen = img.get("generatedImage", {}) if isinstance(img.get("generatedImage"), dict) else {}
+                # Try every known field name, in order of preference
+                url = (
+                    gen.get("fifeUrl", "")
+                    or gen.get("imageUrl", "")
+                    or gen.get("url", "")
+                    or img.get("fifeUrl", "")
+                    or img.get("imageUrl", "")
+                    or img.get("url", "")
+                    or item.get("fifeUrl", "")
+                )
+                name = item.get("name", "") or gen.get("name", "") or img.get("name", "")
                 if url:
                     fife_url = url
                     break
@@ -2616,7 +2633,26 @@ class ExtensionModeManager:
                 )
 
         if not fife_url:
+            # Log the api_data shape so we can figure out what field name
+            # Google is actually returning — the code above tries every
+            # historical name we know but the response format changes.
+            try:
+                shape = json.dumps(api_data, indent=2, default=str)[:1500]
+            except Exception:
+                shape = str(api_data)[:1500]
+            self._log(
+                f"[{worker.slot_id}] No downloadable media URL in response — "
+                f"api_data shape (first 1500 chars):\n{shape}"
+            )
             return None, "No downloadable media in API response"
+
+        # Log the resolved URL so we can see what's actually being fetched
+        # when 403s hit — useful for spotting when Google changes the
+        # CDN host or requires a new signature scheme.
+        self._log(
+            f"[{worker.slot_id}] Download URL resolved: {fife_url[:150]}"
+            + ("…" if len(fife_url) > 150 else "")
+        )
 
         dl_headers = {
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
