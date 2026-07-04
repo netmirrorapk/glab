@@ -2686,25 +2686,97 @@ class ExtensionModeManager:
             except Exception as e:
                 return None, f"Download error: {str(e)[:200]}"
 
-        # ── IMAGE: direct aiohttp download (no cookies needed) ──
+        # ── IMAGE: download with browser cookies + fall back to extension ──
+        # Google's fifeUrl / backbone.redirect endpoints require an
+        # authenticated Google session cookie (mid-2026 change). The
+        # Bearer token alone is not sufficient — the CDN validates the
+        # SAPISID / __Secure-3PSID cookies too. We follow the same 2-tier
+        # pattern the video path uses:
+        #   Tier 1: fetch cookies via extension, do the fetch ourselves
+        #   Tier 2: ask the extension to download via chrome.fetch (it
+        #           runs inside the tab so cookies attach automatically)
         try:
+            # Tier 1 — direct aiohttp with cookies from the extension
+            try:
+                cookie_result = await worker._bridge.request_token(
+                    worker.account_email, "GET_COOKIES", timeout=10.0,
+                )
+                cookie_str = str(cookie_result.get("cookies", "") or "")
+            except Exception:
+                cookie_str = ""
+            headers_with_cookies = dict(dl_headers)
+            if cookie_str:
+                headers_with_cookies["cookie"] = cookie_str
+
             async with _make_aiohttp_session() as session:
                 async with session.get(
                     fife_url,
-                    headers=dl_headers,
+                    headers=headers_with_cookies,
                     timeout=aiohttp.ClientTimeout(total=120),
                     allow_redirects=True,
                 ) as resp:
-                    if not resp.ok:
-                        return None, f"Download HTTP {resp.status}"
+                    if resp.ok:
+                        content_type = str(resp.headers.get("content-type", "")).lower()
+                        data = await resp.read()
+                        if data:
+                            return await self._save_media(
+                                job_id, data, content_type, queue_no,
+                                slot_id=worker.slot_id,
+                            )
+                    tier1_status = resp.status
+        except Exception as e:
+            tier1_status = f"exception: {str(e)[:80]}"
 
-                    content_type = str(resp.headers.get("content-type", "")).lower()
-                    data = await resp.read()
-                    if not data:
-                        return None, "Downloaded empty file"
+        # Tier 2 — extension-side download (fetches from inside the labs
+        # tab so session cookies attach automatically). Slower than Tier 1
+        # but reliable when Google's CDN 403s the aiohttp request.
+        try:
+            self._log(
+                f"[{worker.slot_id}] Tier-1 download failed ({tier1_status}); "
+                f"falling back to extension-side fetch."
+            )
+            bridge_result = await worker._bridge.request_token(
+                worker.account_email,
+                f"FETCH_MEDIA_BYTES:{fife_url}",
+                timeout=60.0,
+            )
+            err = bridge_result.get("error", "")
+            if err:
+                return None, f"Download HTTP {tier1_status} (bridge: {err})"
 
-            return await self._save_media(job_id, data, content_type, queue_no, slot_id=worker.slot_id)
+            # Extension either hands us the raw bytes or a CDN URL that
+            # will accept a follow-up unauthenticated request.
+            b64 = bridge_result.get("data_b64", "")
+            if b64:
+                import base64 as _b64
+                data = _b64.b64decode(b64)
+                content_type = str(bridge_result.get("content_type", "image/jpeg"))
+                return await self._save_media(
+                    job_id, data, content_type, queue_no,
+                    slot_id=worker.slot_id,
+                )
 
+            cdn_url = bridge_result.get("cdn_url", "")
+            if cdn_url:
+                async with _make_aiohttp_session() as session:
+                    async with session.get(
+                        cdn_url,
+                        headers=dl_headers,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                        allow_redirects=True,
+                    ) as resp:
+                        if not resp.ok:
+                            return None, f"Download HTTP {resp.status}"
+                        content_type = str(resp.headers.get("content-type", "")).lower()
+                        data = await resp.read()
+                        if not data:
+                            return None, "Downloaded empty file"
+                return await self._save_media(
+                    job_id, data, content_type, queue_no,
+                    slot_id=worker.slot_id,
+                )
+
+            return None, f"Download HTTP {tier1_status} (bridge returned nothing)"
         except Exception as e:
             return None, f"Download error: {str(e)[:200]}"
 

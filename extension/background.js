@@ -401,6 +401,64 @@ async function handleWork(work) {
     return;
   }
 
+  // ─── FETCH_MEDIA_BYTES: fetch a URL from inside the labs.google tab
+  //     (so cookies attach) and return raw bytes as base64. Used by the
+  //     image download path when a direct aiohttp request comes back 403
+  //     because Google's CDN now requires an authenticated session.
+  if (action && action.startsWith("FETCH_MEDIA_BYTES:")) {
+    const mediaUrl = action.slice("FETCH_MEDIA_BYTES:".length);
+    const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+    const tabId = allLabsTabs.length > 0 ? allLabsTabs[0].id : null;
+    if (!tabId) {
+      await submitResult(request_id, { error: "no_labs_tab_for_fetch" });
+      return;
+    }
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: async (url) => {
+          try {
+            const r = await fetch(url, {
+              method: "GET",
+              credentials: "include",
+              redirect: "follow",
+            });
+            if (!r.ok) return { error: `fetch_${r.status}` };
+            const ct = r.headers.get("content-type") || "image/jpeg";
+            const buf = await r.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let bin = "";
+            const chunk = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunk) {
+              bin += String.fromCharCode.apply(
+                null, bytes.subarray(i, i + chunk)
+              );
+            }
+            return { data_b64: btoa(bin), content_type: ct };
+          } catch (e) {
+            return { error: "fetch_exception: " + (e && e.message || e) };
+          }
+        },
+        args: [mediaUrl],
+      });
+      const r = results?.[0]?.result;
+      if (r?.error) {
+        await submitResult(request_id, { error: r.error });
+      } else if (r?.data_b64) {
+        await submitResult(request_id, {
+          data_b64: r.data_b64,
+          content_type: r.content_type || "image/jpeg",
+        });
+      } else {
+        await submitResult(request_id, { error: "empty_fetch_result" });
+      }
+    } catch (e) {
+      await submitResult(request_id, { error: e.message || "fetch_bytes_error" });
+    }
+    return;
+  }
+
   // ─── DOWNLOAD_MEDIA: resolve redirect URL via webRequest + MAIN world fetch (fallback) ───
   if (action && action.startsWith("DOWNLOAD_MEDIA:")) {
     const mediaUrl = action.slice("DOWNLOAD_MEDIA:".length);
