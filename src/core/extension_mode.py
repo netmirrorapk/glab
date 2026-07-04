@@ -1533,7 +1533,14 @@ class ExtensionModeManager:
         self._last_dispatch_ts: Dict[str, float] = {}  # account -> last dispatch timestamp
         # reCAPTCHA streak tracking — auto-hold after consecutive failures
         self._recaptcha_streak: Dict[str, int] = {}  # account -> consecutive recaptcha failures
-        self.RECAPTCHA_HOLD_THRESHOLD = 3  # hold account after this many consecutive failures
+        self.RECAPTCHA_HOLD_THRESHOLD = 3  # after this many consecutive failures, START recovery (not HOLD)
+        # Auto-recovery tracking — mirrors the user's manual dance
+        # (clear cache/history + reconnect VPN + reload Flow tab). We
+        # try this AUTOMATICALLY before ever holding an account, and
+        # only hold after MAX_RECOVERY_ATTEMPTS rounds all fail.
+        self._recaptcha_recovery_attempts: Dict[str, int] = {}
+        self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS = 3
+        self._recovery_in_progress: Dict[str, float] = {}  # account -> lock timestamp
 
         # ─── Auto tracking cleanup — keeps reCAPTCHA score healthy ───
         self._account_gen_count: Dict[str, int] = {}   # account -> generations since last cleanup
@@ -2311,6 +2318,12 @@ class ExtensionModeManager:
                         self.qm._record_throttle_success(worker.account_email)
                         # Reset reCAPTCHA streak on success
                         self._recaptcha_streak.pop(worker.account_email, None)
+                        # Reset the recovery-attempt counter too — a
+                        # successful generation proves the recovery
+                        # worked, so the next cascade gets a fresh
+                        # MAX_RECAPTCHA_RECOVERY_ATTEMPTS budget instead
+                        # of jumping straight to HOLD.
+                        self._recaptcha_recovery_attempts.pop(worker.account_email, None)
                         # Reset 429 streak — account is back to normal
                         self.qm.clear_429_streak(worker.account_email)
                         # Track generation count for auto cleanup
@@ -2422,7 +2435,10 @@ class ExtensionModeManager:
                     self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                     return
 
-                # reCAPTCHA score/token failure → track streak, hold if persistent
+                # reCAPTCHA score/token failure → track streak, trigger
+                # auto-recovery on cascade (mirrors user's manual flow of
+                # clear cache + reconnect VPN + reload Flow + retry).
+                # Only HOLD after MAX_RECAPTCHA_RECOVERY_ATTEMPTS rounds all fail.
                 if "recaptcha" in err_lower or "captcha" in err_lower:
                     streak = self._recaptcha_streak.get(worker.account_email, 0) + 1
                     self._recaptcha_streak[worker.account_email] = streak
@@ -2431,44 +2447,124 @@ class ExtensionModeManager:
                     )
 
                     if streak >= self.RECAPTCHA_HOLD_THRESHOLD:
-                        already_held = self.qm.account_disabled.get(worker.account_email, False)
-                        # Account is flagged — hold it and reassign jobs
-                        self.qm.account_disabled[worker.account_email] = True
-                        # Also hold ecosystem activity for this account (48h default)
-                        # Using warmup on a flagged account makes things worse.
-                        try:
-                            self._bridge.hold_ecosystem_account(
-                                worker.account_email, duration_seconds=172800
-                            )
-                        except Exception:
-                            pass
-                        if not already_held:
-                            # First slot to detect — log, warn, reassign
-                            self._log(
-                                f"[ExtMode] ⛔ Account {worker.account_email} hit {streak} consecutive "
-                                f"reCAPTCHA failures — HOLDING account and reassigning jobs."
-                            )
-                            self.qm.signals.account_auth_status.emit(
-                                worker.account_email, "expired",
-                                f"reCAPTCHA flagged ({streak} failures)"
-                            )
-                            # Show warning popup
-                            self.qm.signals.show_warning.emit(
-                                f"Account '{worker.account_email}' has {streak} consecutive reCAPTCHA failures.\n"
-                                f"Google has likely flagged this account.\n"
-                                f"Close this account's extension tab and use a different account."
-                            )
-                            # Reassign this account's pending/running jobs to other accounts
+                        recovery_count = self._recaptcha_recovery_attempts.get(
+                            worker.account_email, 0
+                        )
+                        # Give up only if we've already tried recovery
+                        # MAX_RECAPTCHA_RECOVERY_ATTEMPTS times and reCAPTCHA
+                        # is STILL failing on that account.
+                        if recovery_count >= self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS:
+                            already_held = self.qm.account_disabled.get(worker.account_email, False)
+                            self.qm.account_disabled[worker.account_email] = True
                             try:
-                                from src.db.db_manager import reassign_account_jobs
-                                count = reassign_account_jobs(worker.account_email)
-                                if count > 0:
-                                    self._log(
-                                        f"[ExtMode] Reassigned {count} job(s) from {worker.account_email} to other accounts."
-                                    )
+                                self._bridge.hold_ecosystem_account(
+                                    worker.account_email, duration_seconds=172800
+                                )
                             except Exception:
                                 pass
-                        # Re-queue current job too
+                            if not already_held:
+                                self._log(
+                                    f"[ExtMode] ⛔ Account {worker.account_email} exhausted "
+                                    f"{recovery_count} recovery attempts — HOLDING account. "
+                                    f"reCAPTCHA reputation not recovering; account needs "
+                                    f"24-48h rest."
+                                )
+                                self.qm.signals.account_auth_status.emit(
+                                    worker.account_email, "expired",
+                                    f"reCAPTCHA flagged (after {recovery_count} recoveries)"
+                                )
+                                self.qm.signals.show_warning.emit(
+                                    f"Account '{worker.account_email}' failed to recover after "
+                                    f"{recovery_count} auto-recovery attempts.\n"
+                                    f"Google's reCAPTCHA reputation is not improving.\n"
+                                    f"Rest this account 24-48h or use a different one."
+                                )
+                                try:
+                                    from src.db.db_manager import reassign_account_jobs
+                                    count = reassign_account_jobs(worker.account_email)
+                                    if count > 0:
+                                        self._log(
+                                            f"[ExtMode] Reassigned {count} job(s) from "
+                                            f"{worker.account_email} to other accounts."
+                                        )
+                                except Exception:
+                                    pass
+                            update_job_status(job_id, "pending", account="")
+                            self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                            return
+
+                        # ── AUTO-RECOVERY (mirrors user's manual flow) ──
+                        # Only one worker per account runs the recovery
+                        # sequence at a time; other workers wait via the
+                        # streak-check on the next iteration.
+                        now = time.time()
+                        lock_ts = self._recovery_in_progress.get(worker.account_email, 0)
+                        if now - lock_ts < 60:
+                            # Another worker started recovery <60s ago —
+                            # just wait for it, then retry.
+                            self._log(
+                                f"[{worker.slot_id}] Recovery already in progress for "
+                                f"{worker.account_email} — waiting 15s then retrying."
+                            )
+                            await asyncio.sleep(15)
+                            if self.qm.stop_requested or self.qm.force_stop_requested:
+                                update_job_status(job_id, "pending", account="")
+                                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                                return
+                            continue
+
+                        self._recovery_in_progress[worker.account_email] = now
+                        self._recaptcha_recovery_attempts[worker.account_email] = recovery_count + 1
+                        self._log(
+                            f"[ExtMode] 🔄 Auto-recovery #{recovery_count + 1}/"
+                            f"{self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS} for "
+                            f"{worker.account_email} — starting sequence "
+                            f"(clean cache → clean _GRECAPTCHA → reload tab → wait)."
+                        )
+                        try:
+                            # Step 1: Clear IndexedDB / cache / SW for labs.google
+                            # (equivalent to user's "clear browsing history").
+                            self._bridge.send_command("clean_tracking", worker.account_email)
+                            await asyncio.sleep(3)
+
+                            # Step 2: Delete _GRECAPTCHA cookie so Google mints
+                            # a fresh reCAPTCHA client on the next page load.
+                            self._bridge.send_command(
+                                "clean_recaptcha_cookie", worker.account_email
+                            )
+                            await asyncio.sleep(2)
+
+                            # Step 3: Reload the Flow tab. Fresh page = fresh
+                            # reCAPTCHA context, and (if the user has an
+                            # external VPN rotator like Surfshark running)
+                            # the request will go out on whichever IP is
+                            # current after the reload settles.
+                            self._bridge.send_command("reload_tab", worker.account_email)
+                            self._log(
+                                f"[ExtMode] 🔄 If using a VPN, this is the moment "
+                                f"to rotate IP — recovery waits 45s for tab reload "
+                                f"and reCAPTCHA to re-initialise."
+                            )
+
+                            # Step 4: Wait for the tab reload + reCAPTCHA to settle.
+                            # Longer wait than the 5s the old code used because
+                            # reCAPTCHA needs a bit of user-simulated activity
+                            # before its score recovers.
+                            await asyncio.sleep(45)
+
+                            # Step 5: Reset the streak so this account gets a
+                            # fresh chance. Also record success at the
+                            # queue-manager level so throttles unwind.
+                            self._recaptcha_streak.pop(worker.account_email, None)
+                            self._log(
+                                f"[ExtMode] ✓ Auto-recovery #{recovery_count + 1} "
+                                f"complete for {worker.account_email}. Streak reset; "
+                                f"account back in rotation."
+                            )
+                        finally:
+                            self._recovery_in_progress.pop(worker.account_email, None)
+
+                        # Re-queue this job so it retries with the fresh state.
                         update_job_status(job_id, "pending", account="")
                         self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                         return
