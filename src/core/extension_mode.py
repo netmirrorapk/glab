@@ -2658,12 +2658,14 @@ class ExtensionModeManager:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
             "referer": "https://labs.google/",
         }
-        # Google started returning 403 on fifeUrl / backbone.redirect for
-        # anonymous requests (mid-2026). Attach the Bearer token so the CDN
-        # sees an authenticated principal and serves the bytes. Same for
-        # images and videos — video path adds cookies below, image path
-        # (the common one) needs at least the Authorization header.
-        if access_token:
+        # Google migrated the image CDN to flow-content.google (July 2026)
+        # and switched to signed URLs — the `Signature=…` query parameter
+        # is the auth. Any Authorization header or cookie we attach makes
+        # the CDN reject the request as "unexpected auth alongside signed
+        # URL", which is exactly the 403 the user just hit. Only attach
+        # Bearer / cookies for the OLD CDN hosts that expected them.
+        is_signed_url = "Signature=" in fife_url or "flow-content.google" in fife_url
+        if access_token and not is_signed_url:
             dl_headers["authorization"] = f"Bearer {access_token}"
 
         # ── VIDEO: direct HTTP with browser cookies (fast) ──
@@ -2732,17 +2734,23 @@ class ExtensionModeManager:
         #   Tier 2: ask the extension to download via chrome.fetch (it
         #           runs inside the tab so cookies attach automatically)
         try:
-            # Tier 1 — direct aiohttp with cookies from the extension
-            try:
-                cookie_result = await worker._bridge.request_token(
-                    worker.account_email, "GET_COOKIES", timeout=10.0,
-                )
-                cookie_str = str(cookie_result.get("cookies", "") or "")
-            except Exception:
-                cookie_str = ""
-            headers_with_cookies = dict(dl_headers)
-            if cookie_str:
-                headers_with_cookies["cookie"] = cookie_str
+            # Tier 1 — direct aiohttp. Only attach cookies for legacy CDN
+            # hosts that expect a Google session; signed flow-content.google
+            # URLs must be requested WITHOUT any auth headers so the CDN
+            # accepts the Signature= param as the sole authorisation.
+            if is_signed_url:
+                headers_with_cookies = dict(dl_headers)
+            else:
+                try:
+                    cookie_result = await worker._bridge.request_token(
+                        worker.account_email, "GET_COOKIES", timeout=10.0,
+                    )
+                    cookie_str = str(cookie_result.get("cookies", "") or "")
+                except Exception:
+                    cookie_str = ""
+                headers_with_cookies = dict(dl_headers)
+                if cookie_str:
+                    headers_with_cookies["cookie"] = cookie_str
 
             async with _make_aiohttp_session() as session:
                 async with session.get(
