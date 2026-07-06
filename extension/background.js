@@ -981,6 +981,78 @@ async function detectAccounts() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Cookie Export — lets CloakBrowser modes log in on a proxy IP
+// ═══════════════════════════════════════════════════════════════════
+
+// Convert a chrome.cookies.Cookie into Playwright's add_cookies() format.
+function toPlaywrightCookie(c) {
+  const sameSiteMap = {
+    no_restriction: "None",
+    lax: "Lax",
+    strict: "Strict",
+    unspecified: "Lax",
+  };
+  let sameSite = sameSiteMap[c.sameSite] || "Lax";
+  let secure = !!c.secure;
+  if (sameSite === "None") secure = true; // Playwright requires secure for None
+  const out = {
+    name: c.name,
+    value: c.value,
+    domain: c.domain,
+    path: c.path || "/",
+    httpOnly: !!c.httpOnly,
+    secure: secure,
+    sameSite: sameSite,
+  };
+  // Session cookie -> expires -1; persistent -> unix seconds (integer).
+  if (!c.session && typeof c.expirationDate === "number") {
+    out.expires = Math.round(c.expirationDate);
+  } else {
+    out.expires = -1;
+  }
+  return out;
+}
+
+// Collect all Google/Flow auth cookies from the current Chrome profile,
+// de-duplicated, already in Playwright format.
+async function collectGoogleCookies() {
+  const domains = [
+    ".google.com", "google.com", "accounts.google.com",
+    "labs.google", ".labs.google", "www.google.com",
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const d of domains) {
+    let cookies = [];
+    try { cookies = await chrome.cookies.getAll({ domain: d }); } catch (e) {}
+    for (const c of cookies) {
+      const key = `${c.name}|${c.domain}|${c.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!c.name || c.value === undefined || c.value === null) continue;
+      out.push(toPlaywrightCookie(c));
+    }
+  }
+  return out;
+}
+
+// Export cookies for an account to the app (bridge writes exported_cookies.json
+// into the account's session folder + registers the account).
+async function exportCookiesForAccount(email) {
+  const cookies = await collectGoogleCookies();
+  if (!cookies.length) {
+    return { ok: false, error: "no cookies found (are you logged in?)" };
+  }
+  const resp = await fetch(`${BRIDGE_URL}/cookies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, cookies }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  return { ok: !!data.ok, count: cookies.length, ...data };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Commands from Bridge
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1029,6 +1101,41 @@ async function handleCommand(cmd) {
         try { await chrome.tabs.reload(tabId); } catch {}
       }
       break;
+
+    case "ensure_tabs": {
+      // Open ONE labs.google tab per generation slot so concurrent slots
+      // don't share a single tab. A shared tab means a recovery/clean_tracking
+      // reload kills the other slots' in-flight fetches ("Failed to fetch")
+      // and Google may generate a duplicate on the retry (image appears in
+      // the Flow UI but never downloads). The app sends the wanted count in
+      // cmd.data. New tabs open in the background (not focused).
+      try {
+        const want = Math.max(1, parseInt(cmd.data, 10) || 1);
+        const existing = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+        const toOpen = want - existing.length;
+        if (toOpen > 0) {
+          for (let i = 0; i < toOpen; i++) {
+            try {
+              await chrome.tabs.create({
+                url: `${LABS_ORIGIN}/fx/tools/flow`,
+                active: false,
+              });
+            } catch {}
+          }
+          console.log(
+            `[G-Labs Helper] ensure_tabs: opened ${toOpen} tab(s) ` +
+            `(had ${existing.length}, want ${want})`
+          );
+          // Let the new tabs load + authenticate, then re-detect so they
+          // register with the bridge and become dispatch targets.
+          setTimeout(() => { try { detectAccounts(); } catch {} }, 8000);
+          setTimeout(() => { try { detectAccounts(); } catch {} }, 20000);
+        }
+      } catch (e) {
+        console.warn("[G-Labs Helper] ensure_tabs failed:", e.message);
+      }
+      break;
+    }
 
     case "clean_genspark_tracking": {
       // Same as clean_tracking but for genspark.ai. Triggered by the
@@ -2610,6 +2717,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "detectAccounts") {
     detectAccounts().then((accounts) => sendResponse({ accounts }));
+    return true; // async response
+  }
+
+  if (msg.type === "exportCookies") {
+    exportCookiesForAccount(msg.email)
+      .then((res) => sendResponse(res))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true; // async response
   }
 

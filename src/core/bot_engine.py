@@ -2645,6 +2645,19 @@ class GoogleLabsBot:
                             await new Promise((resolve) => enterprise.ready(resolve));
                         }
 
+                        // Pre-warm reCAPTCHA Enterprise. Anti-detect browsers
+                        // (CloakBrowser) score low on a COLD engine, so fire 3
+                        // throwaway execute() calls to prime the score before
+                        // minting the real token. Real Chrome is lenient enough
+                        // to skip this (the extension does), but CloakBrowser
+                        // needs the warmup even for image generation.
+                        try {
+                            for (let _w = 0; _w < 3; _w++) {
+                                enterprise.execute(siteKey, { action: recaptchaAction }).catch(() => {});
+                                await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+                            }
+                        } catch (e) {}
+
                         const token = await enterprise.execute(siteKey, { action: recaptchaAction });
                         if (!token) return null;
                         return {
@@ -3120,6 +3133,14 @@ class GoogleLabsBot:
                                 if (typeof enterprise.ready === "function") {
                                     await new Promise((resolve) => enterprise.ready(resolve));
                                 }
+                                // Pre-warm reCAPTCHA (CloakBrowser needs priming
+                                // on a cold engine — 3 throwaway execute() calls).
+                                try {
+                                    for (let _w = 0; _w < 3; _w++) {
+                                        enterprise.execute(siteKey, { action: recaptchaAction }).catch(() => {});
+                                        await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+                                    }
+                                } catch (e) {}
                                 const token = await enterprise.execute(siteKey, { action: recaptchaAction });
                                 if (token) {
                                     recaptchaContext = {
@@ -3430,6 +3451,14 @@ class GoogleLabsBot:
                             if (typeof enterprise.ready === "function") {
                                 await new Promise((resolve) => enterprise.ready(resolve));
                             }
+                            // Pre-warm reCAPTCHA (CloakBrowser needs priming on a
+                            // cold engine — 3 throwaway execute() calls).
+                            try {
+                                for (let _w = 0; _w < 3; _w++) {
+                                    enterprise.execute(siteKey, { action: recaptchaAction }).catch(() => {});
+                                    await sleep(80 + Math.random() * 120);
+                                }
+                            } catch (e) {}
                             const token = await enterprise.execute(siteKey, { action: recaptchaAction });
                             if (token) {
                                 recaptchaContext = {

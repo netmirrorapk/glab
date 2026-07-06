@@ -67,6 +67,11 @@ function updateStatus(status) {
           </div>
         </div>
         ${actionBtn}
+        <button class="btn btn-secondary export-cookies-btn"
+          data-email="${acc.email}"
+          style="margin-top:6px;padding:6px 8px;font-size:11px;">
+          📤 Export Cookies (for proxy / CloakBrowser)
+        </button>
       </div>`;
       })
       .join("");
@@ -94,6 +99,25 @@ function updateStatus(status) {
           { type: "ecosystemReleaseAccount", account: email },
           () => setTimeout(refresh, 300)
         );
+      });
+    });
+
+    // Export cookies -> app writes exported_cookies.json for CloakBrowser + proxy
+    document.querySelectorAll(".export-cookies-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const b = e.currentTarget;
+        const email = b.dataset.email;
+        const orig = b.textContent;
+        b.textContent = "Exporting…";
+        b.disabled = true;
+        chrome.runtime.sendMessage({ type: "exportCookies", email }, (resp) => {
+          if (resp && resp.ok) {
+            b.textContent = `✅ ${resp.count} cookies saved${resp.registered ? " + account added" : ""}`;
+          } else {
+            b.textContent = `⚠ ${(resp && resp.error) || "failed (is the app running?)"}`;
+          }
+          setTimeout(() => { b.textContent = orig; b.disabled = false; }, 3500);
+        });
       });
     });
   } else {

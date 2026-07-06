@@ -1659,14 +1659,40 @@ class HttpModeManager:
                 self._report_recaptcha_success(account_name)
                 self._consecutive_failures[slot_id] = 0
 
-                # Download and save
-                output_path, dl_error = await self._download_and_save(
-                    worker, job_id, result, queue_no=queue_no
-                )
+                # The image is ALREADY generated on Flow. If the DOWNLOAD fails,
+                # retry ONLY the download (reuse result) — NEVER re-queue via
+                # _handle_job_failure, because that regenerates the image,
+                # wasting quota and duplicating it on Flow for one prompt.
+                output_path = None
+                dl_error = None
+                for dl_attempt in range(4):
+                    output_path, dl_error = await self._download_and_save(
+                        worker, job_id, result, queue_no=queue_no
+                    )
+                    if not dl_error:
+                        break
+                    self._log(
+                        f"[{slot_id}] Download failed (try {dl_attempt + 1}/4): "
+                        f"{str(dl_error)[:150]} — retrying DOWNLOAD only "
+                        f"(image already on Flow)."
+                    )
+                    if dl_attempt < 3:
+                        await asyncio.sleep(5)
                 if dl_error:
-                    # Download failed — treat as retryable error
-                    await self._handle_job_failure(
-                        slot_id, account_name, job_id, f"Download failed: {dl_error}"
+                    # Image exists on Flow but couldn't be downloaded. Mark
+                    # failed WITHOUT regenerating (recover from Flow gallery).
+                    self._log(
+                        f"[{slot_id}] Download failed after 4 tries — image is "
+                        f"on Flow but not saved locally. NOT regenerating "
+                        f"(avoids quota waste + duplicates)."
+                    )
+                    update_job_status(
+                        job_id, "failed", account=account_name,
+                        error=f"generated_but_download_failed: {str(dl_error)[:140]}",
+                    )
+                    self.qm.signals.job_updated.emit(
+                        job_id, "failed", account_name,
+                        "Generated on Flow, download failed (not regenerated)",
                     )
                     return
 

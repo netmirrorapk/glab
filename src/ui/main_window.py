@@ -4276,10 +4276,28 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #334155; color: #F1F5F9; }
         """)
         self.btn_ext_refresh.clicked.connect(self._refresh_extension_accounts)
+        # Standalone cookie-import bridge — start the bridge WITHOUT generation
+        # so the extension can export cookies for CloakBrowser + proxy mode.
+        self.btn_cookie_bridge = QPushButton("🍪 Connect (Cookie Import)")
+        self.btn_cookie_bridge.setToolTip(
+            "Starts the extension bridge WITHOUT running any generation.\n"
+            "Then open the extension popup and click 'Export Cookies' for each\n"
+            "account to set them up for HTTP Shared (CloakBrowser + proxy) mode."
+        )
+        self.btn_cookie_bridge.setStyleSheet("""
+            QPushButton {
+                background: #1E293B; border: 1px solid #334155;
+                border-radius: 6px; color: #94A3B8; font-size: 11px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover { background: #334155; color: #F1F5F9; }
+        """)
+        self.btn_cookie_bridge.clicked.connect(self._toggle_cookie_bridge)
         ext_header.addWidget(self.ext_status_dot)
         ext_header.addWidget(ext_title)
         ext_header.addStretch()
         ext_header.addWidget(self.ext_status_label)
+        ext_header.addWidget(self.btn_cookie_bridge)
         ext_header.addWidget(self.btn_ext_refresh)
         ext_card_layout.addLayout(ext_header)
 
@@ -6417,6 +6435,14 @@ class MainWindow(QMainWindow):
         runtime_status = getattr(self, "_runtime_auth_status", {}).get(acc_name)
         if runtime_status == "expired":
             return False, "⚠ Session Expired", "Re-login required — generation auth failed"
+        if runtime_status == "quota_exhausted":
+            # Account is logged in fine — it just ran out of quota on every
+            # image model. Show a distinct banner so the user knows to switch
+            # accounts; it auto-clears on the next successful generation.
+            return True, "🚫 Quota Exhausted", (
+                "All image models (Nano Banana 2 / Lite / Pro) hit their "
+                "per-account quota. Resets in ~6h — use another account meanwhile."
+            )
 
         # Check exported_cookies.json for auth cookie validity
         cookies_json = session_dir / "exported_cookies.json"
@@ -7464,6 +7490,91 @@ class MainWindow(QMainWindow):
                 pass  # widget destroyed
 
         threading.Thread(target=_fetch, daemon=True).start()
+
+    def _toggle_cookie_bridge(self):
+        """Start/stop a standalone extension bridge (no generation) so the
+        extension can export cookies for CloakBrowser + proxy mode."""
+        running = (
+            getattr(self, "_cookie_bridge_thread", None) is not None
+            and self._cookie_bridge_thread.is_alive()
+        )
+        if running:
+            self._stop_cookie_bridge()
+        else:
+            self._start_cookie_bridge()
+
+    def _start_cookie_bridge(self):
+        import threading
+        import asyncio
+        if (
+            getattr(self, "_cookie_bridge_thread", None) is not None
+            and self._cookie_bridge_thread.is_alive()
+        ):
+            return
+        self._cookie_bridge = None
+        self._cookie_bridge_loop = None
+
+        def _run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                from src.core.extension_bridge import ExtensionBridge
+                bridge = ExtensionBridge(lambda m: print(m))
+                self._cookie_bridge = bridge
+                self._cookie_bridge_loop = loop
+                loop.run_until_complete(bridge.start())
+                loop.run_forever()
+            except Exception as e:
+                print(f"[CookieBridge] failed: {e}")
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self._cookie_bridge_thread = t
+        try:
+            self.btn_cookie_bridge.setText("🍪 Stop Cookie Bridge")
+        except Exception:
+            pass
+        try:
+            QMessageBox.information(
+                self, "Cookie Bridge Started",
+                "Bridge is now running (no generation).\n\n"
+                "1. Open the G-Labs Helper extension popup — the status should "
+                "turn GREEN (Connected).\n"
+                "2. Click 'Export Cookies' under each account.\n"
+                "3. Click 'Refresh List' here — the account will appear.\n"
+                "4. Set its proxy, then run in HTTP Shared mode.\n\n"
+                "Click 'Stop Cookie Bridge' when done (before starting a normal "
+                "generation run, so ports don't clash)."
+            )
+        except Exception:
+            pass
+
+    def _stop_cookie_bridge(self):
+        import asyncio
+        loop = getattr(self, "_cookie_bridge_loop", None)
+        bridge = getattr(self, "_cookie_bridge", None)
+        if loop is not None and bridge is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(bridge.stop(), loop)
+                fut.result(timeout=3)
+            except Exception:
+                pass
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        self._cookie_bridge_thread = None
+        self._cookie_bridge = None
+        self._cookie_bridge_loop = None
+        try:
+            self.btn_cookie_bridge.setText("🍪 Connect (Cookie Import)")
+        except Exception:
+            pass
 
     def _apply_ext_accounts(self, data):
         """Update extension accounts UI (called on main thread)."""
@@ -10810,8 +10921,19 @@ class MainWindow(QMainWindow):
             # Live countdown is shown via the account_runtime detail cell.
             self._runtime_auth_status[account_name] = "rate_limited"
             self.append_log(f"[{account_name}] ⏸ Rate limited: {message}")
+        elif status == "quota_exhausted":
+            # All image models hit their per-account per-model quota. This
+            # account is held (peers keep running); the row shows a banner and
+            # we log a clear notification. Google's quotas reset within ~6h.
+            self._runtime_auth_status[account_name] = "quota_exhausted"
+            self.append_log(
+                f"[{account_name}] 🚫 Quota exhausted — all image models "
+                f"({message or 'Nano Banana 2 / Lite / Pro'}) hit their limit. "
+                f"This account is paused; other accounts keep running. "
+                f"Quotas reset within ~6h."
+            )
         elif status == "logged_in":
-            # Clear expired/rate_limited status on successful generation
+            # Clear expired/rate_limited/quota_exhausted status on success
             self._runtime_auth_status.pop(account_name, None)
 
         # Trigger immediate status refresh

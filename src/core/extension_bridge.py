@@ -162,6 +162,9 @@ class ExtensionBridge:
         self._app.router.add_post("/project", self._handle_project)
         self._app.router.add_get("/status", self._handle_status)
         self._app.router.add_post("/command", self._handle_command_post)
+        # Extension exports the account's Google cookies (already converted to
+        # Playwright format) so CloakBrowser modes can log in on a proxy IP.
+        self._app.router.add_post("/cookies", self._handle_cookies)
         # Ecosystem / Auto Warmup Mode endpoints
         self._app.router.add_get("/ecosystem", self._handle_ecosystem_status)
         self._app.router.add_post("/ecosystem", self._handle_ecosystem_update)
@@ -759,6 +762,81 @@ class ExtensionBridge:
             )
 
         return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
+
+    async def _handle_cookies(self, request: web.Request) -> web.Response:
+        """Extension exports an account's Google cookies (Playwright format).
+
+        Writes them to <sessions>/<email>/exported_cookies.json and registers
+        the account in the DB (if new) so the CloakBrowser generation modes
+        (HTTP Shared / Browser per slot / CDP) can log in with these cookies
+        on the account's assigned proxy IP — no manual login needed.
+        """
+        _cors = {"Access-Control-Allow-Origin": "*"}
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "bad json"}, status=400, headers=_cors
+            )
+
+        email = str(data.get("email") or "").strip()
+        cookies = data.get("cookies") or []
+        if not email or not isinstance(cookies, list) or not cookies:
+            return web.json_response(
+                {"ok": False, "error": "missing email or cookies"},
+                status=400, headers=_cors,
+            )
+
+        # Keep only well-formed cookies (name + value + domain required by
+        # Playwright's add_cookies).
+        clean = [
+            c for c in cookies
+            if isinstance(c, dict) and c.get("name") and c.get("domain")
+            and c.get("value") is not None
+        ]
+        if not clean:
+            return web.json_response(
+                {"ok": False, "error": "no valid cookies after filtering"},
+                status=400, headers=_cors,
+            )
+
+        try:
+            from src.core.app_paths import get_sessions_dir
+            session_dir = get_sessions_dir() / email
+            session_dir.mkdir(parents=True, exist_ok=True)
+            cookies_path = session_dir / "exported_cookies.json"
+            with open(cookies_path, "w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=2)
+        except Exception as e:
+            self._log(f"[Bridge] Cookie export write failed for {email}: {e}")
+            return web.json_response(
+                {"ok": False, "error": f"write failed: {str(e)[:120]}"},
+                status=500, headers=_cors,
+            )
+
+        # Register the account in the DB (idempotent) so it shows up in the
+        # app's account list, ready for a CloakBrowser mode + proxy.
+        registered = False
+        try:
+            from src.db.db_manager import get_accounts, add_account
+            existing = [a for a in get_accounts() if a.get("name") == email]
+            if not existing:
+                add_account(email, str(session_dir), "")
+                registered = True
+        except Exception as e:
+            # Non-fatal — cookies are saved; user can add the account manually.
+            self._log(f"[Bridge] Cookie export: DB register skipped ({str(e)[:80]}).")
+
+        self._log(
+            f"[Bridge] 🍪 Cookies exported for {email}: {len(clean)} saved to "
+            f"{cookies_path}"
+            + (" (account registered — refresh account list)" if registered else "")
+        )
+        return web.json_response(
+            {"ok": True, "saved": len(clean), "registered": registered,
+             "path": str(cookies_path)},
+            headers=_cors,
+        )
 
     async def _handle_project(self, request: web.Request) -> web.Response:
         """Extension reports project ID for an account."""

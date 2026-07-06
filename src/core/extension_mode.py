@@ -946,11 +946,29 @@ class ExtensionWorker:
                 resp_text = fetch_result.get("body", "")
 
                 if status == 429 and attempts_left > 0:
-                    # Per-project quota exhausted. Burn this project so
-                    # the rest of the worker pool stops using it, resolve
-                    # a fresh project (skipping burned ones, or creating
-                    # a new one if all are cool-down), rebuild the body
-                    # with the new projectId, and retry once.
+                    # Two different 429 flavors need opposite recovery:
+                    #   • per-MODEL quota ("Resource exhausted / check quota")
+                    #     — rotating the project does NOT help (the same model
+                    #     429s again on a fresh project, as the logs proved).
+                    #     Surface it so the OUTER handler swaps to a live model.
+                    #   • per-PROJECT rate limit (generic 429) — burn + rotate
+                    #     to a fresh project, which DOES clear it.
+                    _429_body = str(resp_text).lower()
+                    _is_quota_429 = (
+                        "exhausted" in _429_body
+                        or "check quota" in _429_body
+                        or "resource_exhausted" in _429_body
+                        or "daily limit" in _429_body
+                    )
+                    if _is_quota_429:
+                        # Don't thrash projects on a per-model quota — bubble
+                        # up immediately for the model-swap recovery.
+                        err_msg = _parse_api_error(status, resp_text)
+                        break
+                    # Per-project rate limit. Burn this project so the rest of
+                    # the worker pool stops using it, resolve a fresh project
+                    # (skipping burned ones, or creating a new one if all are
+                    # cool-down), rebuild the body with the new projectId, retry.
                     self._log(
                         f"[{self.slot_id}] 429 on project {project_id} — "
                         "burning and rotating to a fresh project."
@@ -1359,25 +1377,26 @@ class ExtensionWorker:
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 401:
-                        # 401 on the tRPC endpoints means Google is telling
-                        # us this account hasn't finished Flow onboarding
-                        # yet (fresh Gmail that's never opened Flow) OR
-                        # the Bearer token doesn't have the scope this
-                        # endpoint requires. No amount of retrying will
-                        # fix it — the user must open labs.google/fx/tools/
-                        # flow for this account manually, accept ToS, and
-                        # create at least one project. Fail fast so we
-                        # don't waste 3×20s on Method 3 timeouts.
+                        # A 401 here can mean the account never finished Flow
+                        # onboarding (fresh Gmail) OR — far more common once an
+                        # account has already generated — the cached Bearer
+                        # token is stale / the account is momentarily reCAPTCHA-
+                        # flagged. Previously we assumed "not onboarded" and
+                        # gave up (skipped Methods 2-4), which stranded perfectly
+                        # good onboarded accounts whose token had simply gone
+                        # stale. DON'T give up: fall through to Method 3, which
+                        # asks the EXTENSION to click "New project" using the
+                        # browser's own logged-in session (no Bearer token
+                        # needed) — that works for onboarded accounts even when
+                        # this API 401s. A genuinely un-onboarded account will
+                        # also fail Method 3, which is the correct outcome.
                         self._log(
-                            f"[{self.slot_id}] ⚠ Method 1 returned HTTP 401 — "
-                            f"account '{self.account_email}' has not completed "
-                            f"Flow onboarding. Open labs.google/fx/tools/flow "
-                            f"for this account, accept ToS, click 'New project' "
-                            f"once, then restart automation. Skipping Methods "
-                            f"2-4 to save time."
+                            f"[{self.slot_id}] Method 1 HTTP 401 (stale token or "
+                            f"un-onboarded) — NOT giving up; trying the extension "
+                            f"'New project' click (Method 3), which uses the "
+                            f"browser session and works for onboarded accounts."
                         )
-                        return None
-                    if not resp.ok:
+                    elif not resp.ok:
                         self._log(
                             f"[{self.slot_id}] Method 1 (searchUserProjects): "
                             f"HTTP {resp.status} — trying Method 2"
@@ -1677,6 +1696,27 @@ class ExtensionModeManager:
                 self._workers[account_name] = workers
                 self._log(f"[ExtMode] {account_name}: {len(workers)} worker(s) ready.")
 
+                # Ask the extension to open ONE labs.google tab per slot for
+                # this account. Multiple slots sharing a SINGLE tab collide: a
+                # recovery/clean_tracking reload kills the other slots'
+                # in-flight fetches ("Failed to fetch") and Google may generate
+                # a duplicate on the retry (image shows in Flow UI but never
+                # downloads). One tab per slot isolates each slot's scripting
+                # channel, so the user gets clean one-shot downloads WITHOUT
+                # manually opening tabs.
+                if slots_per_account > 1:
+                    try:
+                        self._bridge.send_command(
+                            "ensure_tabs", account_name, data=slots_per_account
+                        )
+                        self._log(
+                            f"[ExtMode] Requested {slots_per_account} labs.google "
+                            f"tab(s) for {account_name} (1 per slot) — avoids "
+                            f"same-tab fetch collisions + duplicate images."
+                        )
+                    except Exception:
+                        pass
+
             total_workers = sum(len(w) for w in self._workers.values())
             if total_workers == 0:
                 self._log("[ExtMode] No workers started. Ensure accounts are logged in via Chrome Extension.")
@@ -1890,28 +1930,41 @@ class ExtensionModeManager:
             self._account_gen_count[account_email] = 0
             self._account_last_cleanup[account_email] = now
 
-    def _try_swap_image_model(self, job_id: str):
+    def _try_swap_image_model(self, job_id: str, account_email: str = ""):
         """Rotate a job's image model through Standard → Lite → Pro (or any
         starting model) when the current model hits a daily/per-model quota.
-        Returns the new model name on success, or None if every model has
-        already been tried for this job.
+        Returns the new model name on success, or None if the account has
+        exhausted every model.
 
         The three Flow image models have INDEPENDENT quotas on Google's side:
           - Nano Banana 2         → NARWHAL
           - Nano Banana 2 Lite    → HARBOR_SEAL
           - Nano Banana Pro       → GEM_PIX_2
-        so exhausting one still leaves the other two available. This method
-        picks whichever of the three hasn't been tried yet for THIS job,
-        preferring same-family siblings first (Standard ↔ Lite, both are
-        ~similar quality) and Pro as the last resort (highest quality, slower).
+        Google tracks quota PER ACCOUNT PER MODEL, so a Standard quota-out
+        on Account A does not affect Account B, and Account B should keep
+        using Standard until IT hits the limit.
 
-        Ping-pong prevention: self._job_models_tried[job_id] is a set of the
-        UI-name strings already attempted. Once all 3 are in the set, this
-        method returns None and the normal 429 pause cascade kicks in.
+        Tracking has two layers:
+          * Per-JOB (_job_models_tried): stops a single job ping-ponging
+            between models it's already tried this run.
+          * Per-ACCOUNT (_account_exhausted_models): records which models
+            have returned quota-exhausted for the account, with a 6h TTL
+            (Google's per-model quota window). Peer accounts are NOT
+            marked — they still use the model normally until their own
+            quota hits.
+
+        When every model is exhausted for the account, this method returns
+        None and emits an "all 3 models exhausted, use a different account"
+        warning; the calling flow HOLDs just that account, other accounts
+        keep going.
         """
-        # Lazy-init the tracking dict
+        # Lazy-init trackers
         if not hasattr(self, "_job_models_tried"):
             self._job_models_tried = {}
+        if not hasattr(self, "_account_exhausted_models"):
+            self._account_exhausted_models = {}  # account -> {model_lower: exhausted_at}
+
+        EXHAUSTED_TTL_S = 6 * 60 * 60  # Google's per-model quota window (~6h)
 
         try:
             current = str(get_job_model(job_id) or "").strip()
@@ -1938,6 +1991,28 @@ class ExtensionModeManager:
             # Unknown starting model — can't safely rotate.
             return None
 
+        bucket_to_name = {
+            "standard": "Nano Banana 2",
+            "lite": "Nano Banana 2 Lite",
+            "pro": "Nano Banana Pro",
+        }
+
+        # Mark the current model as exhausted for THIS account only.
+        # Peer accounts are not touched — they keep using this model
+        # until their own quota fires.
+        now = time.time()
+        if account_email:
+            acct_bucket = self._account_exhausted_models.setdefault(
+                account_email, {}
+            )
+            # Clean expired entries (past 6h TTL) — Google's quota
+            # windows roll over, so an old exhausted marker shouldn't
+            # keep blocking the model forever.
+            for m in list(acct_bucket.keys()):
+                if now - acct_bucket[m] > EXHAUSTED_TTL_S:
+                    acct_bucket.pop(m, None)
+            acct_bucket[bucket_to_name[current_bucket].lower()] = now
+
         # Preferred rotation order per starting bucket. Same-family sibling
         # first, Pro (premium) last.
         rotation_map = {
@@ -1947,18 +2022,53 @@ class ExtensionModeManager:
         }
         candidates = rotation_map.get(current_bucket, [])
 
+        # Per-JOB tracking (in-run ping-pong prevention)
         tried = self._job_models_tried.setdefault(job_id, set())
-        tried.add(low)  # Mark the current one as tried
+        tried.add(low)
 
-        # Pick the first candidate not yet attempted for this job.
+        # Per-ACCOUNT tracking (persistent across jobs)
+        acct_exhausted = (
+            self._account_exhausted_models.get(account_email, {})
+            if account_email else {}
+        )
+
+        # Pick the first candidate not tried by this job AND not
+        # exhausted for this account.
         alternate = None
         for cand in candidates:
-            if cand.lower() not in tried:
-                alternate = cand
-                break
+            cand_low = cand.lower()
+            if cand_low in tried:
+                continue
+            if cand_low in acct_exhausted:
+                continue
+            alternate = cand
+            break
 
         if alternate is None:
-            # All three models exhausted for this job — surrender to pause.
+            # All 3 models exhausted for this account. Log the state
+            # loudly and emit a user warning; the calling code will
+            # HOLD this one account so healthy peers keep running.
+            if account_email:
+                self._log(
+                    f"[ExtMode] ⛔ Account {account_email}: ALL 3 IMAGE "
+                    f"MODELS have hit quota (Nano Banana 2, Nano Banana 2 "
+                    f"Lite, Nano Banana Pro). Account is out for the current "
+                    f"6-hour quota window. Use a different account; this "
+                    f"one will become usable again automatically as Google's "
+                    f"quota TTL expires."
+                )
+                try:
+                    self.qm.signals.show_warning.emit(
+                        f"Account '{account_email}' has exhausted ALL 3 image "
+                        f"model quotas.\n\n"
+                        f"• Nano Banana 2 — quota reached\n"
+                        f"• Nano Banana 2 Lite — quota reached\n"
+                        f"• Nano Banana Pro — quota reached\n\n"
+                        f"Use a different account for now. Quotas will reset "
+                        f"within ~6 hours on Google's side."
+                    )
+                except Exception:
+                    pass
             return None
 
         tried.add(alternate.lower())
@@ -1967,6 +2077,88 @@ class ExtensionModeManager:
         except Exception:
             return None
         return alternate
+
+    def _route_model_for_account(self, job_id: str, account_email: str,
+                                 requested_model: str):
+        """Proactive per-account image-model router — the READ side of the
+        model-quota logic (the WRITE side is _try_swap_image_model).
+
+        Called at job dispatch, BEFORE any API call. If this account has
+        already hit a per-model quota on `requested_model` earlier this run
+        (recorded in _account_exhausted_models within the 6h TTL), switch to
+        the next live model in the responsive rotation order up-front — so the
+        queue NEVER re-fires a model we already know is dead for this account,
+        never wastes a reCAPTCHA token, and never 429s for nothing. Peer
+        accounts are untouched (separate exhausted sets), so account B keeps
+        using Nano Banana 2 while account A has already rotated off it.
+
+        Returns:
+          * requested_model unchanged — still live for this account
+          * a new model name — requested one is dead but a sibling is live
+            (the job's stored model is updated too, so logs/download match)
+          * None — EVERY image model is exhausted for this account (caller
+            should hold just this account so peers keep running)
+        """
+        if not account_email:
+            return requested_model
+        exhausted = getattr(self, "_account_exhausted_models", {}).get(
+            account_email, {}
+        )
+        if not exhausted:
+            return requested_model
+
+        # Drop markers older than the 6h quota window so a model that has
+        # since refilled on Google's side becomes usable again automatically.
+        now = time.time()
+        for m in list(exhausted.keys()):
+            if now - exhausted[m] > 6 * 60 * 60:
+                exhausted.pop(m, None)
+        if not exhausted:
+            return requested_model
+
+        low = str(requested_model or "").lower()
+        if "lite" in low and "nano" in low:
+            bucket = "lite"
+        elif "pro" in low and "nano" in low:
+            bucket = "pro"
+        elif "nano" in low or "narwhal" in low or "imagen" in low:
+            bucket = "standard"
+        else:
+            # Unknown model — leave it alone.
+            return requested_model
+
+        bucket_to_name = {
+            "standard": "Nano Banana 2",
+            "lite": "Nano Banana 2 Lite",
+            "pro": "Nano Banana Pro",
+        }
+        # Requested model still live for this account → use it as-is.
+        if bucket_to_name[bucket].lower() not in exhausted:
+            return requested_model
+
+        # Requested model is a known-dead bucket for this account. Walk the
+        # same responsive rotation order used by _try_swap_image_model and
+        # pick the first sibling that is still live.
+        rotation_map = {
+            "standard": ["Nano Banana 2 Lite", "Nano Banana Pro"],
+            "lite":     ["Nano Banana 2",      "Nano Banana Pro"],
+            "pro":      ["Nano Banana 2",      "Nano Banana 2 Lite"],
+        }
+        for cand in rotation_map.get(bucket, []):
+            if cand.lower() not in exhausted:
+                try:
+                    update_job_model(job_id, cand)
+                except Exception:
+                    pass
+                self._log(
+                    f"[ExtMode] {account_email}: '{requested_model}' quota "
+                    f"already reached this run — routing this job to '{cand}' "
+                    f"up-front (no wasted call on the dead model)."
+                )
+                return cand
+
+        # Every model exhausted for this account.
+        return None
 
     async def _run_pipeline_job(self, worker: ExtensionWorker, job: dict):
         """Execute a pipeline job: Step 1 = generate image, Step 2 = generate video from it."""
@@ -2211,6 +2403,49 @@ class ExtensionModeManager:
         if job_type == "pipeline":
             return await self._run_pipeline_job(worker, job)
 
+        # Proactive per-account image-model routing (READ side; WRITE side is
+        # _try_swap_image_model on failure). If this account already hit a
+        # per-model quota on the job's model earlier this run, switch to the
+        # next live model up-front — so we never waste a call (and a reCAPTCHA
+        # token) re-firing a model we already know is dead for this account.
+        # Video jobs use their own model and are skipped.
+        if "video" not in job_type:
+            _routed = self._route_model_for_account(
+                job_id, worker.account_email, model
+            )
+            if _routed is None:
+                # Every image model exhausted for this account — hold JUST this
+                # account (peers keep running) and re-queue for a healthy one.
+                # Fires the same banner + 6h auto-recovery as the failure path.
+                if not self.qm.account_disabled.get(worker.account_email):
+                    self.qm.account_disabled[worker.account_email] = True
+                    try:
+                        self.qm.account_hold_until[worker.account_email] = time.time() + 6 * 60 * 60
+                        self.qm.account_hold_reason[worker.account_email] = "All image models hit quota (auto-resumes in ~6h)"
+                    except Exception:
+                        pass
+                    self._log(
+                        f"[{worker.slot_id}] ⛔ All image models already at quota "
+                        f"for {worker.account_email} — holding this account, "
+                        f"re-queuing job for a healthy account. Quotas reset ~6h."
+                    )
+                    try:
+                        self.qm.signals.account_auth_status.emit(
+                            worker.account_email, "quota_exhausted",
+                            "All 3 image models exhausted"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        from src.db.db_manager import reassign_account_jobs
+                        reassign_account_jobs(worker.account_email)
+                    except Exception:
+                        pass
+                update_job_status(job_id, "pending", account="")
+                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                return
+            model = _routed
+
         self._log(f"[{worker.slot_id}] Job {job_id[:6]}...: {prompt[:40]}...")
 
         max_retries = max(1, get_int_setting("max_auto_retries_per_job", 3))
@@ -2309,34 +2544,70 @@ class ExtensionModeManager:
                     )
 
                 if result and not error:
-                    # Download and save
-                    output_path, dl_error = await self._download_and_save(
-                        worker, job_id, result, queue_no=queue_no,
-                        access_token=worker.last_access_token,
-                    )
-                    if dl_error:
-                        last_error = dl_error
-                        # 403 on the download step means Google's CDN
-                        # rejected our request — either the Bearer token
-                        # expired between generation and download or the
-                        # account has been silently throttled. Force a
-                        # token refresh on the next attempt by discarding
-                        # the worker's cached one, and wait a bit longer
-                        # so a transient throttle can lift.
+                    # The image is ALREADY generated on Google's side. If the
+                    # DOWNLOAD fails, retry ONLY the download (reusing the same
+                    # generation result) — NEVER loop back to generate_image(),
+                    # because that burns quota and creates DUPLICATE images on
+                    # Flow for a single prompt (the exact bug: one prompt got
+                    # generated 3x because each download failure regenerated).
+                    output_path = None
+                    dl_error = None
+                    for dl_attempt in range(4):
+                        output_path, dl_error = await self._download_and_save(
+                            worker, job_id, result, queue_no=queue_no,
+                            access_token=worker.last_access_token,
+                        )
+                        if not dl_error:
+                            break
+                        # 403 = stale Bearer token / CDN throttle. Refresh the
+                        # token and retry the DOWNLOAD of the already-generated
+                        # image (NOT the generation).
                         if "403" in str(dl_error):
                             self._log(
-                                f"[{worker.slot_id}] Download 403 — likely stale "
-                                f"Bearer token or CDN throttle. Discarding cached "
-                                f"token; next attempt will fetch a fresh one."
+                                f"[{worker.slot_id}] Download 403 (try "
+                                f"{dl_attempt + 1}/4) — refreshing token, "
+                                f"re-downloading the already-generated image."
                             )
                             worker.last_access_token = None
-                            if attempt < max_retries:
-                                await asyncio.sleep(20)
-                                continue
-                        self._log(f"[{worker.slot_id}] Download failed: {dl_error[:200]}")
-                        if attempt < max_retries:
-                            await asyncio.sleep(5)
-                            continue
+                            try:
+                                _fresh = await self._bridge.request_token(
+                                    worker.account_email, "IMAGE_GENERATION"
+                                )
+                                if _fresh and _fresh.get("access_token"):
+                                    worker.last_access_token = _fresh["access_token"]
+                            except Exception:
+                                pass
+                            if dl_attempt < 3:
+                                await asyncio.sleep(15)
+                        else:
+                            self._log(
+                                f"[{worker.slot_id}] Download failed (try "
+                                f"{dl_attempt + 1}/4): {str(dl_error)[:150]} — "
+                                f"retrying DOWNLOAD only (image already on Flow)."
+                            )
+                            if dl_attempt < 3:
+                                await asyncio.sleep(5)
+                    if dl_error:
+                        # Every download retry failed. The image EXISTS on Flow
+                        # but we couldn't fetch it. Fail WITHOUT regenerating —
+                        # regenerating would waste quota and duplicate the image.
+                        # The user can recover it from the Flow project gallery.
+                        last_error = dl_error
+                        self._log(
+                            f"[{worker.slot_id}] Download failed after 4 tries "
+                            f"({str(dl_error)[:120]}). Image is on Flow but not "
+                            f"saved locally — NOT regenerating (avoids wasting "
+                            f"quota + duplicates)."
+                        )
+                        update_job_status(
+                            job_id, "failed", account=worker.account_email,
+                            error=f"generated_but_download_failed: {str(dl_error)[:140]}",
+                        )
+                        self.qm.signals.job_updated.emit(
+                            job_id, "failed", worker.account_email,
+                            "Generated on Flow, download failed (not regenerated)",
+                        )
+                        return
                     else:
                         update_job_status(job_id, "completed", account=worker.account_email)
                         self.qm.signals.job_updated.emit(job_id, "completed", worker.account_email, "")
@@ -2354,6 +2625,19 @@ class ExtensionModeManager:
                         # VPN IP is still healthy (skip rotation) or if
                         # everyone is failing (rotation warranted).
                         self._account_last_success[worker.account_email] = time.time()
+                        # A successful generation proves the model this
+                        # job used is NOT exhausted for this account —
+                        # clear the exhausted marker so future jobs on
+                        # this account can pick it again if the rotator
+                        # brought us back to it after a 6h TTL wrap.
+                        try:
+                            used_model = str(get_job_model(job_id) or "").lower().strip()
+                            if used_model and hasattr(self, "_account_exhausted_models"):
+                                self._account_exhausted_models.get(
+                                    worker.account_email, {}
+                                ).pop(used_model, None)
+                        except Exception:
+                            pass
                         # Reset 429 streak — account is back to normal
                         self.qm.clear_429_streak(worker.account_email)
                         # Track generation count for auto cleanup
@@ -2389,7 +2673,27 @@ class ExtensionModeManager:
                 #      re-queue forever, it gets marked failed instead so
                 #      the queue moves on to other prompts.
                 err_lower = last_error.lower()
-                if any(p in err_lower for p in ("429", "rate limit", "too many requests")):
+                # A 429 that is actually a reCAPTCHA reputation failure (Google
+                # returns HTTP 429 with "reCAPTCHA evaluation failed" in the
+                # body) must NOT go down the pause cascade below — pausing the
+                # account 5min→15min→1h does nothing for reCAPTCHA reputation.
+                # Route it to the reCAPTCHA-recovery flow instead (cache clean →
+                # _GRECAPTCHA cookie drop → smart VPN rotation → tab reload),
+                # which is the only path that actually clears the flag.
+                # EXCEPTION: a per-model quota-exhaustion 429 still belongs in
+                # the 429 block so the model-swap recovery can run.
+                _is_recaptcha_429 = (
+                    ("recaptcha" in err_lower
+                     or "captcha" in err_lower
+                     or "evaluation failed" in err_lower)
+                    and not any(q in err_lower for q in (
+                        "exhausted", "check quota", "daily limit", "different model"
+                    ))
+                )
+                if (
+                    any(p in err_lower for p in ("429", "rate limit", "too many requests"))
+                    and not _is_recaptcha_429
+                ):
                     # Recovery strategy 1 — Cache cleanup. Some 429s "stick"
                     # in client-side state (IndexedDB, service worker cache).
                     # Manually clearing browser data on labs.google often
@@ -2419,7 +2723,9 @@ class ExtensionModeManager:
                         or "different model" in err_lower
                     )
                     if quota_exhausted:
-                        swapped_to = self._try_swap_image_model(job_id)
+                        swapped_to = self._try_swap_image_model(
+                            job_id, worker.account_email
+                        )
                         if swapped_to:
                             self._log(
                                 f"[{worker.slot_id}] 🔄 Quota exhausted on "
@@ -2434,6 +2740,57 @@ class ExtensionModeManager:
                             )
                             # IMPORTANT: skip the pause cascade below —
                             # the swap path is the recovery for this job.
+                            return
+                        else:
+                            # _try_swap_image_model returned None → this
+                            # account has exhausted every model. Hold JUST
+                            # this account (peers keep running on their
+                            # own quotas) and reassign pending jobs to
+                            # accounts that still have a working model.
+                            already_held = self.qm.account_disabled.get(
+                                worker.account_email, False
+                            )
+                            self.qm.account_disabled[worker.account_email] = True
+                            # Auto-recover after ~6h (Google's per-model quota
+                            # window) so the account re-enables ITSELF once its
+                            # quota resets — matches the 6h TTL on the per-model
+                            # exhausted markers. _check_account_holds() clears
+                            # account_disabled + emits logged_in when this fires,
+                            # which also clears the "Quota Exhausted" banner.
+                            try:
+                                self.qm.account_hold_until[worker.account_email] = time.time() + 6 * 60 * 60
+                                self.qm.account_hold_reason[worker.account_email] = "All image models hit quota (auto-resumes in ~6h)"
+                            except Exception:
+                                pass
+                            if not already_held:
+                                self._log(
+                                    f"[ExtMode] ⛔ All 3 image models exhausted "
+                                    f"for {worker.account_email} — holding this "
+                                    f"account only. Peer accounts continue "
+                                    f"normally. Quotas auto-reset within ~6h."
+                                )
+                                try:
+                                    self.qm.signals.account_auth_status.emit(
+                                        worker.account_email, "quota_exhausted",
+                                        "All 3 image models exhausted"
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    from src.db.db_manager import reassign_account_jobs
+                                    count = reassign_account_jobs(worker.account_email)
+                                    if count > 0:
+                                        self._log(
+                                            f"[ExtMode] Reassigned {count} job(s) "
+                                            f"from {worker.account_email} to accounts "
+                                            f"that still have working models."
+                                        )
+                                except Exception:
+                                    pass
+                            update_job_status(job_id, "pending", account="")
+                            self.qm.signals.job_updated.emit(
+                                job_id, "pending", "", ""
+                            )
                             return
 
                     # Keep the legacy slot throttle running too — it provides
@@ -2469,7 +2826,11 @@ class ExtensionModeManager:
                 # auto-recovery on cascade (mirrors user's manual flow of
                 # clear cache + reconnect VPN + reload Flow + retry).
                 # Only HOLD after MAX_RECAPTCHA_RECOVERY_ATTEMPTS rounds all fail.
-                if "recaptcha" in err_lower or "captcha" in err_lower:
+                if (
+                    "recaptcha" in err_lower
+                    or "captcha" in err_lower
+                    or "evaluation failed" in err_lower
+                ):
                     streak = self._recaptcha_streak.get(worker.account_email, 0) + 1
                     self._recaptcha_streak[worker.account_email] = streak
                     self._log(
@@ -2618,37 +2979,57 @@ class ExtensionModeManager:
                                         f"worth the chance of a fresh IP unlocking "
                                         f"this account before HOLD."
                                     )
-                                try:
-                                    import tempfile as _tempfile
-                                    trigger_path = os.path.join(
-                                        _tempfile.gettempdir(),
-                                        "glabs_vpn_rotate.trigger",
-                                    )
-                                    with open(trigger_path, "w", encoding="utf-8") as _f:
-                                        _f.write(
-                                            f"rotate requested by {worker.account_email} "
-                                            f"at {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                                            f"(recovery {recovery_count + 1}/"
-                                            f"{self.MAX_RECAPTCHA_RECOVERY_ATTEMPTS})\n"
-                                        )
-                                    reason = (
-                                        "final recovery attempt"
-                                        if is_final_attempt
-                                        else "no peer has succeeded in the last 60s"
+                                # VPN rotation DISABLED. Restarting the network
+                                # adapter mid-run tore down in-flight generation
+                                # and download requests ("Failed to fetch"), and
+                                # Surfshark's datacenter IPs don't pass Flow's
+                                # reCAPTCHA anyway. No trigger file is written, so
+                                # the Surfshark-Rotate script never restarts the
+                                # adapter — the network stays stable and downloads
+                                # complete in one shot.
+                                self._log(
+                                    f"[ExtMode] VPN rotation skipped (disabled to "
+                                    f"keep the network stable). Recovery uses cache "
+                                    f"+ reCAPTCHA cookie clear + tab reload only."
+                                )
+
+                            # Step 3a-2: PROJECT rotation. A reCAPTCHA cascade
+                            # often rides along with a Flow project that Google
+                            # has already started 429-ing. Burn the account's
+                            # current project so the retry AFTER this recovery
+                            # resolves a FRESH one (via the normal Methods 1-4
+                            # in _resolve_project_id — same proven path the
+                            # inline 429-burn uses). This is a cache-pointer
+                            # drop only — no tab navigation here, so it cannot
+                            # race the reload below. The actual switch lands on
+                            # the next attempt, giving a clean fresh-IP +
+                            # fresh-cache + fresh-project combination.
+                            try:
+                                current_pid = self._bridge.get_project_id(
+                                    worker.account_email
+                                )
+                                if current_pid:
+                                    self._bridge.burn_project(
+                                        worker.account_email, current_pid
                                     )
                                     self._log(
-                                        f"[ExtMode] 🌐 VPN rotation trigger written "
-                                        f"({reason}). Surfshark-Rotate.ps1 will "
-                                        f"restart the adapter within ~3s if "
-                                        f"running. If not running, start it now: "
-                                        f"powershell -File "
-                                        f"'C:\\Users\\PC\\Desktop\\Surfshark-Rotate.ps1'"
+                                        f"[ExtMode] 🗂 Burned project "
+                                        f"{current_pid} for {worker.account_email} "
+                                        f"— retry will resolve a fresh project on "
+                                        f"top of the IP + cache reset."
                                     )
-                                except Exception as _e:
+                                else:
                                     self._log(
-                                        f"[ExtMode] VPN trigger write failed "
-                                        f"({str(_e)[:80]}) — recovery still proceeds."
+                                        f"[ExtMode] 🗂 No live cached project for "
+                                        f"{worker.account_email} — retry will "
+                                        f"resolve a fresh one anyway."
                                     )
+                            except Exception as _pe:
+                                self._log(
+                                    f"[ExtMode] Project burn during recovery "
+                                    f"failed ({str(_pe)[:80]}) — recovery still "
+                                    f"proceeds."
+                                )
 
                             # Step 3b: Reload the Flow tab. Fresh page = fresh
                             # reCAPTCHA context, and the VPN trigger above
@@ -2709,6 +3090,26 @@ class ExtensionModeManager:
                     "Failed to fetch",
                     "Bridge error: no_labs_tab",
                 )):
+                    # For a plain IMAGE job WITHOUT references, a network blip
+                    # is worth retrying: a duplicate image is cheap, and losing
+                    # the (possibly already-generated) image just wastes quota
+                    # with nothing saved locally — exactly the "generation hoti
+                    # hai, download fail, image lost" complaint. Only VIDEO or
+                    # reference-based jobs stay fail-fast, because a duplicate
+                    # video / duplicate reference upload is expensive.
+                    _has_refs = bool(
+                        job.get("reference_media_ids")
+                        or str(job.get("ref_path") or "").strip()
+                        or str(job.get("ref_paths") or "").strip()
+                    )
+                    if job_type == "image" and not _has_refs and attempt < max_retries:
+                        self._log(
+                            f"[{worker.slot_id}] Network blip on image job "
+                            f"({last_error[:80]}) — retrying (duplicate image is "
+                            f"cheap; better than losing the generation)."
+                        )
+                        await asyncio.sleep(3)
+                        continue
                     self._log(
                         f"[{worker.slot_id}] Network-level failure — not retrying "
                         f"(Google may have received the first request). "
