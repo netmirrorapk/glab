@@ -278,8 +278,13 @@ class PlaywrightDolaModeManager:
             self._slots = max(1, min(8, int(str(get_setting("slots_per_account", "1") or "1"))))
         except Exception:
             self._slots = 1
-        self._cloak = self._bool_setting("dola_pw_cloak", "1")
-        self._headless = self._bool_setting("dola_pw_headless", "1")
+        # Honor the app's "Browser & Stealth" settings so the visible choices drive
+        # this mode too: Browser Mode = CloakBrowser → cloak; Cloak Display = Headless
+        # → invisible. Real-Chrome modes run OFF-SCREEN when 'headless'.
+        bmode = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
+        cdisp = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
+        self._cloak = (bmode == "cloakbrowser")
+        self._headless = (cdisp == "headless") if self._cloak else (bmode == "headless")
         self._auto_delete = self._bool_setting("dola_auto_delete", "1")
         # If cloak is requested but the CloakBrowser binary isn't available, fall
         # back to real Chrome (off-screen when headless) so the mode still runs.
