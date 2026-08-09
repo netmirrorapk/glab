@@ -456,13 +456,15 @@ class DolaSession:
         conv = re.findall(r'"conversation_id":"(\d+)"', raw)
         if not conv:
             raise DolaError("submit ok but no conversation_id in SSE")
-        # ★ INSTANT exhaustion (extension's line 814): dola sets ext.has_video_gen="1"
-        # (→ verdict 'gen') ONLY when it actually queues a video. If the submit SSE
-        # got a conversation_id but there's NO gen flag / gen text at all, no video
-        # was queued — the account is out of points. Detect it NOW (not after a
-        # poll) so the caller burn-recreates immediately, exactly like the extension.
-        if verdict != "gen":
-            raise DailyLimitReached("submit accepted but no video queued — account exhausted (no points)")
+        # NOTE on the ambiguous "no_video_gen" case (conversation_id but no gen flag
+        # / gen text): the extension deliberately did NOT treat this as exhaustion
+        # (dola.js:807-814) — it's often just that has_video_gen hasn't streamed into
+        # the SUBMIT response yet (esp. right after a fresh login/burn-recreate). If
+        # we burn-recreated here we'd wrongly nuke a HEALTHY fresh account and
+        # cascade. So we return the conversation_id and let wait_for_video decide:
+        # a real gen shows up in the first few polls; a truly exhausted account
+        # trips the 15s "generation never started" fast-fail there. Only EXPLICIT
+        # limit/refusal text (handled above) fails instantly at submit.
         return conv[0]
 
     async def _pull_single(self, conv_id: str) -> str:
