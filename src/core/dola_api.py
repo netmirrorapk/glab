@@ -475,10 +475,12 @@ class DolaSession:
                 saw_gen = True
             # Silent exhaustion: dola accepted the submit (conversation_id) but the
             # assistant NEVER starts a generation (no gen text, no vid, no explicit
-            # error) — almost always the account is out of points. Don't wait the
-            # full timeout; treat it as a daily-limit so the caller burn-recreates.
-            if not saw_gen and (time.time() - start) > 90:
-                raise DailyLimitReached("generation never started — account likely exhausted (no points)")
+            # error) — almost always the account is out of points. A REAL generation
+            # confirms within ~6s, so if nothing has started by 20s the account is
+            # exhausted → fail fast so the caller burn-recreates immediately (no
+            # point waiting the full timeout on an account that can't generate).
+            if not saw_gen and (time.time() - start) > 20:
+                raise DailyLimitReached("generation never started — account exhausted (no points)")
             # Periodic visibility: every ~30s log what dola is actually showing so
             # a stuck "generating" or a NEW/unknown error is visible in the log
             # (esp. useful when the window is off-screen/headless).
