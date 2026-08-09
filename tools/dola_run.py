@@ -30,8 +30,11 @@ try:
 except Exception:
     pass
 
+import json as _json
+import tempfile
 from playwright.async_api import async_playwright
 from src.core.dola_api import DolaSession, DailyLimitReached, GenerationRefused, DolaError
+from src.core.cloakbrowser_support import load_cloakbrowser_api
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES_DIR = os.path.join(ROOT, "data", "dola_profiles")
@@ -108,14 +111,75 @@ async def _launch(profile_dir, proxy, headless):
     return p, ctx
 
 
-async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats):
+async def _export_cookies(profile_dir):
+    """Grab a dedicated profile's cookies (Google + dola) so CloakBrowser — which
+    doesn't persist a Google login — can be seeded with a logged-in session."""
+    chrome = find_chrome()
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir, executable_path=chrome, headless=False,
+            ignore_default_args=["--enable-automation"],
+            args=["--no-first-run", "--no-default-browser-check",
+                  "--window-position=-32000,-32000", "--window-size=1200,800"])
+        try:
+            return await asyncio.wait_for(ctx.cookies(), timeout=30)
+        finally:
+            try:
+                await asyncio.wait_for(ctx.close(), timeout=15)
+            except Exception:
+                pass
+
+
+async def _cookies_for(acct, profile_dir):
+    """Cached cookies (data/dola_profiles/<acct>_cookies.json) or a fresh export."""
+    cf = os.path.join(PROFILES_DIR, f"{acct}_cookies.json")
+    if os.path.isfile(cf):
+        try:
+            return _json.load(open(cf, encoding="utf-8"))
+        except Exception:
+            pass
+    ck = await _export_cookies(profile_dir)
+    try:
+        _json.dump(ck, open(cf, "w", encoding="utf-8"))
+    except Exception:
+        pass
+    return ck
+
+
+async def _launch_cloak(cookies, proxy, headless):
+    """Launch anti-detect CloakBrowser (passes dola's headless check) + inject the
+    logged-in cookies. Returns (None, ctx) — no separate playwright object."""
+    api = load_cloakbrowser_api()
+    persistent = api.get("persistent_async")
+    if not api.get("available") or persistent is None:
+        raise RuntimeError("CloakBrowser not available")
+    session_path = tempfile.mkdtemp(prefix="dola_cloak_")
+    ctx = await persistent(
+        session_path, headless=headless,
+        args=["--no-first-run", "--no-default-browser-check"],
+        proxy=proxy or None, humanize={"preset": "careful"})
+    try:
+        await ctx.add_cookies(cookies)
+    except Exception:
+        pass
+    return None, ctx
+
+
+async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats, cloak=False):
     profile_dir = os.path.join(PROFILES_DIR, acct)
     if not os.path.isdir(profile_dir):
         log(acct, "profile missing — skipping"); return
     p = ctx = None
     recreated = 0
     try:
-        p, ctx = await _launch(profile_dir, proxy, headless)
+        if cloak:
+            log(acct, "CloakBrowser mode — exporting cookies + launching (truly invisible)…")
+            cookies = await _cookies_for(acct, profile_dir)
+            # cloak proxy expects a Playwright-style dict; convert the URL if given
+            cproxy = _proxy_dict(proxy) if isinstance(proxy, str) else proxy
+            p, ctx = await _launch_cloak(cookies, cproxy, headless)
+        else:
+            p, ctx = await _launch(profile_dir, proxy, headless)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         session = DolaSession(ctx, page, logger=lambda *a: log(acct, *a))
         try:
@@ -233,8 +297,11 @@ async def main_async(args):
     print(f"[run] {len(prompts)} prompts across {len(accounts)} account(s): {accounts}")
     print(f"[run] proxies: {list(proxies.keys()) or '(none — all on this machine IP)'}")
 
+    if getattr(args, "cloak", False):
+        print("[run] CloakBrowser mode — truly invisible headless (passes dola's detection)")
     await asyncio.gather(*[
-        worker(a, proxies.get(a), queue, args.ratio, args.headless, stats) for a in accounts
+        worker(a, proxies.get(a), queue, args.ratio, args.headless, stats,
+               cloak=getattr(args, "cloak", False)) for a in accounts
     ])
     print(f"[run] FINISHED — done={stats['done']} refused={stats['refused']} "
           f"errors={stats['errors']} | videos in {OUT_DIR}")
@@ -245,7 +312,8 @@ def main():
     ap.add_argument("--prompts", required=True, help="text file, one prompt per line")
     ap.add_argument("--accounts", default=None, help="comma list of profile names (default: all in registry)")
     ap.add_argument("--ratio", default="16:9")
-    ap.add_argument("--headless", action="store_true", help="invisible via Chrome NEW headless (--headless=new), which dola does NOT detect (old headless is throttled)")
+    ap.add_argument("--headless", action="store_true", help="invisible: off-screen headed (regular Chrome) — dola passes this")
+    ap.add_argument("--cloak", action="store_true", help="use anti-detect CloakBrowser in TRUE headless (truly invisible; cookies auto-injected from the dedicated profile)")
     args = ap.parse_args()
     asyncio.run(main_async(args))
 
