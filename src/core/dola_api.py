@@ -457,8 +457,10 @@ class DolaSession:
         Returns (vid, raw_message_text)."""
         exclude = exclude or set()
         deadline = time.time() + timeout
+        start = time.time()
         last = ""
         self.last_points_left = None
+        saw_gen = False
         cyc = 0
         while time.time() < deadline:
             await asyncio.sleep(poll_every)
@@ -467,6 +469,16 @@ class DolaSession:
             for vid in _extract_all_vids(last):
                 if vid not in exclude:
                     return vid, last
+            low0 = last.lower()
+            if ("generating" in low0 or "the video will be generated" in low0
+                    or "will be ready" in low0 or _HAS_VIDEO_GEN in last):
+                saw_gen = True
+            # Silent exhaustion: dola accepted the submit (conversation_id) but the
+            # assistant NEVER starts a generation (no gen text, no vid, no explicit
+            # error) — almost always the account is out of points. Don't wait the
+            # full timeout; treat it as a daily-limit so the caller burn-recreates.
+            if not saw_gen and (time.time() - start) > 90:
+                raise DailyLimitReached("generation never started — account likely exhausted (no points)")
             # Periodic visibility: every ~30s log what dola is actually showing so
             # a stuck "generating" or a NEW/unknown error is visible in the log
             # (esp. useful when the window is off-screen/headless).
