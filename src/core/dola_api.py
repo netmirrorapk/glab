@@ -609,12 +609,21 @@ class DolaSession:
         #    out, the page bounces to the Google account chooser (accounts.google.com).
         log("opening /delete-account (Google re-auth auto-completes if Google is logged in)...")
         await self.page.goto(delete_url, wait_until="domcontentloaded")
-        await asyncio.sleep(7)
+        await asyncio.sleep(1.5)   # let the page commit to bounce-or-render
+        # Poll fast for a KNOWN state instead of a blanket 7s wait: either it bounced
+        # to Google (re-auth) or the Delete button already rendered. Proceeds the
+        # instant it's ready — same accuracy, no wasted seconds on a fast load.
         cur_url = ""
-        try:
-            cur_url = str(self.page.url or "")
-        except Exception:
-            cur_url = ""
+        for _ in range(24):   # up to ~12s, 0.5s granularity
+            try:
+                cur_url = str(self.page.url or "")
+            except Exception:
+                cur_url = ""
+            if "accounts.google.com" in cur_url:
+                break
+            if await self._click_delete_control(log, do_click=False):
+                break
+            await asyncio.sleep(0.5)
         if "accounts.google.com" in cur_url:
             # The delete re-auth bounced to Google (chooser/consent for this
             # sensitive op). Google IS logged in — nudge the account row and WAIT
@@ -622,18 +631,19 @@ class DolaSession:
             # renders). Poll the LIVE url so we don't act on a stale mid-redirect.
             log("delete re-auth bounced to Google — completing + waiting for return to dola...")
             back = False
-            for _ in range(12):   # ~30s
-                try:
-                    await self.page.evaluate(
-                        r"""() => {
-                            const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
-                              .filter(e => { const t=(e.innerText||'').toLowerCase();
-                                return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<130; });
-                            if(rows[0]) rows[0].click();
-                        }""")
-                except Exception:
-                    pass
-                await asyncio.sleep(2.5)
+            for i in range(40):   # ~20s, but returns the INSTANT we're back on dola
+                if i % 6 == 0:   # (re)click the account row every ~3s
+                    try:
+                        await self.page.evaluate(
+                            r"""() => {
+                                const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
+                                  .filter(e => { const t=(e.innerText||'').toLowerCase();
+                                    return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<130; });
+                                if(rows[0]) rows[0].click();
+                            }""")
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)   # poll the url every 0.5s (fast return detect)
                 try:
                     cur_url = str(self.page.url or "")
                 except Exception:
@@ -644,21 +654,21 @@ class DolaSession:
             if not back:
                 return False, f"Google re-auth for delete didn't return to dola (url={cur_url[:60]})."
             log("  re-auth complete — back on dola/delete-account")
-            await asyncio.sleep(4)   # let /delete-account render the danger button
 
         # Let the page settle on the delete view before hunting the button — right
         # after the OAuth bounce it may still be mid-navigation, which makes an
-        # evaluate throw "execution context was destroyed".
+        # evaluate throw "execution context was destroyed". The button-retry loop
+        # below then grabs the button the instant it renders (no blanket wait).
         try:
-            await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+            await self.page.wait_for_load_state("domcontentloaded", timeout=6000)
         except Exception:
             pass
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         # 3) Locate + click the danger 'Delete Now' control. The button renders
         #    LATE while the page finishes bouncing through the silent OAuth, so we
         #    RETRY (extension dola.js:1130 — up to ~20×1.5s) instead of a single try.
         clicked = False
-        for _ in range(18):   # ~27s
+        for _ in range(25):   # ~25s, but breaks the instant the button appears
             if await self._click_delete_control(log, do_click=not dry_run):
                 clicked = True
                 break
@@ -669,7 +679,7 @@ class DolaSession:
                 u = ""
             if any(s in u for s in ("/login", "/passport/web/logout", "from_logout")):
                 return True, "account deletion confirmed (logout redirect)"
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
         if not clicked:
             return False, "could not find the 'Delete Now' button on /delete-account"
         if dry_run:
