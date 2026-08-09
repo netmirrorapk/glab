@@ -38,3 +38,8 @@ desktop.ini
 # ─── Claude Code ───
 .claude/
 .deps_installing
+
+# Dola sync backup + local logs (not for repo)
+_backup_before_dola/
+test_run.log
+test_run*.log

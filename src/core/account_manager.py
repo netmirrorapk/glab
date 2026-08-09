@@ -37,6 +37,14 @@ class AccountManager:
     """Manages spawning Playwright to handle Google Auth sessions."""
     FLOW_PAGE_URL = "https://labs.google/fx/tools/flow"
     FLOW_REFERER = "https://www.google.com"
+    # Login start URLs per target. Both open Google login in real Chrome — this is
+    # what reliably leaves an ACTIVE google.com session in the profile. dola's own
+    # login is auto_open, so once Google is active, visiting dola.com (for generation
+    # or the delete-account flow) silently OAuths and logs in with NO extra click.
+    LOGIN_START_URLS = {
+        "flow": "https://accounts.google.com",
+        "dola": "https://accounts.google.com",
+    }
     WEBDRIVER_OVERRIDE_SCRIPT = """
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
@@ -550,6 +558,83 @@ class AccountManager:
                 shutil.rmtree(temp_root, ignore_errors=True)
 
     @staticmethod
+    async def delete_dola_account(session_path, proxy=None, update_log_callback=None, headless=True, dry_run=False):
+        """Open the account's saved browser profile and delete the dola.com account.
+
+        Deletes ONLY the dola.com (ByteDance passport) account. The linked Google
+        login and its cookies are on a separate domain and are left untouched, so
+        the profile stays reusable for Google. Returns {"ok": bool, "detail": str}.
+        """
+        from src.core.dola_api import DolaSession
+
+        logger = update_log_callback if callable(update_log_callback) else (lambda _m: None)
+        session_path = str(session_path or "").strip()
+        if not session_path or not os.path.isdir(session_path):
+            return {"ok": False, "detail": "session folder not found on disk"}
+
+        # Run on a TEMP COPY of the profile (not the live one) so a warmup/lock on
+        # the live profile can't crash the launch. The copy carries the login
+        # cookies, and dola deletion is server-side, so nothing needs to persist back.
+        temp_root = None
+        context = None
+        try:
+            temp_root, work_session_path = AccountManager._make_temp_status_session_copy(session_path)
+            cleanup_session_locks(work_session_path)
+
+            async with async_playwright() as p:
+                launch_options = AccountManager._persistent_context_launch_options(
+                    headless=bool(headless), proxy_value=proxy
+                )
+                # The profile is written by the system's (newer) real Chrome. Playwright's
+                # bundled Chromium can't open it (version mismatch -> instant crash), so
+                # launch with real Chrome itself. Fall back to bundled Chromium only if
+                # Chrome isn't installed.
+                real_chrome = AccountManager._find_chrome_path()
+                if real_chrome:
+                    launch_options["executable_path"] = real_chrome
+                else:
+                    browser_path = AccountManager._resolve_browser_path(p)
+                    if browser_path:
+                        launch_options["executable_path"] = browser_path
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=work_session_path,
+                    **launch_options,
+                )
+                AccountManager._register_context_process(context)
+                page = context.pages[0] if context.pages else await context.new_page()
+                await AccountManager._apply_browser_overrides(context, page)
+                await AccountManager._apply_stealth_to_page(page)
+
+                # Some profiles (Mac CloakBrowser hybrid) keep login in exported_cookies.json.
+                cookies_json = os.path.join(work_session_path, "exported_cookies.json")
+                if os.path.exists(cookies_json):
+                    try:
+                        with open(cookies_json, "r", encoding="utf-8") as f:
+                            saved = json.load(f)
+                        if isinstance(saved, list) and saved:
+                            await AccountManager._maybe_await(context.add_cookies(saved))
+                    except Exception:
+                        pass
+
+                sess = DolaSession(context, page, logger=logger)
+                ok, detail = await sess.delete_account(log=logger, dry_run=bool(dry_run))
+                return {"ok": bool(ok), "detail": str(detail)}
+        except Exception as exc:
+            return {"ok": False, "detail": f"delete run failed: {str(exc)[:200]}"}
+        finally:
+            try:
+                if context is not None:
+                    await AccountManager._close_context_and_flush(context, flush_delay=1)
+            except Exception:
+                pass
+            AccountManager._unregister_context_process(context)
+            if temp_root and os.path.isdir(temp_root):
+                try:
+                    shutil.rmtree(temp_root, ignore_errors=True)
+                except Exception:
+                    pass
+
+    @staticmethod
     async def _run_cookie_warmup_once(
         account_name,
         session_path,
@@ -807,6 +892,10 @@ class AccountManager:
     _AUTH_COOKIE_NAMES = frozenset((
         "SID", "SSID", "HSID", "SAPISID", "APISID",
         "__Secure-1PSID", "__Secure-3PSID",
+    ))
+    # dola.com (ByteDance passport) session cookies — presence means dola is logged in.
+    _DOLA_LOGIN_COOKIE_NAMES = frozenset((
+        "sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt",
     ))
 
     @staticmethod
@@ -1277,13 +1366,19 @@ class AccountManager:
     @staticmethod
     async def _monitor_chrome_and_extract_cookies(
         chrome_process, cdp_port, session_dir, label, logger=None, should_stop=None,
+        login_target="flow",
     ):
         """
         Monitor Chrome process. Periodically extract cookies via live CDP.
-        After login detected, auto-navigates to Flow page to set all cookies.
-        Keeps updating until Chrome closes.
-        Returns (cookies_exported: bool, detected_email: str or None).
+        After Google login is detected, auto-navigates to the target site to set
+        all cookies: labs.google/flow for "flow", or dola.com for "dola" (which
+        auto-logs-in via the active Google session). Keeps updating until Chrome
+        closes. Returns (cookies_exported: bool, detected_email: str or None).
         """
+        is_dola = str(login_target or "flow").strip().lower() == "dola"
+        post_login_url = "https://www.dola.com/" if is_dola else "https://labs.google/fx/tools/flow"
+        site_label = "dola.com" if is_dola else "Flow"
+
         cookies_saved = False
         detected_email = None
         last_cookie_count = 0
@@ -1323,10 +1418,17 @@ class AccountManager:
                         c for c in raw_cookies
                         if "google" in (c.get("domain") or "").lower()
                     ]
-                    labs_cookies = [
-                        c for c in raw_cookies
-                        if "labs.google" in (c.get("domain") or "").lower()
-                    ]
+                    if is_dola:
+                        site_cookies = [
+                            c for c in raw_cookies
+                            if "dola.com" in (c.get("domain") or "").lower()
+                            and c.get("name", "") in AccountManager._DOLA_LOGIN_COOKIE_NAMES
+                        ]
+                    else:
+                        site_cookies = [
+                            c for c in raw_cookies
+                            if "labs.google" in (c.get("domain") or "").lower()
+                        ]
 
                     # Log only when cookie count changes
                     if len(raw_cookies) != last_cookie_count:
@@ -1346,27 +1448,29 @@ class AccountManager:
                                     logger(f"[AUTO] Detected logged-in Google account: {detected_email}")
                                 break
 
-                    # Login detected — auto-navigate to Flow page
+                    # Login detected — auto-navigate to the target site
                     if len(auth_cookies) >= 2 and not login_detected:
                         login_detected = True
                         if logger:
                             logger(f"[{label}] Google login detected! "
                                    f"({len(auth_cookies)} auth cookies)")
-                            logger(f"[{label}] Navigating to Flow page to set all cookies...")
+                            logger(f"[{label}] Navigating to {site_label} to set all cookies"
+                                   + (" (dola auto-logs-in via Google)..." if is_dola else "..."))
                         await AccountManager._navigate_chrome_via_cdp(
-                            cdp_port, "https://labs.google/fx/tools/flow",
+                            cdp_port, post_login_url,
                             logger=logger, label=label,
                         )
-                        await asyncio.sleep(5)
+                        # dola auto-login runs its OAuth after landing — give it time.
+                        await asyncio.sleep(8 if is_dola else 5)
                         # Re-fetch cookies after navigation
                         continue
 
-                    # Check if Flow cookies appeared
-                    if login_detected and not flow_visited and len(labs_cookies) >= 1:
+                    # Check if the target-site login cookies appeared
+                    if login_detected and not flow_visited and len(site_cookies) >= 1:
                         flow_visited = True
                         if logger:
-                            logger(f"[{label}] Flow page cookies set! "
-                                   f"({len(labs_cookies)} labs.google cookies)")
+                            logger(f"[{label}] {site_label} login cookies set! "
+                                   f"({len(site_cookies)} {site_label} cookies)")
                             logger(f"[{label}] You can close Chrome now.")
 
                     # Save cookies every poll when we have auth
@@ -1391,7 +1495,7 @@ class AccountManager:
             if not login_detected:
                 logger(f"[{label}] No Google login detected. Please try again.")
             elif not flow_visited:
-                logger(f"[{label}] Flow page was not visited. Login may not persist for generation.")
+                logger(f"[{label}] {site_label} page was not visited. Login may not persist for generation.")
 
         return cookies_saved, detected_email
 
@@ -1482,6 +1586,7 @@ class AccountManager:
     @staticmethod
     async def _pure_chrome_login(
         session_dir, account_hint, update_log_callback=None, should_stop=None, proxy=None,
+        login_target="flow",
     ):
         """
         Launch Chrome as a PURE subprocess WITH --remote-debugging-port.
@@ -1525,7 +1630,7 @@ class AccountManager:
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--window-size=1920,1080",
-            "https://accounts.google.com",
+            AccountManager.LOGIN_START_URLS.get(str(login_target or "flow"), "https://accounts.google.com"),
         ]
         if proxy:
             # Chromium can't use SOCKS5 with username/password — route
@@ -1541,7 +1646,10 @@ class AccountManager:
 
         if update_log_callback:
             update_log_callback(f"[{label}] Launching pure Chrome with CDP port {cdp_port}...")
-            update_log_callback(f"[{label}] Please log in to Google, then CLOSE Chrome when done.")
+            if str(login_target or "flow") == "dola":
+                update_log_callback(f"[{label}] Log in to your Google account fully, then CLOSE Chrome. dola.com will auto-login later using this Google session.")
+            else:
+                update_log_callback(f"[{label}] Please log in to Google, then CLOSE Chrome when done.")
 
         creationflags = 0
         popen_kwargs = {}
@@ -1588,6 +1696,7 @@ class AccountManager:
             chrome_process, cdp_port, session_dir, label,
             logger=update_log_callback,
             should_stop=should_stop,
+            login_target=login_target,
         )
 
         process_tracker.unregister(getattr(chrome_process, "pid", None))
@@ -1656,11 +1765,16 @@ class AccountManager:
         warmup_complete_callback=None,
         should_stop=None,
         proxy=None,
+        login_target="flow",
     ):
         """
         Launches a visible browser for the user to login.
         Saves the persistent browser context to the data directory so future
         headless runs can stay logged in.
+
+        login_target: "flow" (Google/labs.google, default) or "dola" (dola.com —
+        opens dola.com so the user signs in via Google; the profile ends up with
+        both dola.com and google cookies).
 
         Mac / Real Chrome: Uses PURE subprocess Chrome (zero Playwright)
         to avoid Google detecting automation hooks.
@@ -1692,6 +1806,7 @@ class AccountManager:
             update_log_callback=update_log_callback,
             should_stop=should_stop,
             proxy=proxy,
+            login_target=login_target,
         )
 
         # ══════════════════════════════════════════════════════════════════

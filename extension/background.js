@@ -15,6 +15,8 @@ try { importScripts("personas.js"); } catch (e) { console.warn("personas.js not 
 try { importScripts("genspark.js"); } catch (e) { console.warn("genspark.js not loaded:", e); }
 // Load Grok module (standalone — uses port 18926 separately from Flow/Genspark)
 try { importScripts("grok.js"); } catch (e) { console.warn("grok.js not loaded:", e); }
+// Load Dola module (standalone — uses port 18927 separately from the others)
+try { importScripts("dola.js"); } catch (e) { console.warn("dola.js not loaded:", e); }
 
 const BRIDGE_URL = "http://127.0.0.1:18924";
 const POLL_INTERVAL = 1500;
@@ -1198,6 +1200,62 @@ async function handleCommand(cmd) {
         console.warn("[G-Labs Helper] clean_recaptcha_cookie failed:", e.message);
       }
       break;
+
+    case "get_project": {
+      // READ (never create) the project the user ALREADY has open. Scans this
+      // account's labs.google tabs for a /project/<id> URL and posts it back —
+      // no Bearer token (Method 1/2 often 401 on fresh accounts), no button
+      // click / navigation (Method 3 is flaky and actually FAILS when a project
+      // is already open). Runs on-demand at resolve time so it sees the CURRENT
+      // tab URL, not the last periodic detectAccounts sweep.
+      try {
+        const labsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+        let foundPid = "";
+        for (const t of labsTabs) {
+          const m = String(t.url || "").match(/\/project\/([a-z0-9-]{16,})/i);
+          if (!m) continue;
+          // Confirm the tab belongs to `account` before attributing the
+          // project to it (avoids cross-account mixups in multi-account
+          // Chrome profiles).
+          let email = connectedAccounts[t.id]?.email || "";
+          if (!email) {
+            try {
+              const r = await chrome.scripting.executeScript({
+                target: { tabId: t.id }, world: "MAIN",
+                func: async () => {
+                  try {
+                    const resp = await fetch(
+                      "https://labs.google/fx/api/auth/session",
+                      { credentials: "include" }
+                    );
+                    if (!resp.ok) return "";
+                    const d = await resp.json().catch(() => null);
+                    return (d && (d.email || (d.user && d.user.email))) || "";
+                  } catch { return ""; }
+                },
+              });
+              email = r?.[0]?.result || "";
+            } catch {}
+          }
+          if (email !== account) continue;
+          foundPid = m[1];
+          break;
+        }
+        if (foundPid) {
+          await fetch(`${BRIDGE_URL}/project`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ account, project_id: foundPid }),
+          });
+          console.log(`[G-Labs Helper] get_project: using open project ${foundPid} for ${account}`);
+        } else {
+          console.log(`[G-Labs Helper] get_project: no open /project/ tab for ${account}`);
+        }
+      } catch (e) {
+        console.warn(`[G-Labs Helper] get_project exception:`, e?.message || e);
+      }
+      break;
+    }
 
     case "new_project":
       if (tabId) {
@@ -2780,4 +2838,14 @@ try {
   }
 } catch (e) {
   console.warn("[G-Labs Helper] Grok module failed to start:", e);
+}
+
+// Start Dola module — independent of the others.
+// Silently stays idle when the Dola bridge (port 18927) isn't running.
+try {
+  if (typeof self.dolaStart === "function") {
+    self.dolaStart();
+  }
+} catch (e) {
+  console.warn("[G-Labs Helper] Dola module failed to start:", e);
 }

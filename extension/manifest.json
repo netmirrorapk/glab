@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "G-Labs Studio Helper",
-  "version": "1.9.8",
-  "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image/video generation (Flow + Genspark + Grok)",
+  "version": "2.5.0",
+  "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image/video generation (Flow + Genspark + Grok + Dola)",
   "permissions": [
     "tabs",
     "scripting",
@@ -10,7 +10,8 @@
     "webRequest",
     "browsingData",
     "storage",
-    "alarms"
+    "alarms",
+    "debugger"
   ],
   "host_permissions": [
     "https://labs.google/*",
@@ -18,6 +19,12 @@
     "http://127.0.0.1:18924/*",
     "http://127.0.0.1:18925/*",
     "http://127.0.0.1:18926/*",
+    "http://127.0.0.1:18927/*",
+    "https://www.dola.com/*",
+    "https://dola.com/*",
+    "https://*.dola.com/*",
+    "https://*.byteintlapi.com/*",
+    "https://*.ibyteimg.com/*",
     "https://*.google.com/*",
     "https://google.com/*",
     "https://accounts.google.com/*",
@@ -39,11 +46,26 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://grok.com/*"],
-      "js": ["grok-inject.js"],
+      "matches": [
+        "https://grok.com/*"
+      ],
+      "js": [
+        "grok-inject.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
+    },
+    {
+      "matches": [
+        "https://www.dola.com/*",
+        "https://dola.com/*"
+      ],
+      "js": [
+        "dola-inject.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "action": {

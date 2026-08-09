@@ -958,6 +958,7 @@ def update_pending_jobs_generation_settings(
     end_image_path=None,
     filter_job_type=None,
     filter_video_sub_mode=None,
+    include_references=False,
 ):
     updated_count = 0
     normalized_job_type = str(job_type or "image").strip().lower()
@@ -984,32 +985,63 @@ def update_pending_jobs_generation_settings(
     def _op(conn):
         nonlocal updated_count
         cursor = conn.cursor()
-        query = [
-            '''
-            UPDATE jobs
-            SET job_type = ?, model = ?, aspect_ratio = ?, output_count = ?,
-                ref_path = ?, ref_paths = ?, video_model = ?, video_sub_mode = ?, video_ratio = ?, video_prompt = ?, video_upscale = ?, video_length = ?, video_output_count = ?,
-                start_image_path = ?, end_image_path = ?
-            WHERE status = 'pending'
-            '''
-        ]
-        params = [
-            normalized_job_type,
-            model,
-            aspect_ratio,
-            int(output_count),
-            normalized_ref_path,
-            normalized_ref_paths_json,
-            normalized_video_model,
-            normalized_video_sub_mode,
-            normalized_video_ratio,
-            normalized_video_prompt,
-            normalized_video_upscale,
-            normalized_video_length,
-            normalized_video_output_count,
-            normalized_start_image_path,
-            normalized_end_image_path,
-        ]
+        # Per-job reference/start/end images (ref_path, ref_paths,
+        # start_image_path, end_image_path) are OWNED BY EACH JOB — for
+        # bulk image→video every job carries a DIFFERENT image. A blanket
+        # settings-sync (fired on queue start / settings change) must NOT
+        # overwrite them with the single UI reference (which is usually
+        # empty → None), or it silently wipes every job's attached image.
+        # Only propagate the reference columns when the caller explicitly
+        # asks for it (include_references=True).
+        if include_references:
+            query = [
+                '''
+                UPDATE jobs
+                SET job_type = ?, model = ?, aspect_ratio = ?, output_count = ?,
+                    ref_path = ?, ref_paths = ?, video_model = ?, video_sub_mode = ?, video_ratio = ?, video_prompt = ?, video_upscale = ?, video_length = ?, video_output_count = ?,
+                    start_image_path = ?, end_image_path = ?
+                WHERE status = 'pending'
+                '''
+            ]
+            params = [
+                normalized_job_type,
+                model,
+                aspect_ratio,
+                int(output_count),
+                normalized_ref_path,
+                normalized_ref_paths_json,
+                normalized_video_model,
+                normalized_video_sub_mode,
+                normalized_video_ratio,
+                normalized_video_prompt,
+                normalized_video_upscale,
+                normalized_video_length,
+                normalized_video_output_count,
+                normalized_start_image_path,
+                normalized_end_image_path,
+            ]
+        else:
+            query = [
+                '''
+                UPDATE jobs
+                SET job_type = ?, model = ?, aspect_ratio = ?, output_count = ?,
+                    video_model = ?, video_sub_mode = ?, video_ratio = ?, video_prompt = ?, video_upscale = ?, video_length = ?, video_output_count = ?
+                WHERE status = 'pending'
+                '''
+            ]
+            params = [
+                normalized_job_type,
+                model,
+                aspect_ratio,
+                int(output_count),
+                normalized_video_model,
+                normalized_video_sub_mode,
+                normalized_video_ratio,
+                normalized_video_prompt,
+                normalized_video_upscale,
+                normalized_video_length,
+                normalized_video_output_count,
+            ]
 
         normalized_filter_job_type = str(filter_job_type or "").strip().lower()
         if normalized_filter_job_type:

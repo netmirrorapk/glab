@@ -1355,6 +1355,31 @@ class ExtensionWorker:
 
         headers = {"authorization": f"Bearer {access_token}"}
 
+        # ── Method 0: Use the project the user ALREADY has open ───────────
+        # Before any API call or button click, ask the extension to read the
+        # project ID straight from this account's open /project/<id> tab. If a
+        # project is open (user opened one, or the account is onboarded), this
+        # resolves instantly — NO Bearer token, NO navigation — sidestepping
+        # Method 1/2 (which 401 on fresh accounts) and Method 3 (which is flaky
+        # and, ironically, FAILS precisely when a project is already open,
+        # because it navigates away to click "New project"). get_project_id()
+        # filters burned projects, so during a burn+rotate this returns the
+        # open (burned) project as None and we correctly fall through to create
+        # a fresh one. Only genuinely project-less accounts reach Methods 1-4.
+        try:
+            self._bridge.send_command("get_project", self.account_email)
+            for _ in range(6):
+                await asyncio.sleep(1)
+                pid = self._bridge.get_project_id(self.account_email)
+                if pid:
+                    self._log(
+                        f"[{self.slot_id}] Method 0 OK: read open project "
+                        f"{pid} from the tab URL — no API/click needed."
+                    )
+                    return pid
+        except Exception as e:
+            self._log(f"[{self.slot_id}] Method 0 exception: {str(e)[:120]}")
+
         # ── Method 1: List projects via tRPC (new endpoint, July 2026) ──
         # Google migrated Flow's project APIs to labs.google/fx/api/trpc.
         # The old aisandbox-pa endpoint (v1/projects) now returns 404.

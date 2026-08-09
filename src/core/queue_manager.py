@@ -110,6 +110,7 @@ class AsyncQueueManager(QThread):
             "chrome_extension",
             "chrome_extension_genspark",
             "chrome_extension_grok",
+            "chrome_extension_dola",
         }:
             gen_mode_raw = "browser_per_slot"
         self.generation_mode = gen_mode_raw
@@ -533,6 +534,28 @@ class AsyncQueueManager(QThread):
                 self.signals.log_msg.emit(
                     f"[ERROR] Grok mode failed: {str(e)[:150]}. "
                     "Falling back to browser mode."
+                )
+            else:
+                return
+            self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
+
+        # Chrome Extension mode — dola.com (ByteDance Seedance video via real Chrome)
+        elif self.generation_mode == "chrome_extension_dola":
+            self.signals.log_msg.emit(
+                "[SYSTEM] Generation mode: Chrome Extension — Dola "
+                "(dola.com Seedance video, real logged-in Chrome, API + download)"
+            )
+            try:
+                from src.core.dola_mode import DolaModeManager
+                manager = DolaModeManager(self)
+                await manager.run()
+            except ImportError:
+                self.signals.log_msg.emit(
+                    "[ERROR] dola_mode.py not found. Falling back to browser mode."
+                )
+            except Exception as e:
+                self.signals.log_msg.emit(
+                    f"[ERROR] Dola mode failed: {str(e)[:150]}. Falling back to browser mode."
                 )
             else:
                 return

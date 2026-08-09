@@ -242,14 +242,15 @@ class LoginWorker(QThread):
     warmup_complete = Signal(str, bool, str)
     finished_login = Signal(str, str, str) # name, session_path, detected_email
     
-    def __init__(self, account_name, proxy=""):
+    def __init__(self, account_name, proxy="", login_target="flow"):
         super().__init__()
         self.account_name = account_name
         self.proxy = str(proxy or "").strip()
+        self.login_target = str(login_target or "flow").strip().lower()
 
     def stop(self):
         self.requestInterruption()
-        
+
     def run(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -258,6 +259,7 @@ class LoginWorker(QThread):
                 AccountManager.login_and_save_session(
                     self.account_name,
                     lambda m: self.log_msg.emit(m),
+                    login_target=self.login_target,
                     download_progress_callback=lambda percent, status: self.download_progress.emit(int(percent), str(status)),
                     download_complete_callback=lambda success, message: self.download_complete.emit(bool(success), str(message)),
                     session_saved_callback=lambda name, session_path, detected_email: self.session_saved.emit(
@@ -393,6 +395,39 @@ class _CloakDownloadLogHandler:
                 self._progress_signal.emit(100, size, size)
             except Exception:
                 pass
+
+
+class DolaDeleteWorker(QThread):
+    """Runs the online dola.com account deletion for a single account off the UI thread."""
+    log_msg = Signal(str)
+    finished_delete = Signal(int, bool, str)  # account_id, ok, detail
+
+    def __init__(self, account_id, session_path, proxy=""):
+        super().__init__()
+        self.account_id = int(account_id or 0)
+        self.session_path = str(session_path or "")
+        self.proxy = str(proxy or "").strip()
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                AccountManager.delete_dola_account(
+                    self.session_path,
+                    proxy=self.proxy,
+                    update_log_callback=lambda m: self.log_msg.emit(m),
+                )
+            )
+            self.finished_delete.emit(
+                self.account_id,
+                bool(result.get("ok")),
+                str(result.get("detail") or ""),
+            )
+        except Exception as e:
+            self.finished_delete.emit(self.account_id, False, str(e))
+        finally:
+            loop.close()
 
 
 class CloakUpdateWorker(QThread):
@@ -1800,6 +1835,7 @@ class MainWindow(QMainWindow):
         self.failed_prompt_edits = {}
         self.login_worker = None
         self.login_check_worker = None
+        self.dola_delete_worker = None
         self.relogin_worker = None
         self._completion_times = []
         self._generation_start_time = None
@@ -3564,8 +3600,114 @@ class MainWindow(QMainWindow):
             self.t2v_lbl_upscale,
             False,
         )
+
+        # Dola-specific settings — shown only when generation mode is
+        # "Chrome Extension — Dola" (toggled in _sync_generation_mode_ui).
+        self._build_dola_settings_row(form)
+
         layout.addLayout(form)
         layout.addStretch()
+
+    def _build_dola_settings_row(self, form):
+        """Model / Ratio / Duration selectors for dola.com (Seedance) mode, added
+        to each video sub-tab. They persist to the dola_model / dola_ratio /
+        dola_duration settings (kept in sync across tabs) which dola_mode.py reads
+        as the run-wide generation config. Hidden unless dola mode is active."""
+        if not hasattr(self, "_dola_setting_rows"):
+            self._dola_setting_rows = []
+            self._dola_model_combos = []
+            self._dola_ratio_combos = []
+            self._dola_dur_combos = []
+            self._dola_autodelete_checks = []
+        try:
+            cur_model = str(get_setting("dola_model", "seedance_v2.0") or "seedance_v2.0")
+            cur_ratio = str(get_setting("dola_ratio", "9:16") or "9:16")
+            try:
+                cur_dur = int(str(get_setting("dola_duration", "10") or "10"))
+            except Exception:
+                cur_dur = 10
+
+            m = self._create_setting_combo(
+                [("Seedance 2.5 (Best)", "seedance_v2.5"),
+                 ("Seedance 2.0 Fast", "seedance_v2.0"),
+                 ("Seedance 1.0", "ic_mini")],
+                current_data=cur_model, trigger_sync=False,
+            )
+            r = self._create_setting_combo(
+                [(x, x) for x in ("9:16", "16:9", "1:1", "3:4", "4:3", "21:9")],
+                current_data=cur_ratio, trigger_sync=False,
+            )
+            d = self._create_setting_combo(
+                [("5s", 5), ("10s", 10)], current_data=cur_dur, trigger_sync=False,
+            )
+            self._dola_model_combos.append(m)
+            self._dola_ratio_combos.append(r)
+            self._dola_dur_combos.append(d)
+
+            m.currentIndexChanged.connect(
+                lambda _=None, c=m: self._on_dola_setting_changed("dola_model", c, self._dola_model_combos)
+            )
+            r.currentIndexChanged.connect(
+                lambda _=None, c=r: self._on_dola_setting_changed("dola_ratio", c, self._dola_ratio_combos)
+            )
+            d.currentIndexChanged.connect(
+                lambda _=None, c=d: self._on_dola_setting_changed("dola_duration", c, self._dola_dur_combos)
+            )
+
+            chk = QCheckBox("Auto-delete on daily limit")
+            chk.setToolTip(
+                "Opt-in: when dola's real 'daily limit for video generation' message "
+                "appears for an account, delete that account from dola.com — but ONLY "
+                "after all its running generations finish. Then continue on other "
+                "accounts. No prediction. PERMANENT/irreversible."
+            )
+            chk.setChecked(str(get_setting("dola_auto_delete", "1") or "1").strip() in ("1", "true", "on", "yes"))
+            self._dola_autodelete_checks.append(chk)
+            chk.toggled.connect(lambda checked=False: self._on_dola_autodelete_toggled(checked))
+
+            lbl = self._make_setting_label("Dola:")
+            field = self._make_inline_row(
+                m, self._make_setting_label("Ratio:"), r,
+                self._make_setting_label("Dur:"), d, chk,
+            )
+            form.addRow(lbl, field)
+            lbl.setVisible(False)
+            field.setVisible(False)
+            self._dola_setting_rows.append((lbl, field))
+        except Exception as exc:
+            try:
+                self.append_log(f"[UI] Dola settings row build warning: {exc}")
+            except Exception:
+                pass
+
+    def _on_dola_autodelete_toggled(self, checked):
+        """Persist the dola auto-delete opt-in and mirror across tabs."""
+        try:
+            set_setting("dola_auto_delete", "1" if checked else "0")
+            for c in getattr(self, "_dola_autodelete_checks", []):
+                if c.isChecked() != bool(checked):
+                    c.blockSignals(True)
+                    c.setChecked(bool(checked))
+                    c.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_dola_setting_changed(self, key, combo, siblings):
+        """Persist a dola setting and mirror the choice into the same combo on
+        the other video sub-tabs so they don't drift."""
+        try:
+            data = combo.currentData()
+            set_setting(key, str(data))
+            for c in siblings:
+                if c is combo:
+                    continue
+                idx = c.findData(data)
+                if idx >= 0 and c.currentIndex() != idx:
+                    c.blockSignals(True)
+                    c.setCurrentIndex(idx)
+                    c.blockSignals(False)
+        except Exception:
+            pass
 
     def _setup_video_ref_tab(self, saved_slots):
         layout, self.ref_tab_scroll = self._create_tab_scroll_content(self.mode_tab_ref, 260)
@@ -3633,6 +3775,7 @@ class MainWindow(QMainWindow):
             self.clear_single_reference_image,
         )
         form.addRow(self._make_setting_label("Reference:"), self.ref_single_row)
+        self._build_dola_settings_row(form)
         layout.addLayout(form)
 
         layout.addWidget(self._create_separator())
@@ -4197,11 +4340,28 @@ class MainWindow(QMainWindow):
         self.btn_login.setMinimumWidth(240)
         self.btn_login.clicked.connect(self.start_login)
 
+        # Second login button — logs into dola.com (Continue with Google). The
+        # saved profile ends up with dola.com session cookies (needed for dola
+        # generation + the "Delete from dola.com" action).
+        _LoginDolaCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_login_dola = _LoginDolaCls()
+        self.btn_login_dola.setText("Login for dola (Google)")
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_login_dola.setProperty("role", "primary")
+        self.btn_login_dola.setMinimumHeight(40)
+        self.btn_login_dola.setMinimumWidth(240)
+        self.btn_login_dola.setToolTip(
+            "Opens real Chrome at Google login. Log into your Google account fully. "
+            "dola.com then auto-logs-in on demand (generation + delete) — no extra click."
+        )
+        self.btn_login_dola.clicked.connect(lambda: self.start_login(login_target="dola"))
+
         add_layout.addWidget(lbl_acc_name_head, 0, 0)
         add_layout.addWidget(self.acc_name_input, 0, 1)
         add_layout.addWidget(lbl_acc_proxy_head, 1, 0)
         add_layout.addWidget(self.acc_proxy_input, 1, 1)
         add_layout.addWidget(self.btn_login, 0, 2, 2, 1)
+        add_layout.addWidget(self.btn_login_dola, 2, 2)
         add_layout.setColumnStretch(1, 1)
         add_group.setLayout(add_layout)
         layout.addWidget(add_group)
@@ -5003,6 +5163,10 @@ class MainWindow(QMainWindow):
         self.cmb_generation_mode.addItem(
             "Chrome Extension — Grok Imagine (video only, SuperGrok)",
             "chrome_extension_grok",
+        )
+        self.cmb_generation_mode.addItem(
+            "Chrome Extension — Dola (dola.com Seedance video)",
+            "chrome_extension_dola",
         )
         self.cmb_generation_mode.setToolTip(
             "Browser per slot: Each slot opens its own browser (~300MB each). Proven stable.\n\n"
@@ -6865,6 +7029,17 @@ class MainWindow(QMainWindow):
             lambda _=False, target_id=account_id: self._delete_account_by_id(target_id)
         )
 
+        menu.addSeparator()
+
+        act_del_dola = menu.addAction("❌  Delete from dola.com")
+        act_del_dola.setToolTip(
+            f"Permanently delete '{account_name}' from dola.com itself (irreversible).\n"
+            "Fully automatic. The linked Google login/cookies are NOT touched."
+        )
+        act_del_dola.triggered.connect(
+            lambda _=False, target_id=account_id: self._delete_dola_online(target_id)
+        )
+
         menu_btn.setMenu(menu)
         layout.addWidget(menu_btn)
 
@@ -7081,6 +7256,78 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _delete_dola_online(self, account_id):
+        """Permanently delete the account from dola.com itself (irreversible).
+
+        Fully automated: no manual clicking in the browser. Only the dola.com
+        account is deleted — the linked Google login/cookies are left intact.
+        """
+        account = self._account_record_by_id(account_id)
+        if not account:
+            QMessageBox.warning(self, "Account Missing", "Could not find that account in the database.")
+            return
+
+        account_name = str(account.get("name") or "").strip()
+        session_path = str(self._resolve_account_session_dir(account))
+        proxy = str(account.get("proxy") or "").strip()
+
+        # Guard: don't delete while the queue is actively using this account.
+        runtime = getattr(self, "account_runtime_state", {}).get(account_name, {})
+        if int(runtime.get("active_slots", 0) or 0) > 0:
+            QMessageBox.warning(
+                self,
+                "Account Busy",
+                f"'{account_name}' has active queue slot(s). Stop the queue before deleting it from dola.com.",
+            )
+            return
+
+        if self.dola_delete_worker and self.dola_delete_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Deletion In Progress",
+                "Another dola.com account deletion is still running. Please wait for it to finish.",
+            )
+            return
+
+        # One-click confirmation — a single lightweight guard against accidental
+        # clicks on an irreversible action (no typing required).
+        if not self._fluent_confirm(
+            "Delete from dola.com",
+            f"Delete '{account_name}' from dola.com now?\n\n"
+            "One click, then fully automatic. The linked Google login is NOT affected "
+            "(you can re-login with the same Gmail later).\n\n"
+            "This action CANNOT be undone.",
+            confirm_label="Delete",
+            cancel_label="Cancel",
+        ):
+            return
+
+        self.append_log(f"[ACCOUNTS] Starting dola.com deletion for '{account_name}' (automatic)...")
+        worker = DolaDeleteWorker(account_id, session_path, proxy=proxy)
+        worker.log_msg.connect(self.append_log, Qt.QueuedConnection)
+        worker.finished_delete.connect(self._on_dola_delete_finished, Qt.QueuedConnection)
+        self.dola_delete_worker = worker
+        worker.start()
+
+    def _on_dola_delete_finished(self, account_id, ok, detail):
+        account = self._account_record_by_id(account_id)
+        account_name = str((account or {}).get("name") or f"Account {account_id}")
+        if ok:
+            self.append_log(f"[ACCOUNTS] ✅ '{account_name}' deleted from dola.com. {detail}")
+            QMessageBox.information(
+                self,
+                "Deleted from dola.com",
+                f"'{account_name}' was deleted from dola.com.\n\n{detail}\n\n"
+                "It is still listed here (kept as requested). The Google login is intact.",
+            )
+        else:
+            self.append_log(f"[ACCOUNTS] ❌ dola.com deletion failed for '{account_name}': {detail}")
+            QMessageBox.warning(
+                self,
+                "Deletion Failed",
+                f"Could not delete '{account_name}' from dola.com.\n\n{detail}",
+            )
+
     @staticmethod
     def _clear_account_project_cache_artifacts(account_name):
         normalized_name = str(account_name or "").strip()
@@ -7217,6 +7464,17 @@ class MainWindow(QMainWindow):
         act_delete.setToolTip(f"Remove '{account_name}' from Account Manager.")
         act_delete.triggered.connect(
             lambda _=False, target_id=account_id: self._delete_account_by_id(target_id)
+        )
+
+        menu.addSeparator()
+
+        act_del_dola = menu.addAction("❌  Delete from dola.com")
+        act_del_dola.setToolTip(
+            f"Permanently delete '{account_name}' from dola.com itself (irreversible).\n"
+            "Fully automatic. The linked Google login/cookies are NOT touched."
+        )
+        act_del_dola.triggered.connect(
+            lambda _=False, target_id=account_id: self._delete_dola_online(target_id)
         )
 
         menu_btn.setMenu(menu)
@@ -8332,6 +8590,14 @@ class MainWindow(QMainWindow):
 
     def append_log(self, msg):
         text = str(msg or "")
+        try:
+            import os as _os
+            _dbgdir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))), "data")
+            _os.makedirs(_dbgdir, exist_ok=True)
+            with open(_os.path.join(_dbgdir, "app_debug.log"), "a", encoding="utf-8") as _fh:
+                _fh.write(text + "\n")
+        except Exception:
+            pass
         marker = "[CREDITS] Remaining:"
         if marker in text:
             try:
@@ -8582,18 +8848,22 @@ class MainWindow(QMainWindow):
             self.append_log("[SETTINGS] Restart Queue Manager to apply new slot settings.")
         self._toast_success("Settings Saved", "Automation settings saved successfully.")
         
-    def start_login(self):
+    def start_login(self, checked=False, login_target="flow"):
+        login_target = str(login_target or "flow").strip().lower()
         acc_name = self.acc_name_input.text().strip()
         proxy_value = self.acc_proxy_input.text().strip()
         log_target = acc_name if acc_name else "AUTO-GMAIL"
-        self.append_log(f"Starting login flow for {log_target}. A browser will open...")
+        site_label = "dola.com" if login_target == "dola" else "Google"
+        self.append_log(f"Starting {site_label} login flow for {log_target}. A browser will open...")
         self._reset_download_progress_widget()
         self._pending_login_add = None
         self.btn_login.setEnabled(False)
+        if hasattr(self, "btn_login_dola"):
+            self.btn_login_dola.setEnabled(False)
         self.acc_name_input.setEnabled(False)
         self.acc_proxy_input.setEnabled(False)
-        
-        self.login_worker = LoginWorker(acc_name, proxy=proxy_value)
+
+        self.login_worker = LoginWorker(acc_name, proxy=proxy_value, login_target=login_target)
         self.login_worker.log_msg.connect(self.append_log, Qt.QueuedConnection)
         self.login_worker.download_progress.connect(self._on_download_progress, Qt.QueuedConnection)
         self.login_worker.download_complete.connect(self._on_download_complete, Qt.QueuedConnection)
@@ -8624,6 +8894,8 @@ class MainWindow(QMainWindow):
         self.acc_name_input.clear()
         self.acc_proxy_input.clear()
         self.btn_login.setEnabled(True)
+        if hasattr(self, "btn_login_dola"):
+            self.btn_login_dola.setEnabled(True)
         self.acc_name_input.setEnabled(True)
         self.acc_proxy_input.setEnabled(True)
         if self._pending_login_add == (str(name), str(session_path)):
@@ -9665,6 +9937,16 @@ class MainWindow(QMainWindow):
                 "end_image_path": None,
             })
 
+        try:
+            _dbg_img = str((pairs[0].get("image_path") if pairs else "")) or "(none)"
+            _dbg_ref = str((job_specs[0].get("ref_path") if job_specs else "")) or "(none)"
+            self.append_log(
+                f"[BULK-DEBUG] sub_mode={bulk_sub_mode}, pairs={len(pairs)}, specs={len(job_specs)}, "
+                f"first_image_path={_dbg_img[:70]}, first_spec_ref={_dbg_ref[:70]}"
+            )
+        except Exception:
+            pass
+
         extra_note = f" ({auto_generated_count} filename prompt(s))" if auto_generated_count else ""
         estimate = self._estimate_video_credits(
             prompt_count=len(pairs),
@@ -10314,6 +10596,16 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    def _is_dola_generation_mode(self) -> bool:
+        """True when Dola (dola.com Seedance) is the selected Generation Mode."""
+        cmb = getattr(self, "cmb_generation_mode", None)
+        if cmb is None:
+            return False
+        try:
+            return str(cmb.currentData() or "").lower() == "chrome_extension_dola"
+        except Exception:
+            return False
+
     def _is_genspark_generation_mode(self) -> bool:
         """True when Genspark is the selected Generation Mode."""
         cmb = getattr(self, "cmb_generation_mode", None)
@@ -10503,6 +10795,12 @@ class MainWindow(QMainWindow):
                 up_lbl,
                 is_grok,
             )
+        # Dola settings rows (one per video sub-tab) — visible only in dola mode.
+        is_dola = self._is_dola_generation_mode()
+        for _lbl, _field in getattr(self, "_dola_setting_rows", []):
+            _lbl.setVisible(is_dola)
+            _field.setVisible(is_dola)
+
         if hasattr(self, "end_row"):
             self.end_row.setVisible(frame_mode == "frames_start_end")
         if hasattr(self, "frm_bulk_group"):
@@ -10559,6 +10857,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == 4:
             self._toast_info("Use Pipeline Add Button", "Use the Pipeline tab's 'Add All to Queue' button.")
             return
+        # On Video+Ref (tab 2) / Frames (tab 3): if bulk images are loaded, the user
+        # wants image↔prompt pairs. Redirect to the bulk add so the reference image
+        # actually attaches — otherwise this bottom button would create ref-less jobs
+        # (a very common confusion vs the Bulk panel's own "Add All to Queue").
+        if hasattr(self, "mode_tabs"):
+            _bulk_key = {2: "ingredients", 3: "frames_start"}.get(self.mode_tabs.currentIndex())
+            if _bulk_key:
+                _panel = self._bulk_panel(_bulk_key)
+                if _panel and (_panel.get("entries") or []):
+                    self.append_log("[BULK] Bulk images loaded → adding image↔prompt pairs (reference attached).")
+                    self.add_bulk_i2v_to_queue(_bulk_key)
+                    return
         text = self.prompts_input.toPlainText().strip()
         if not text:
             self._toast_warning("No Prompts", "Please enter at least one prompt.")
