@@ -459,6 +459,7 @@ class DolaSession:
         deadline = time.time() + timeout
         last = ""
         self.last_points_left = None
+        cyc = 0
         while time.time() < deadline:
             await asyncio.sleep(poll_every)
             last = await self._pull_single(conv_id)
@@ -466,6 +467,20 @@ class DolaSession:
             for vid in _extract_all_vids(last):
                 if vid not in exclude:
                     return vid, last
+            # Periodic visibility: every ~30s log what dola is actually showing so
+            # a stuck "generating" or a NEW/unknown error is visible in the log
+            # (esp. useful when the window is off-screen/headless).
+            cyc += 1
+            if cyc % 5 == 1:
+                low = last.lower()
+                gen = ("generating" in low or "the video will be generated" in low
+                       or _HAS_VIDEO_GEN in last)
+                # last assistant text_block, trimmed — surfaces any new wording
+                m = re.findall(r'"text_block":\{"text":"((?:[^"\\]|\\.){0,140})', last)
+                snippet = (m[-1] if m else "")[:120]
+                elapsed = int(cyc * poll_every)
+                self._log(f"  …still waiting ({elapsed}s): generating={bool(gen)} "
+                          f"points_left={self.last_points_left} | dola: {snippet!r}")
             # Otherwise apply the FULL verdict classifier — catches the case where
             # dola shows "generating" then flips to "can't generate / no points /
             # daily limit / refused" mid-poll (fake-poll would otherwise run to the
