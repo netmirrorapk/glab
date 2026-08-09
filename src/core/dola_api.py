@@ -771,13 +771,20 @@ class DolaSession:
         except Exception:
             return False
 
-    async def get_play_info(self, vid: str) -> str:
-        """Resolve a vid to a downloadable mp4 URL."""
-        r = await self.pf("/samantha/video/get_play_info", {"vid": vid})
-        urls = _extract_mp4(r["body"] or "")
-        if not urls:
-            raise DolaError("get_play_info returned no mp4 url")
-        return urls[0]
+    async def get_play_info(self, vid: str, tries: int = 8, delay: float = 2.0) -> str:
+        """Resolve a vid to a downloadable mp4 URL. dola sometimes returns the
+        play-info BEFORE the CDN has a plain URL ready — only an ENCRYPTED main_url
+        (base64, with encryption_method/gear_des_key) and no plain http…mp4. Poll a
+        few times until the plain mp4 URL appears instead of failing (or worse,
+        saving the JSON body as if it were a video)."""
+        for i in range(tries):
+            r = await self.pf("/samantha/video/get_play_info", {"vid": vid})
+            urls = _extract_mp4(r["body"] or "")
+            if urls:
+                return urls[0]
+            if i < tries - 1:
+                await asyncio.sleep(delay)
+        raise DolaError("get_play_info returned no plain mp4 url after retries")
 
     async def download(self, url: str, out_path: str) -> int:
         """Download via the browser network stack (shares auth/cookies). Returns bytes written."""
@@ -816,6 +823,16 @@ class DolaSession:
                 raise
             url = cand[0]
         n = await self.download(url, out_path)
+        # Validate: a real dola mp4 is megabytes and starts with an ISO-BMFF box.
+        # Guard against saving an error/JSON body (e.g. an expired or not-ready play
+        # URL) as if it were a video and wrongly reporting success.
+        if not _looks_like_video(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            raise DolaError(f"downloaded content is not a valid video ({n} bytes) — "
+                            f"play URL expired/not ready")
         self._log(f"downloaded {n} bytes -> {out_path}")
         return out_path
 
@@ -839,6 +856,21 @@ def _extract_all_vids(text: str):
             seen.add(v)
             out.append(v)
     return out
+
+
+def _looks_like_video(path: str) -> bool:
+    """True only for a plausible real dola mp4: megabyte-scale and starting with an
+    ISO-BMFF box. Rejects tiny/JSON/HTML bodies (expired or not-ready play URLs)."""
+    try:
+        if os.path.getsize(path) < 50_000:   # real videos are >1MB; this small = error body
+            return False
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return False
+    if head[:1] in (b"{", b"<"):             # JSON / HTML error page
+        return False
+    return b"ftyp" in head or b"moov" in head or b"mdat" in head
 
 
 def _extract_mp4(text: str):
