@@ -632,6 +632,8 @@ class DolaSession:
             log("delete re-auth bounced to Google — completing + waiting for return to dola...")
             back = False
             for i in range(40):   # ~20s, but returns the INSTANT we're back on dola
+                if self.page.is_closed():   # browser context died (overload) — stop
+                    return False, "browser context closed during delete re-auth"
                 if i % 6 == 0:   # (re)click the account row every ~3s
                     try:
                         await self.page.evaluate(
@@ -669,6 +671,8 @@ class DolaSession:
         #    RETRY (extension dola.js:1130 — up to ~20×1.5s) instead of a single try.
         clicked = False
         for _ in range(25):   # ~25s, but breaks the instant the button appears
+            if self.page.is_closed():   # browser context died (overload) — stop, don't spam
+                return False, "browser context closed during delete"
             if await self._click_delete_control(log, do_click=not dry_run):
                 clicked = True
                 break
@@ -689,6 +693,8 @@ class DolaSession:
         # 4) Wait for the cancel/confirm 200 (definitive success signal).
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self.page.is_closed():   # browser context died (overload) — stop, don't spam
+                return False, "browser context closed during delete"
             if state["confirm_ok"]:
                 await asyncio.sleep(2)  # let the follow-up logout settle
                 return True, "account deletion confirmed (passport cancel/confirm 200)"

@@ -493,7 +493,7 @@ class PlaywrightDolaModeManager:
                     self._settle(job_id)
                     if self._auto_delete and session.last_points_left == 0:
                         self._log(f"[DolaPW][{tag}] dola reports 0 points left → burn-recreate")
-                        await self._account_recreate(acct, main_session, state)
+                        await self._safe_recreate(acct, main_session, state)
                 except DailyLimitReached:
                     state["busy"] -= 1
                     limit_hits[job_id] = limit_hits.get(job_id, 0) + 1
@@ -508,7 +508,7 @@ class PlaywrightDolaModeManager:
                         self.qm.signals.job_updated.emit(job_id, "pending", "", "daily_limit_requeued")
                         self._log(f"[DolaPW][{tag}] daily limit → burn-recreate this account")
                         if self._auto_delete:
-                            await self._account_recreate(acct, main_session, state)
+                            await self._safe_recreate(acct, main_session, state)
                 except GenerationRefused:
                     state["busy"] -= 1
                     update_job_status(job_id, "failed", account=acct, error="prompt_refused")
@@ -553,6 +553,19 @@ class PlaywrightDolaModeManager:
                 self._job_q.task_done()
 
     # ── coordinated burn-recreate (delete dola account → relogin → fresh quota) ─
+    async def _safe_recreate(self, acct, main_session, state) -> None:
+        """Wrapper so a burn-recreate crash retires ONE account cleanly instead of
+        propagating out of the tab loop and killing the whole worker."""
+        try:
+            await self._safe_recreate(acct, main_session, state)
+        except Exception as e:
+            self._log(f"[DolaPW][{acct}] recreate crashed ({str(e)[:60]}) → retiring account")
+            state["alive"] = False
+            try:
+                state["healthy"].set()
+            except Exception:
+                pass
+
     async def _account_recreate(self, acct, main_session, state) -> None:
         seen = state["recreated"]
         alog = lambda *a: self._log(f"[DolaPW][{acct}] " + " ".join(str(x) for x in a))
@@ -582,23 +595,33 @@ class PlaywrightDolaModeManager:
                 state["alive"] = False
                 state["healthy"].set()
                 return
-            await asyncio.sleep(3)
-            main_session._base = {}
-            if not await main_session.login_via_google(timeout=90):
-                alog("re-login failed → retiring")
+            # Re-login on the fresh account. Wrap EVERYTHING so a browser crash under
+            # load ("Execution context was destroyed" / "Target ... closed") retires
+            # this ONE account cleanly instead of throwing out of the tab loop and
+            # killing the whole worker (which loses the account + spams errors).
+            try:
+                await asyncio.sleep(3)
+                main_session._base = {}
+                if not await main_session.login_via_google(timeout=90):
+                    alog("re-login failed → retiring")
+                    state["alive"] = False
+                    state["healthy"].set()
+                    return
+                await main_session._ensure_base()
+                for _ in range(5):              # settle + confirm the fresh session
+                    await asyncio.sleep(2)
+                    try:
+                        if await main_session.logged_in_for_real():
+                            break
+                    except Exception:
+                        pass
+                state["recreated"] += 1
+                if state.get("cloak") and state.get("ctx") and state.get("session_path"):
+                    await _save_cookies(state["session_path"], state["ctx"])
+                alog("✅ fresh account ready — resuming all tabs")
+                state["healthy"].set()
+            except Exception as e:
+                alog(f"re-login crashed ({str(e)[:60]}) → retiring account")
                 state["alive"] = False
                 state["healthy"].set()
                 return
-            await main_session._ensure_base()
-            for _ in range(5):                  # settle + confirm the fresh session
-                await asyncio.sleep(2)
-                try:
-                    if await main_session.logged_in_for_real():
-                        break
-                except Exception:
-                    pass
-            state["recreated"] += 1
-            if state.get("cloak") and state.get("ctx") and state.get("session_path"):
-                await _save_cookies(state["session_path"], state["ctx"])
-            alog("✅ fresh account ready — resuming all tabs")
-            state["healthy"].set()
