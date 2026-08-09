@@ -429,6 +429,13 @@ class DolaSession:
         conv = re.findall(r'"conversation_id":"(\d+)"', raw)
         if not conv:
             raise DolaError("submit ok but no conversation_id in SSE")
+        # ★ INSTANT exhaustion (extension's line 814): dola sets ext.has_video_gen="1"
+        # (→ verdict 'gen') ONLY when it actually queues a video. If the submit SSE
+        # got a conversation_id but there's NO gen flag / gen text at all, no video
+        # was queued — the account is out of points. Detect it NOW (not after a
+        # poll) so the caller burn-recreates immediately, exactly like the extension.
+        if verdict != "gen":
+            raise DailyLimitReached("submit accepted but no video queued — account exhausted (no points)")
         return conv[0]
 
     async def _pull_single(self, conv_id: str) -> str:

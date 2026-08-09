@@ -229,6 +229,7 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
     except Exception:
         pass
     attempts = {}
+    limit_hits = {}   # per-prompt "exhausted" count — guards against a poison prompt
     while state["alive"]:
         await state["healthy"].wait()            # block while the account recreates
         if not state["alive"]:
@@ -256,9 +257,21 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
             attempts.pop(idx, None)
         except DailyLimitReached:
             state["busy"] -= 1
-            await queue.put((idx, prompt))       # re-run on the fresh account
-            log(tag, f"#{idx} daily limit → burn-recreate this account")
-            await _account_recreate(acct, main_session, state)
+            # A REAL exhausted account, once burn-recreated, generates this prompt
+            # fine — so a given prompt should trigger "exhausted" at most a couple of
+            # times total. If the SAME prompt keeps signalling exhausted across
+            # multiple FRESH accounts, it isn't a quota problem — it's a poison
+            # prompt (dola silently returns no video for it). Skip it instead of
+            # burning account after account on it.
+            limit_hits[idx] = limit_hits.get(idx, 0) + 1
+            if limit_hits[idx] > 2:
+                log(tag, f"🚫 #{idx} signalled 'exhausted' {limit_hits[idx]}x across fresh "
+                         f"accounts — poison prompt, skipping (not burning)")
+                stats["refused"] += 1
+            else:
+                await queue.put((idx, prompt))   # re-run on the fresh account
+                log(tag, f"#{idx} daily limit → burn-recreate this account")
+                await _account_recreate(acct, main_session, state)
         except GenerationRefused:
             state["busy"] -= 1
             log(tag, f"🚫 #{idx} refused (prompt) — skipping")
