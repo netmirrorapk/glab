@@ -697,6 +697,13 @@ class DolaSession:
         # Land the generation in a fresh conversation so we never pick up an old video…
         seen_before = set()
         conv = await self.submit(prompt, model=model, ratio=ratio, duration=duration)
+        # Bring the VISIBLE page to the conversation so you can watch the render
+        # (the submit itself is an API call, so the page otherwise stays on the
+        # idle create page). Harmless to polling — pf() fetches work on any dola page.
+        try:
+            await self.page.goto(f"{DOLA_ORIGIN}/chat/{conv}", wait_until="domcontentloaded")
+        except Exception:
+            pass
         # …and as a belt-and-braces guard, ignore any vids already in that conversation.
         seen_before = await self.snapshot_vids(conv)
         self._log(f"conversation_id={conv}; {len(seen_before)} existing vid(s) ignored; waiting for new video...")
