@@ -644,6 +644,14 @@ class DolaSession:
             log("  re-auth complete — back on dola/delete-account")
             await asyncio.sleep(4)   # let /delete-account render the danger button
 
+        # Let the page settle on the delete view before hunting the button — right
+        # after the OAuth bounce it may still be mid-navigation, which makes an
+        # evaluate throw "execution context was destroyed".
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
         # 3) Locate + click the danger 'Delete Now' control. The button renders
         #    LATE while the page finishes bouncing through the silent OAuth, so we
         #    RETRY (extension dola.js:1130 — up to ~20×1.5s) instead of a single try.

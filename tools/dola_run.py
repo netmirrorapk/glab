@@ -350,7 +350,22 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
         # login-check → login if needed
         log(acct, "checking dola login…")
         if not await main_session.login_via_google(timeout=90):
-            log(acct, "login failed — retiring account"); return
+            # In cloak mode the session is seeded from a CACHED cookie file that can
+            # go stale (Google rotates cookies). Re-export the LIVE cookies from the
+            # dedicated profile (which holds the real Google login) and retry once.
+            if cloak:
+                log(acct, "login failed — refreshing cookies from the dedicated profile & retrying…")
+                try:
+                    fresh = await _export_cookies(profile_dir)
+                    await ctx.add_cookies(fresh)
+                    _json.dump(fresh, open(os.path.join(PROFILES_DIR, f"{acct}_cookies.json"), "w", encoding="utf-8"))
+                    log(acct, f"refreshed {len(fresh)} cookies")
+                except Exception as e:
+                    log(acct, "cookie refresh failed:", str(e)[:80])
+            if not await main_session.login_via_google(timeout=90):
+                log(acct, "login failed — retiring account "
+                          "(dedicated profile's Google may be logged out → re-run "
+                          f"`python tools/dola_profiles.py login --as {acct}`)"); return
         await main_session._ensure_base()
         if cloak:
             await _save_cookies(acct, ctx)     # cache the FRESH session (not the stale seed)
