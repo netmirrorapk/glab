@@ -165,106 +165,156 @@ async def _launch_cloak(cookies, proxy, headless):
     return None, ctx
 
 
-async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats, cloak=False):
+async def _account_recreate(acct, main_session, state):
+    """Coordinated burn-recreate for ALL tabs of an account: pause every tab, wait
+    for in-flight generations to finish, delete + re-login on the main tab (fresh
+    quota), then resume. Only ONE tab actually performs it (the lock); others that
+    also hit the limit just return once the account is healthy again."""
+    async with state["lock"]:
+        if state["healthy"].is_set():
+            # already recovered by whoever got here first
+            if state["alive"]:
+                return
+        if state["recreated"] >= MAX_RECREATE:
+            log(acct, f"recreate cap ({MAX_RECREATE}) reached — retiring account")
+            state["alive"] = False
+            state["healthy"].set()
+            return
+        state["healthy"].clear()                 # pause every tab
+        log(acct, "⛔ daily limit → burn-recreate: waiting for other tabs' gens to finish…")
+        for _ in range(150):                     # up to ~5 min for in-flight gens
+            if state["busy"] <= 0:
+                break
+            await asyncio.sleep(2)
+        state["recreated"] += 1
+        log(acct, f"burn-recreate #{state['recreated']}: delete → re-login…")
+        try:
+            ok, detail = await main_session.delete_account(timeout=90, log=lambda *a: log(acct, *a))
+        except Exception as e:
+            ok, detail = False, str(e)[:80]
+        if not ok:
+            log(acct, "delete failed → retiring:", detail)
+            state["alive"] = False
+            state["healthy"].set()
+            return
+        await asyncio.sleep(4)
+        main_session._base = {}
+        if not await main_session.login_via_google(timeout=90):
+            log(acct, "re-login failed → retiring")
+            state["alive"] = False
+            state["healthy"].set()
+            return
+        await main_session._ensure_base()
+        log(acct, "✅ fresh account ready — resuming all tabs")
+        state["healthy"].set()                   # resume every tab
+
+
+async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, state):
+    tag = f"{acct}#t{tab_i+1}"
+    try:
+        await session._ensure_base()
+    except Exception:
+        pass
+    attempts = {}
+    while state["alive"]:
+        await state["healthy"].wait()            # block while the account recreates
+        if not state["alive"]:
+            return
+        try:
+            idx, prompt = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        # login-check BEFORE every submit (guest/deleted → real login)
+        try:
+            if not await session.logged_in_for_real():
+                log(tag, "not logged in/guest → login…")
+                if await session.login_via_google(timeout=90):
+                    await session._ensure_base()
+        except Exception:
+            pass
+        out = os.path.join(OUT_DIR, f"{idx:04d}_{acct}.mp4")
+        state["busy"] += 1
+        try:
+            await session.generate_one(prompt, out, ratio=ratio, timeout=720)
+            state["busy"] -= 1
+            n = os.path.getsize(out) if os.path.exists(out) else 0
+            log(tag, f"✅ #{idx} saved ({n} bytes)")
+            stats["done"] += 1
+            attempts.pop(idx, None)
+        except DailyLimitReached:
+            state["busy"] -= 1
+            await queue.put((idx, prompt))       # re-run on the fresh account
+            log(tag, f"#{idx} daily limit → burn-recreate this account")
+            await _account_recreate(acct, main_session, state)
+        except GenerationRefused:
+            state["busy"] -= 1
+            log(tag, f"🚫 #{idx} refused (prompt) — skipping")
+            stats["refused"] += 1
+        except DolaError as e:
+            state["busy"] -= 1
+            attempts[idx] = attempts.get(idx, 0) + 1
+            if attempts[idx] > 4:
+                log(tag, f"#{idx} failed {attempts[idx]}x ({str(e)[:45]}) — giving up")
+                stats["errors"] += 1
+            else:
+                await queue.put((idx, prompt))
+                await asyncio.sleep(8)
+        finally:
+            queue.task_done()
+
+
+async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
+                 cloak=False, parallel=1, launch_delay=0.0):
+    if launch_delay:
+        await asyncio.sleep(launch_delay)        # staggered launch (Ns gap between accounts)
     profile_dir = os.path.join(PROFILES_DIR, acct)
     if not os.path.isdir(profile_dir):
         log(acct, "profile missing — skipping"); return
     p = ctx = None
-    recreated = 0
     try:
+        log(acct, f"opening profile ({'CloakBrowser' if cloak else 'Chrome'})…")
         if cloak:
-            log(acct, "CloakBrowser mode — exporting cookies + launching (truly invisible)…")
             cookies = await _cookies_for(acct, profile_dir)
-            # cloak proxy expects a Playwright-style dict; convert the URL if given
             cproxy = _proxy_dict(proxy) if isinstance(proxy, str) else proxy
             p, ctx = await _launch_cloak(cookies, cproxy, headless)
         else:
             p, ctx = await _launch(profile_dir, proxy, headless)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        session = DolaSession(ctx, page, logger=lambda *a: log(acct, *a))
+        main_session = DolaSession(ctx, page, logger=lambda *a: log(acct, *a))
         try:
             ipr = await ctx.request.get("https://api.ipify.org?format=json")
             log(acct, "IP", (await ipr.text()).strip())
         except Exception:
             pass
-        if not await session.login_via_google(timeout=90):
+        # login-check → login if needed
+        log(acct, "checking dola login…")
+        if not await main_session.login_via_google(timeout=90):
             log(acct, "login failed — retiring account"); return
-        await session._ensure_base()
-        log(acct, "ready ✅")
-
-        attempts = {}          # idx -> how many times this prompt failed transiently
-        no_conv_streak = 0     # consecutive rate-limit hits → back off harder
-        while True:
+        await main_session._ensure_base()
+        # open `parallel` tabs (concurrent generations per account); tab 0 = main
+        nslots = max(1, int(parallel or 1))
+        log(acct, f"logged in ✅ — opening {nslots} tab(s) for parallel generation…")
+        sessions = [main_session]
+        for _ in range(nslots - 1):
+            pg = await ctx.new_page()
             try:
-                idx, prompt = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                log(acct, "queue empty — done"); return
-
-            # ── STEP 0: ALWAYS make sure dola is logged in BEFORE submitting ──
-            try:
-                if not await session.logged_in_for_real():
-                    log(acct, "not logged in (or guest/deleted) → logging into dola first…")
-                    if not await session.login_via_google(timeout=90):
-                        log(acct, "login failed → retiring"); return
-                    await session._ensure_base()
-                    log(acct, "logged in ✅ — resuming")
-            except Exception as e:
-                log(acct, "login-check error:", str(e)[:80])
-
-            out = os.path.join(OUT_DIR, f"{idx:04d}_{acct}.mp4")
-            try:
-                await session.generate_one(prompt, out, ratio=ratio, timeout=720)
-                n = os.path.getsize(out) if os.path.exists(out) else 0
-                log(acct, f"✅ #{idx} saved ({n} bytes)")
-                stats["done"] += 1
-                no_conv_streak = 0
-                attempts.pop(idx, None)
-                await asyncio.sleep(2)     # gentle stagger between jobs
-            except DailyLimitReached:
-                # EXHAUST → burn-recreate: delete → re-login (fresh quota) → resume,
-                # and put THIS prompt back so it runs on the fresh account.
-                await queue.put((idx, prompt))
-                if recreated >= MAX_RECREATE:
-                    log(acct, f"daily limit; recreate cap ({MAX_RECREATE}) reached — retiring"); return
-                recreated += 1
-                log(acct, f"⛔ daily limit → burn-recreate #{recreated}: delete → re-login → resume…")
-                ok, detail = await session.delete_account(timeout=90, log=lambda *a: log(acct, *a))
-                if not ok:
-                    log(acct, "delete failed → retiring:", detail); return
-                await asyncio.sleep(4)
-                session._base = {}
-                if not await session.login_via_google(timeout=90):
-                    log(acct, "re-login failed → retiring"); return
-                await session._ensure_base()
-                log(acct, "✅ fresh account ready — resuming")
-                no_conv_streak = 0
-            except GenerationRefused:
-                log(acct, f"🚫 #{idx} refused (prompt) — skipping")
-                stats["refused"] += 1
-            except DolaError as e:
-                msg = str(e)
-                attempts[idx] = attempts.get(idx, 0) + 1
-                if attempts[idx] > 4:
-                    log(acct, f"#{idx} failed {attempts[idx]}x ({msg[:50]}) — giving up on this prompt")
-                    stats["errors"] += 1
-                    continue
-                await queue.put((idx, prompt))
-                if "no conversation_id" in msg or "rate" in msg.lower():
-                    # RATE-LIMIT (esp. multiple accounts on ONE IP). Do NOT hammer —
-                    # back off progressively; give dola time to cool down.
-                    no_conv_streak += 1
-                    cooldown = min(15 + no_conv_streak * 15, 90)
-                    log(acct, f"#{idx} rate-limited (no conv) — cooling down {cooldown}s "
-                              f"(streak {no_conv_streak}). Tip: give each account its own proxy IP.")
-                    await asyncio.sleep(cooldown)
-                else:
-                    log(acct, f"#{idx} transient: {msg[:70]} — retry in 8s")
-                    await asyncio.sleep(8)
-            finally:
-                queue.task_done()
+                await pg.goto("https://www.dola.com/chat/create-video", wait_until="domcontentloaded")
+            except Exception:
+                pass
+            sessions.append(DolaSession(ctx, pg, logger=lambda *a: log(acct, *a)))
+        state = {"healthy": asyncio.Event(), "busy": 0, "recreated": 0,
+                 "lock": asyncio.Lock(), "alive": True}
+        state["healthy"].set()
+        log(acct, f"{len(sessions)} tab(s) ready — generating")
+        await asyncio.gather(*[
+            _tab_loop(acct, i, s, main_session, queue, ratio, stats, state)
+            for i, s in enumerate(sessions)])
+        log(acct, "all tabs done")
     except Exception as e:
         log(acct, "worker crashed:", str(e)[:120])
     finally:
+        # closes tabs + profile for THIS account (only after its tabs finished).
+        # If the whole app/process is killed, Playwright tears every context down too.
         try:
             if ctx: await ctx.close()
         except Exception:
@@ -299,9 +349,14 @@ async def main_async(args):
 
     if getattr(args, "cloak", False):
         print("[run] CloakBrowser mode — truly invisible headless (passes dola's detection)")
+    stagger = float(getattr(args, "stagger", 5.0) or 0)
+    parallel = int(getattr(args, "parallel", 1) or 1)
+    print(f"[run] parallel tabs/account={parallel}, launch stagger={stagger}s between accounts")
     await asyncio.gather(*[
         worker(a, proxies.get(a), queue, args.ratio, args.headless, stats,
-               cloak=getattr(args, "cloak", False)) for a in accounts
+               cloak=getattr(args, "cloak", False), parallel=parallel,
+               launch_delay=i * stagger)                     # staggered: 0s, 5s, 10s, …
+        for i, a in enumerate(accounts)
     ])
     print(f"[run] FINISHED — done={stats['done']} refused={stats['refused']} "
           f"errors={stats['errors']} | videos in {OUT_DIR}")
@@ -314,6 +369,8 @@ def main():
     ap.add_argument("--ratio", default="16:9")
     ap.add_argument("--headless", action="store_true", help="invisible: off-screen headed (regular Chrome) — dola passes this")
     ap.add_argument("--cloak", action="store_true", help="use anti-detect CloakBrowser in TRUE headless (truly invisible; cookies auto-injected from the dedicated profile)")
+    ap.add_argument("--parallel", type=int, default=1, help="parallel tabs (concurrent generations) PER account")
+    ap.add_argument("--stagger", type=float, default=5.0, help="seconds between opening each account's profile (default 5)")
     args = ap.parse_args()
     asyncio.run(main_async(args))
 
