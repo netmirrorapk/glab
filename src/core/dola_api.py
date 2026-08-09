@@ -245,6 +245,32 @@ class DolaSession:
         cks = await self.ctx.cookies(DOLA_ORIGIN)
         return bool({c["name"] for c in cks} & LOGIN_COOKIES)
 
+    async def _page_is_guest(self) -> bool:
+        """Look at the ACTUAL page, not just cookies. After a delete the dola
+        cookies linger (stale) so the cookie check false-positives — but the page
+        shows the guest state ('not available for guests' / a top-right 'Log In'
+        button). Detecting that forces a real login (which recreates the account)."""
+        try:
+            return bool(await self.page.evaluate(r"""() => {
+                const t = (document.body ? document.body.innerText : '').toLowerCase();
+                if (t.indexOf('not available for guests') !== -1) return true;
+                if (t.indexOf('log in to start creating') !== -1) return true;
+                const w = window.innerWidth || 1280;
+                const els = Array.from(document.querySelectorAll("button,[role='button'],a,div,span"));
+                return els.some(b => {
+                    const s = (b.textContent||'').replace(/\s+/g,' ').trim().toLowerCase();
+                    if (s !== 'log in' && s !== 'login' && s !== 'sign in') return false;
+                    const r = b.getBoundingClientRect();   // top-right corner = guest login button
+                    return r.top < 140 && r.left > w*0.4 && r.width > 4 && r.height > 4;
+                });
+            }"""))
+        except Exception:
+            return False
+
+    async def logged_in_for_real(self) -> bool:
+        """Cookies present AND the page is NOT showing the guest state."""
+        return (await self.is_logged_in()) and not (await self._page_is_guest())
+
     async def ensure_logged_in(self, timeout: int = 25) -> bool:
         """Ensure the dola.com session is live. dola's login is auto_open: with an
         ACTIVE Google session in the profile, visiting dola.com silently runs the
@@ -289,7 +315,9 @@ class DolaSession:
         re-login after a burn-recreate (delete)."""
         await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
         await asyncio.sleep(2.5)
-        if await self.is_logged_in():
+        # REAL check (page state, not just stale cookies) — a deleted account keeps
+        # its dola cookies but shows the guest page, so we must actually log in.
+        if await self.logged_in_for_real():
             return True
         await self._trusted_click(["log in", "login", "sign in", "log in / sign up", "sign up / log in"])
         await asyncio.sleep(1.8)
@@ -323,9 +351,9 @@ class DolaSession:
                 await self._trusted_click(["i am 18", "confirm", "i'm 18", "yes", "continue"])  # age modal
             except Exception:
                 pass
-            if await self.is_logged_in():
+            if await self.logged_in_for_real():
                 return True
-        return await self.is_logged_in()
+        return await self.logged_in_for_real()
 
     async def fetch_capabilities(self) -> dict:
         """Live model / ratio / duration options from /samantha/skill/pack."""

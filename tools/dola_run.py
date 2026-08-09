@@ -138,8 +138,8 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats):
 
             # ── STEP 0: ALWAYS make sure dola is logged in BEFORE submitting ──
             try:
-                if not await session.is_logged_in():
-                    log(acct, "not logged in → logging into dola first…")
+                if not await session.logged_in_for_real():
+                    log(acct, "not logged in (or guest/deleted) → logging into dola first…")
                     if not await session.login_via_google(timeout=90):
                         log(acct, "login failed → retiring"); return
                     await session._ensure_base()
