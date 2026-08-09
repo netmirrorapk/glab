@@ -3619,6 +3619,7 @@ class MainWindow(QMainWindow):
             self._dola_ratio_combos = []
             self._dola_dur_combos = []
             self._dola_autodelete_checks = []
+            self._dola_watermark_checks = []
         try:
             cur_model = str(get_setting("dola_model", "seedance_v2.0") or "seedance_v2.0")
             cur_ratio = str(get_setting("dola_ratio", "9:16") or "9:16")
@@ -3665,10 +3666,20 @@ class MainWindow(QMainWindow):
             self._dola_autodelete_checks.append(chk)
             chk.toggled.connect(lambda checked=False: self._on_dola_autodelete_toggled(checked))
 
+            chk_wm = QCheckBox("Remove watermark")
+            chk_wm.setToolTip(
+                "Auto-remove dola's bottom-right 'Dola AI' watermark from every video "
+                "right after it downloads (ffmpeg delogo, ~<1s/video, in-place). "
+                "Playwright Dola mode only. Needs ffmpeg on PATH."
+            )
+            chk_wm.setChecked(str(get_setting("dola_remove_watermark", "1") or "1").strip() in ("1", "true", "on", "yes"))
+            self._dola_watermark_checks.append(chk_wm)
+            chk_wm.toggled.connect(lambda checked=False: self._on_dola_watermark_toggled(checked))
+
             lbl = self._make_setting_label("Dola:")
             field = self._make_inline_row(
                 m, self._make_setting_label("Ratio:"), r,
-                self._make_setting_label("Dur:"), d, chk,
+                self._make_setting_label("Dur:"), d, chk, chk_wm,
             )
             form.addRow(lbl, field)
             lbl.setVisible(False)
@@ -3685,6 +3696,18 @@ class MainWindow(QMainWindow):
         try:
             set_setting("dola_auto_delete", "1" if checked else "0")
             for c in getattr(self, "_dola_autodelete_checks", []):
+                if c.isChecked() != bool(checked):
+                    c.blockSignals(True)
+                    c.setChecked(bool(checked))
+                    c.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_dola_watermark_toggled(self, checked):
+        """Persist the dola watermark-removal opt-in and mirror across tabs."""
+        try:
+            set_setting("dola_remove_watermark", "1" if checked else "0")
+            for c in getattr(self, "_dola_watermark_checks", []):
                 if c.isChecked() != bool(checked):
                     c.blockSignals(True)
                     c.setChecked(bool(checked))

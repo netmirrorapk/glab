@@ -189,6 +189,49 @@ def _job_ref(job) -> str:
     return ""
 
 
+# Watermark box as FRACTIONS of the frame (measured on dola's 1280x720 output:
+# the "Dola AI" logo sits bottom-right). Fractions → scales to any 16:9 size.
+_WM = {"x": 0.867, "y": 0.910, "w": 0.123, "h": 0.075}
+
+
+async def _dewatermark(path) -> bool:
+    """Remove dola's bottom-right 'Dola AI' watermark IN-PLACE via ffmpeg delogo.
+    Runs as an async subprocess so it doesn't block the event loop. Graceful no-op
+    if ffmpeg/ffprobe aren't available or anything fails (original is left intact)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        w, h = (int(v) for v in out.decode().strip().split("x")[:2])
+    except Exception:
+        return False
+    x = max(1, min(int(_WM["x"] * w), w - 3))
+    y = max(1, min(int(_WM["y"] * h), h - 3))
+    bw = max(2, min(int(_WM["w"] * w), w - x - 1))
+    bh = max(2, min(int(_WM["h"] * h), h - y - 1))
+    tmp = path + ".nw.mp4"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", path,
+            "-vf", f"delogo=x={x}:y={y}:w={bw}:h={bh}",
+            "-preset", "veryfast", "-c:a", "copy", tmp,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        rc = await proc.wait()
+        if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 50000:
+            os.replace(tmp, path)
+            return True
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    except Exception:
+        pass
+    return False
+
+
 class PlaywrightDolaModeManager:
     """Dola automation via Playwright dedicated profiles (no extension)."""
 
@@ -210,6 +253,8 @@ class PlaywrightDolaModeManager:
         self._cloak = True
         self._headless = True
         self._auto_delete = True
+        self._remove_wm = True
+        self._wm_warned = False
 
     # ── lifecycle helpers ──────────────────────────────────────────────────────
     def _running(self) -> bool:
@@ -278,6 +323,7 @@ class PlaywrightDolaModeManager:
         self._cloak = (bmode == "cloakbrowser")
         self._headless = (cdisp == "headless") if self._cloak else (bmode == "headless")
         self._auto_delete = self._bool_setting("dola_auto_delete", "1")
+        self._remove_wm = self._bool_setting("dola_remove_watermark", "1")
         # If cloak is requested but the CloakBrowser binary isn't available, fall
         # back to real Chrome (off-screen when headless) so the mode still runs.
         if self._cloak:
@@ -484,6 +530,13 @@ class PlaywrightDolaModeManager:
                     await session.generate_one(prompt, out_path, model=model, ratio=ratio,
                                                duration=self._duration, timeout=GEN_TIMEOUT)
                     state["busy"] -= 1
+                    # auto-remove the "Dola AI" watermark (in-place, async, ~<1s)
+                    if self._remove_wm:
+                        ok_wm = await _dewatermark(out_path)
+                        if not ok_wm and not self._wm_warned:
+                            self._wm_warned = True
+                            self._log("[DolaPW] Note: watermark not removed (ffmpeg not found "
+                                      "on PATH?) — videos are saved WITH the watermark.")
                     update_job_runtime_state(job_id, output_path=out_path)
                     update_job_status(job_id, "completed", account=acct)
                     self.qm.signals.job_updated.emit(job_id, "completed", acct, "")
