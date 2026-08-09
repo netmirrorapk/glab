@@ -38,10 +38,86 @@ class GenerationRefused(DolaError):
 
 # Terminal messages dola streams into the assistant reply. Detecting these lets us
 # stop immediately instead of blindly polling until timeout.
-_LIMIT_MARKERS = ("reached the daily limit for video generation",
-                  "daily limit for video generation")
-_REFUSAL_MARKERS = ("temporarily unable to generate", "unable to generate a video",
-                    "please try entering other requirements", "violates", "not able to create")
+# Find a visible element by text/aria and return its CENTER for a trusted click.
+_RECT_JS = r"""(wants) => {
+  const norm = s => (s||'').replace(/\s+/g,' ').trim().toLowerCase();
+  const vis = el => { if(!el||!el.isConnected) return false; const st=getComputedStyle(el);
+    if(!st||st.display==='none'||st.visibility==='hidden'||st.opacity==='0') return false;
+    const r=el.getBoundingClientRect(); return r.width>4&&r.height>4; };
+  const btns = Array.from(document.querySelectorAll("button,[role='button'],div,span,a,img")).filter(vis);
+  let el = btns.find(b => wants.includes(norm(b.textContent)));
+  if(!el){ el = btns.find(b => { const a=((b.getAttribute&&(b.getAttribute('aria-label')||b.getAttribute('alt')))||'').toLowerCase();
+    return a.indexOf('google')!==-1 && getComputedStyle(b).cursor==='pointer'; }); }
+  if(!el) return null;
+  const r = el.getBoundingClientRect();
+  return {x: r.left + r.width/2, y: r.top + r.height/2,
+          label:(el.textContent||'').replace(/\s+/g,' ').trim().slice(0,30)};
+}"""
+
+# ── FULL verdict markers, ported from the extension (dola.js + dola_mode.py) ──
+# Definitive daily-limit / out-of-quota (account can't generate now).
+_LIMIT_MARKERS = (
+    "reached the daily limit for video generation",
+    "daily limit for video generation",
+    "reached the daily limit",
+    "try again tomorrow",
+    # cap prompts dola shows instead of generating — they never yield a vid
+    "do you want to continue generating",
+    "longer than 10 seconds is not supported",
+)
+# Last-points edge case: dola OPTIMISTICALLY says "generating" then corrects with
+# "I can't generate the video. No points were used." → account is out of quota.
+_CANTGEN_MARKERS = (
+    "can't generate the video", "cannot generate the video",
+    "couldn't generate the video", "could not generate the video",
+    "unable to generate the video", "no points were used",
+)
+# Content-moderation refusal — THIS prompt is bad; the ACCOUNT is fine (do NOT
+# exhaust it, just fail this one job).
+_CONTENT_REFUSAL_MARKERS = (
+    "generate the requested content", "create the requested content",
+    "try something else", "against our content policy",
+)
+_REFUSAL_MARKERS = (
+    "temporarily unable to generate", "unable to generate a video",
+    "please try entering other requirements", "violates", "not able to create",
+) + _CONTENT_REFUSAL_MARKERS
+# Backend-authoritative "a video task was actually queued" flag.
+_HAS_VIDEO_GEN = '"has_video_gen":"1"'
+
+
+def _points_left(text: str):
+    """Backend-authoritative remaining video points, e.g. 'You still have 0 points
+    left today.' — 0 means retire the account after the current gen. None if absent."""
+    m = (re.search(r"have\s+(\d+)\s+(?:video\s+)?points?\s+left\s+today", text, re.I)
+         or re.search(r"only\s+have\s+(\d+)\s+left\s+today", text, re.I)
+         or re.search(r"(\d+)\s+points?\s+left\s+today", text, re.I))
+    return int(m.group(1)) if m else None
+
+
+def _classify_reply(raw: str):
+    """Classify a dola reply (submit SSE OR poll chain). Returns one of:
+        'refused'  — content moderation (fail job, account OK)
+        'limit'    — daily-limit / no-points (exhaust / burn-recreate)
+        'gen'      — a video was queued / is being produced
+        None       — nothing decisive yet
+    Priority mirrors the extension: content-refusal and hard limits WIN over the
+    optimistic 'the video will be generated' text (dola prints that even when it
+    then refuses)."""
+    low = raw.lower()
+    if any(m in low for m in _CONTENT_REFUSAL_MARKERS):
+        return "refused"
+    if any(m in low for m in _LIMIT_MARKERS):
+        return "limit"
+    if any(m in low for m in _CANTGEN_MARKERS):
+        return "limit"
+    if "left today" in low and ("video point" in low or "only have" in low or "insufficient" in low):
+        return "limit"
+    if any(m in low for m in _REFUSAL_MARKERS):
+        return "refused"
+    if _HAS_VIDEO_GEN in raw or "the video will be generated" in low or "will be ready in" in low:
+        return "gen"
+    return None
 
 
 def _full_option() -> dict:
@@ -72,6 +148,7 @@ class DolaSession:
         self.page = page
         self._log = logger or (lambda *a: None)
         self._base = {}                    # common query params (aid, device_id, ...)
+        self.last_points_left = None       # backend remaining video points (0 ⇒ retire after this gen)
         self.page.on("request", self._on_request)
 
     # ---- signing / base params -------------------------------------------------
@@ -88,15 +165,58 @@ class DolaSession:
     def _qs(self) -> str:
         return urllib.parse.urlencode(self._base)
 
+    async def _perf_scan_base(self):
+        """Robust fallback (esp. headless): read the page's OWN past requests via
+        the Performance API and pull the base query params from any dola API URL
+        that already carries device_id+aid. Works even when the live request
+        sniffer misses them, because dola fires these during normal page load."""
+        js = r"""() => {
+            try {
+                const sign = new Set(["msToken","a_bogus","X-Bogus","_signature","x-signature"]);
+                const ents = performance.getEntriesByType("resource").map(e => e.name);
+                for (const url of ents) {
+                    if (url.indexOf("dola.com/") === -1) continue;
+                    let u; try { u = new URL(url); } catch (e) { continue; }
+                    const q = u.searchParams;
+                    if (q.get("device_id") && q.get("aid")) {
+                        const o = {};
+                        for (const [k, v] of q.entries()) if (!sign.has(k)) o[k] = v;
+                        return o;
+                    }
+                }
+                return null;
+            } catch (e) { return null; }
+        }"""
+        try:
+            got = await self.page.evaluate(js)
+            if got and got.get("device_id") and got.get("aid"):
+                self._base = {k: v for k, v in got.items()}
+                return True
+        except Exception:
+            pass
+        return False
+
     async def _ensure_base(self):
         if self._base:
             return
-        # a reload triggers the site's own signed XHRs which we sniff for base params
+        # 1) live sniffer: a reload triggers the site's own signed XHRs
         await self.page.reload(wait_until="domcontentloaded")
-        for _ in range(20):
+        for _ in range(16):
             if self._base:
                 return
-            await asyncio.sleep(0.5)
+            # 2) fallback: scan already-fired requests via the Performance API
+            if await self._perf_scan_base():
+                return
+            await asyncio.sleep(0.6)
+        # 3) last try: navigate to the video page (fires more API calls) + scan
+        try:
+            await self.page.goto(START_URL, wait_until="domcontentloaded")
+            for _ in range(10):
+                if self._base or await self._perf_scan_base():
+                    return
+                await asyncio.sleep(0.6)
+        except Exception:
+            pass
         raise DolaError("Could not capture base query params from dola.com")
 
     async def pf(self, path: str, body, content_type: str = "application/json") -> dict:
@@ -149,6 +269,64 @@ class DolaSession:
                 pass
         return await self.is_logged_in()
 
+    async def _trusted_click(self, wants):
+        """Find a visible element by text/aria and click it with a REAL mouse
+        gesture (page.mouse.click). GSI's 'Continue with Google' only reacts to a
+        genuine user gesture — a scripted el.click() is ignored (→ no popup)."""
+        rect = await self.page.evaluate(_RECT_JS, wants)
+        if not rect:
+            return None
+        try:
+            await self.page.mouse.click(rect["x"], rect["y"])
+            return rect["label"]
+        except Exception:
+            return None
+
+    async def login_via_google(self, gmail: str = None, timeout: int = 90) -> bool:
+        """Drive dola's own 'Continue with Google' login (extension-style) against
+        the profile's active Google session. Establishes the dola session even when
+        dola's silent auto-login doesn't fire. Used for first login AND for the
+        re-login after a burn-recreate (delete)."""
+        await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+        await asyncio.sleep(2.5)
+        if await self.is_logged_in():
+            return True
+        await self._trusted_click(["log in", "login", "sign in", "log in / sign up", "sign up / log in"])
+        await asyncio.sleep(1.8)
+        popup = None
+        try:
+            async with self.ctx.expect_page(timeout=12000) as pi:
+                await self._trusted_click(["continue with google", "sign in with google", "log in with google"])
+            popup = await pi.value
+        except Exception:
+            popup = None
+        if popup:
+            try:
+                await popup.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(2)
+                await popup.evaluate(
+                    r"""(email) => {
+                        const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
+                          .filter(e => { const t=(e.innerText||'').toLowerCase();
+                            return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<120; });
+                        let el = email ? rows.find(e => (e.innerText||'').toLowerCase().indexOf(email)!==-1) : null;
+                        if(!el) el = rows[0];
+                        if(el){ el.click(); return true; }
+                        return false;
+                    }""", (gmail or "").lower())
+            except Exception:
+                pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                await self._trusted_click(["i am 18", "confirm", "i'm 18", "yes", "continue"])  # age modal
+            except Exception:
+                pass
+            if await self.is_logged_in():
+                return True
+        return await self.is_logged_in()
+
     async def fetch_capabilities(self) -> dict:
         """Live model / ratio / duration options from /samantha/skill/pack."""
         r = await self.pf("/samantha/skill/pack", {"skill_type": VIDEO_ABILITY_TYPE})
@@ -167,9 +345,25 @@ class DolaSession:
         return out
 
     # ---- generation ------------------------------------------------------------
+    @staticmethod
+    def _build_prompt_text(prompt: str, ratio: str) -> str:
+        """Mirror the extension's promptText: strip any leading 'Generated video:'
+        prefixes + a trailing aspect ratio, then add exactly one prefix and append
+        the ratio. The 'Generated video: ' prefix makes dola return a VIDEO (not
+        images); the ', 16:9' suffix ENFORCES the aspect (ability_param.ratio alone
+        is a weak hint the model sometimes ignores)."""
+        p = str(prompt or "")
+        while re.match(r"(?i)^\s*generated video:\s*", p):
+            p = re.sub(r"(?i)^\s*generated video:\s*", "", p)
+        p = re.sub(r"\s*,\s*\d{1,2}\s*:\s*\d{1,2}\s*$", "", p).strip()
+        r = str(ratio or "").strip()
+        return "Generated video: " + p + (", " + r if r else "")
+
     async def submit(self, prompt: str, model: str = "seedance_v2.0",
                      ratio: str = "9:16", duration: int = 10) -> str:
-        """Submit a text->video generation. Returns conversation_id."""
+        """Submit a text->video generation. Returns conversation_id.
+        Raises DailyLimitReached / GenerationRefused from the submit SSE itself."""
+        prompt_text = self._build_prompt_text(prompt, ratio)
         local_conv = f"local_{int(time.time() * 1000)}"
         body = {
             "client_meta": {"local_conversation_id": local_conv, "conversation_id": "",
@@ -178,7 +372,7 @@ class DolaSession:
                 "local_message_id": str(uuid.uuid4()),
                 "content_block": [{
                     "block_type": 10000,
-                    "content": {"text_block": {"text": prompt, "icon_url": "", "icon_url_dark": "", "summary": ""},
+                    "content": {"text_block": {"text": prompt_text, "icon_url": "", "icon_url_dark": "", "summary": ""},
                                 "pc_event_block": ""},
                     "block_id": str(uuid.uuid4()), "parent_id": "", "meta_info": [], "append_fields": []
                 }],
@@ -197,7 +391,14 @@ class DolaSession:
         r = await self.pf("/chat/completion", body)
         if r["status"] != 200:
             raise DolaError(f"submit failed: HTTP {r['status']}: {r['body'][:200]}")
-        conv = re.findall(r'"conversation_id":"(\d+)"', r["body"] or "")
+        raw = r["body"] or ""
+        # Backend-authoritative verdict from the submit SSE (full extension logic).
+        verdict = _classify_reply(raw)
+        if verdict == "refused":
+            raise GenerationRefused("dola refused/moderated this prompt")
+        if verdict == "limit":
+            raise DailyLimitReached("daily video-generation limit reached / no points left")
+        conv = re.findall(r'"conversation_id":"(\d+)"', raw)
         if not conv:
             raise DolaError("submit ok but no conversation_id in SSE")
         return conv[0]
@@ -229,18 +430,26 @@ class DolaSession:
         exclude = exclude or set()
         deadline = time.time() + timeout
         last = ""
+        self.last_points_left = None
         while time.time() < deadline:
             await asyncio.sleep(poll_every)
             last = await self._pull_single(conv_id)
-            low = last.lower()
-            if any(m in low for m in _LIMIT_MARKERS):
-                raise DailyLimitReached("daily video-generation limit reached — try again tomorrow "
-                                        "or switch to another account")
-            if any(m in low for m in _REFUSAL_MARKERS):
-                raise GenerationRefused("dola refused/moderated this prompt")
+            # A NEW finished vid wins immediately.
             for vid in _extract_all_vids(last):
                 if vid not in exclude:
                     return vid, last
+            # Otherwise apply the FULL verdict classifier — catches the case where
+            # dola shows "generating" then flips to "can't generate / no points /
+            # daily limit / refused" mid-poll (fake-poll would otherwise run to the
+            # full timeout).
+            pl = _points_left(last)
+            if pl is not None:
+                self.last_points_left = pl
+            verdict = _classify_reply(last)
+            if verdict == "refused":
+                raise GenerationRefused("dola refused/moderated this prompt")
+            if verdict == "limit":
+                raise DailyLimitReached("daily video-generation limit reached / no points left")
         raise DolaError("video not ready within timeout")
 
     # ---- account deletion (dola.com only — Google login stays intact) ---------
@@ -295,11 +504,35 @@ class DolaSession:
         except Exception:
             cur_url = ""
         if "accounts.google.com" in cur_url:
-            return False, (
-                "Google session is not active in this profile (Google account chooser was shown). "
-                "Re-login this account with Google (real Chrome) so the Google session is active, "
-                "then delete again."
-            )
+            # The delete re-auth bounced to Google (chooser/consent for this
+            # sensitive op). Google IS logged in — nudge the account row and WAIT
+            # for the redirect back to dola.com/delete-account (where 'Delete Now'
+            # renders). Poll the LIVE url so we don't act on a stale mid-redirect.
+            log("delete re-auth bounced to Google — completing + waiting for return to dola...")
+            back = False
+            for _ in range(12):   # ~30s
+                try:
+                    await self.page.evaluate(
+                        r"""() => {
+                            const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
+                              .filter(e => { const t=(e.innerText||'').toLowerCase();
+                                return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<130; });
+                            if(rows[0]) rows[0].click();
+                        }""")
+                except Exception:
+                    pass
+                await asyncio.sleep(2.5)
+                try:
+                    cur_url = str(self.page.url or "")
+                except Exception:
+                    cur_url = ""
+                if "dola.com" in cur_url:
+                    back = True
+                    break
+            if not back:
+                return False, f"Google re-auth for delete didn't return to dola (url={cur_url[:60]})."
+            log("  re-auth complete — back on dola/delete-account")
+            await asyncio.sleep(4)   # let /delete-account render the danger button
 
         # 3) Locate the danger 'Delete Now' control (and click it unless dry-run).
         clicked = await self._click_delete_control(log, do_click=not dry_run)
@@ -415,7 +648,7 @@ class DolaSession:
 
     # ---- high-level convenience ------------------------------------------------
     async def generate_one(self, prompt: str, out_path: str, *, model="seedance_v2.0",
-                           ratio="9:16", duration=10, timeout=300) -> str:
+                           ratio="9:16", duration=10, timeout=720) -> str:
         """Full pipeline for a single prompt -> saved mp4. Returns out_path."""
         self._log(f"submit: {prompt[:50]}...")
         # Land the generation in a fresh conversation so we never pick up an old video…

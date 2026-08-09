@@ -85,7 +85,7 @@ class AsyncQueueManager(QThread):
         # Mini-orchestrator controls (Ultimate-style fundamentals).
         self.account_parallel_slots = max(1, min(40, get_int_setting("slots_per_account", 5)))
         self.enable_profile_clones = get_bool_setting("enable_profile_clones", True)
-        mode_raw = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
+        mode_raw = str(get_setting("browser_mode", "real_chrome") or "real_chrome").strip().lower()
         if mode_raw == "playwright":
             mode_raw = "visible"
         if mode_raw not in {"headless", "visible", "real_chrome", "cloakbrowser"}:

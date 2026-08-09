@@ -657,7 +657,7 @@ class AccountManager:
             logger(f"[{account_label}] Cookie warm-up already done. Skipping.")
             return
 
-        browser_mode = str(forced_browser_mode or get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
+        browser_mode = str(forced_browser_mode or get_setting("browser_mode", "real_chrome") or "real_chrome").strip().lower()
         if browser_mode == "playwright":
             browser_mode = "visible"
         # Mac hybrid: force Real Chrome for warmup — same as login, cookies save reliably.

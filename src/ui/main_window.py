@@ -5115,7 +5115,7 @@ class MainWindow(QMainWindow):
         self.cmb_browser_mode.addItem("Real Chrome (CDP)", "real_chrome")
         self.cmb_browser_mode.addItem("CloakBrowser (Best Stealth)", "cloakbrowser")
         self.cmb_browser_mode.currentIndexChanged.connect(self._on_browser_mode_changed)
-        saved_browser_mode = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
+        saved_browser_mode = str(get_setting("browser_mode", "real_chrome") or "real_chrome").strip().lower()
         if saved_browser_mode == "playwright":
             saved_browser_mode = "visible"
         browser_mode_index = self.cmb_browser_mode.findData(saved_browser_mode)

@@ -43,3 +43,10 @@ desktop.ini
 _backup_before_dola/
 test_run.log
 test_run*.log
+
+# Playwright migration — dedicated profiles hold Google cookies (NEVER commit)
+data/dola_profiles/
+outputs/dola_run/
+outputs/*.mp4
+outputs/*.log
+outputs/test_prompts.txt
