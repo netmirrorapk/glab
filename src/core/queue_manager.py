@@ -111,6 +111,7 @@ class AsyncQueueManager(QThread):
             "chrome_extension_genspark",
             "chrome_extension_grok",
             "chrome_extension_dola",
+            "playwright_dola",
         }:
             gen_mode_raw = "browser_per_slot"
         self.generation_mode = gen_mode_raw
@@ -556,6 +557,29 @@ class AsyncQueueManager(QThread):
             except Exception as e:
                 self.signals.log_msg.emit(
                     f"[ERROR] Dola mode failed: {str(e)[:150]}. Falling back to browser mode."
+                )
+            else:
+                return
+            self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
+
+        # Playwright Dola mode — dola.com Seedance via dedicated Playwright profiles
+        # (no Chrome extension; invisible CloakBrowser/off-screen headless).
+        elif self.generation_mode == "playwright_dola":
+            self.signals.log_msg.emit(
+                "[SYSTEM] Generation mode: Playwright — Dola "
+                "(dola.com Seedance video, dedicated profiles, invisible headless, burn-recreate)"
+            )
+            try:
+                from src.core.dola_playwright_mode import PlaywrightDolaModeManager
+                manager = PlaywrightDolaModeManager(self)
+                await manager.run()
+            except ImportError:
+                self.signals.log_msg.emit(
+                    "[ERROR] dola_playwright_mode.py not found. Falling back to browser mode."
+                )
+            except Exception as e:
+                self.signals.log_msg.emit(
+                    f"[ERROR] Playwright Dola mode failed: {str(e)[:150]}. Falling back to browser mode."
                 )
             else:
                 return

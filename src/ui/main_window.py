@@ -5168,6 +5168,10 @@ class MainWindow(QMainWindow):
             "Chrome Extension — Dola (dola.com Seedance video)",
             "chrome_extension_dola",
         )
+        self.cmb_generation_mode.addItem(
+            "Playwright — Dola (dola.com Seedance, dedicated profiles, invisible, auto burn-recreate)",
+            "playwright_dola",
+        )
         self.cmb_generation_mode.setToolTip(
             "Browser per slot: Each slot opens its own browser (~300MB each). Proven stable.\n\n"
             "HTTP Shared: 1 browser per account for reCAPTCHA only.\n"
@@ -10602,7 +10606,7 @@ class MainWindow(QMainWindow):
         if cmb is None:
             return False
         try:
-            return str(cmb.currentData() or "").lower() == "chrome_extension_dola"
+            return str(cmb.currentData() or "").lower() in ("chrome_extension_dola", "playwright_dola")
         except Exception:
             return False
 
