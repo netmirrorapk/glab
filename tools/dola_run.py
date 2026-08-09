@@ -223,6 +223,16 @@ async def _account_recreate(acct, main_session, state):
             state["healthy"].set()
             return
         await main_session._ensure_base()
+        # Let the fresh session fully settle + CONFIRM it's really logged in before
+        # resuming, so the first submit doesn't briefly see the guest state (which
+        # would needlessly trip the re-login + requeue path).
+        for _ in range(5):                       # up to ~10s
+            await asyncio.sleep(2)
+            try:
+                if await main_session.logged_in_for_real():
+                    break
+            except Exception:
+                pass
         if state.get("cloak") and state.get("ctx"):
             await _save_cookies(state.get("acct", acct), state["ctx"])   # cache fresh account
         log(acct, "✅ fresh account ready — resuming all tabs")
