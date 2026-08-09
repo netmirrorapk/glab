@@ -7025,6 +7025,15 @@ class MainWindow(QMainWindow):
             lambda _=False, target_id=account_id: self._relogin_account(target_id)
         )
 
+        act_check = menu.addAction("🔍  Check Profile (open browser)")
+        act_check.setToolTip(
+            "Open this account's saved profile in a Chrome window to visually check "
+            "if its Google / dola login is still active.\nUse when generation is NOT running."
+        )
+        act_check.triggered.connect(
+            lambda _=False, target_id=account_id: self._open_account_profile(target_id)
+        )
+
         menu.addSeparator()
 
         act_delete = menu.addAction("🗑  Delete Account")
@@ -7460,6 +7469,15 @@ class MainWindow(QMainWindow):
         act_relogin = menu.addAction("🔐  Re-Login")
         act_relogin.triggered.connect(
             lambda _=False, target_id=account_id: self._relogin_account(target_id)
+        )
+
+        act_check = menu.addAction("🔍  Check Profile (open browser)")
+        act_check.setToolTip(
+            "Open this account's saved profile in a Chrome window to visually check "
+            "if its Google / dola login is still active.\nUse when generation is NOT running."
+        )
+        act_check.triggered.connect(
+            lambda _=False, target_id=account_id: self._open_account_profile(target_id)
         )
 
         menu.addSeparator()
@@ -9160,6 +9178,47 @@ class MainWindow(QMainWindow):
             else:
                 self.append_log(f"[ACCOUNTS] All {total} accounts logged in.")
         self._refresh_account_overview()
+
+    def _open_account_profile(self, account_id):
+        """Open an account's saved profile in a plain Chrome window so the user can
+        visually verify its Google / dola login is still active (spot logged-out
+        accounts). Opens the Google account page + dola so both states are visible."""
+        import os as _os
+        import subprocess
+        acc = None
+        for a in (get_accounts() or []):
+            if str(a.get("id")) == str(account_id):
+                acc = a
+                break
+        if not acc:
+            QMessageBox.warning(self, "Check Profile", "Account not found.")
+            return
+        sp = str(acc.get("session_path") or "").strip()
+        if not sp or not _os.path.isdir(sp):
+            QMessageBox.warning(self, "Check Profile", f"Session folder not found:\n{sp}")
+            return
+        chrome_exes = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            _os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+        chrome = next((c for c in chrome_exes if _os.path.isfile(c)), None)
+        if not chrome:
+            QMessageBox.warning(self, "Check Profile", "Chrome was not found on this system.")
+            return
+        try:
+            subprocess.Popen([
+                chrome, f"--user-data-dir={sp}", "--no-first-run",
+                "--no-default-browser-check", "--profile-directory=Default",
+                "https://myaccount.google.com/", "https://www.dola.com/chat/create-video",
+            ])
+            self.append_log(
+                f"[Check] Opened profile for '{acc.get('name')}' — check the Google login in the "
+                "window (2 tabs: Google account + dola). Close it when done; don't run generation "
+                "while it's open."
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Check Profile", f"Could not open Chrome:\n{exc}")
 
     def _relogin_account(self, account_id):
         self._start_account_session_refresh(account_id, action_label="Re-login")
