@@ -154,17 +154,27 @@ async def _export_google_state(from_profile):
     Uses ctx.cookies() (light) — NOT storage_state() (which can hang on a big
     real profile). Everything is wrapped in timeouts so it can't hang forever."""
     chrome = find_chrome()
-    args = [f"--profile-directory={from_profile}"] + _FAST_ARGS
+    # Real Chrome profiles (extensions/state) often HANG or crash under headless.
+    # Launch a genuine HEADED window moved OFF-SCREEN instead — reliable, invisible.
+    args = [f"--profile-directory={from_profile}",
+            "--window-position=-32000,-32000", "--window-size=1200,800",
+            "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
+            "--disable-features=Translate,OptimizationHints,MediaRouter"] + _FAST_ARGS
     async with async_playwright() as p:
-        log("  launching real profile (headless)…")
+        log("  launching real profile (headed, off-screen; big profiles are slow)…")
         try:
             ctx = await asyncio.wait_for(
                 p.chromium.launch_persistent_context(
                     user_data_dir=CHROME_USER_DATA, executable_path=chrome,
-                    headless=True, args=args),
-                timeout=60)
+                    headless=False, ignore_default_args=["--enable-automation"], args=args),
+                timeout=75)
         except asyncio.TimeoutError:
-            log("  ⛔ launch timed out (is Chrome REALLY fully closed? check Task Manager for chrome.exe)")
+            log("  ⛔ launch timed out. Chrome 136+ BLOCKS automation (DevTools/CDP) on your")
+            log("     REAL Chrome profile ('DevTools remote debugging requires a non-default")
+            log("     data directory') — so import can't read its cookies. This is a Google")
+            log("     security change, not fixable here.")
+            log("     → Use direct login instead:  python tools/dola_profiles.py login --as <name>")
+            log("       (or the app's '➕ Add Dola Account' button). One sign-in per Gmail.")
             return False, None, None
         try:
             log("  reading cookies…")
@@ -190,8 +200,10 @@ async def _inject_into_dedicated(name, state):
         log("  opening dedicated profile + injecting cookies…")
         ctx = await asyncio.wait_for(
             p.chromium.launch_persistent_context(
-                user_data_dir=dest, executable_path=chrome, headless=True, args=_FAST_ARGS),
-            timeout=60)
+                user_data_dir=dest, executable_path=chrome, headless=False,
+                ignore_default_args=["--enable-automation"],
+                args=["--window-position=-32000,-32000", "--window-size=1200,800"] + _FAST_ARGS),
+            timeout=90)
         try:
             await ctx.add_cookies(state.get("cookies", []))
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
