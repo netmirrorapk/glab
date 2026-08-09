@@ -127,11 +127,14 @@ class DolaModeManager:
         self._deleting: set = set()                  # accounts with a delete in flight
         self._pending_delete: set = set()            # hit daily-limit; delete once all its gens finish
         self._dry_delete_cycles = 0                  # deletes with NO successful gen in between
-        self._max_dry_delete_cycles = 3              # if re-login isn't resetting quota → stop
+        self._max_dry_delete_cycles = 20             # backstop only; a successful gen resets to 0. Raised
+                                                     # from 3 so a batch of already-exhausted accounts at the
+                                                     # start of a run doesn't false-trip the burn-recreate.
         self._timeout_retries: Dict[str, int] = {}   # job_id -> times re-queued after a slow/not-ready timeout
         self._max_timeout_retries = 2                # give a slow video this many extra chances before failing
         self._logged_out_until: Dict[str, float] = {}  # account -> ts until which to skip it (logged out / re-login didn't take)
         self._logged_out_cooldown = 90.0             # seconds to skip a logged-out account before retrying it
+        self._exhausted_accounts: set = set()        # accounts that hit daily-limit this run → skip (no re-hammer)
 
     @staticmethod
     def _delete_threshold(model: str) -> int:
@@ -382,6 +385,27 @@ class DolaModeManager:
                         await asyncio.sleep(stagger)
 
                 if dispatched == 0:
+                    # If nothing could be dispatched, nothing is running, and EVERY
+                    # known account is exhausted (daily limit) — the whole fleet is
+                    # out of quota for the day. Don't spin forever leaving the queue
+                    # "running": stop cleanly, leaving the remaining jobs PENDING for
+                    # the next run (or after adding accounts / a daily reset).
+                    if not self._active_tasks and self._workers:
+                        usable = [
+                            e for e in self._workers
+                            if e not in self._exhausted_accounts
+                            and e not in self._deleted_accounts
+                            and e not in self._pending_delete
+                            and e not in self._deleting
+                            and time.time() >= self._logged_out_until.get(e, 0)
+                        ]
+                        if not usable:
+                            self._log(
+                                f"[DolaMode] ⛔ All {len(self._workers)} account(s) have hit their daily "
+                                f"limit — {len(pending)} job(s) left PENDING. Add more accounts (each in its "
+                                f"own Chrome profile) or resume after the daily quota resets. Stopping."
+                            )
+                            break
                     await asyncio.sleep(self.qm.scheduler_poll_seconds)
 
             # Drain remaining tasks
@@ -426,6 +450,13 @@ class DolaModeManager:
             # Skip accounts queued for deletion, mid-delete, or already deleted —
             # so no new jobs land on tabs that are about to be closed/re-logged-in.
             if email in self._pending_delete or email in self._deleting or email in self._deleted_accounts:
+                continue
+            # Account already hit its daily limit this run → its quota is gone for
+            # the day. Skip it entirely so we don't re-dispatch (and re-hammer) it
+            # dozens of times — that hammering is what makes dola rate-limit and
+            # return "no conversation_id in SSE". Each account does its ~1 video,
+            # then steps aside for the next account.
+            if email in self._exhausted_accounts:
                 continue
             # Logged-out account (re-login didn't take — e.g. it isn't the active
             # Google account in this single Chrome). Skip for a cooldown so its
@@ -602,18 +633,59 @@ class DolaModeManager:
             msg = f"{err}" + (f" — {detail[:200]}" if detail else "")
             self._log(f"[{worker.slot_id}] Dola returned error: {msg}")
             if "daily_limit" in str(err).lower():
-                # Don't fail the job — re-queue it as PENDING so it retries on the
-                # fresh account after delete + auto re-login.
-                update_job_status(job_id, "pending", account="", error="dola_daily_limit (re-queued for fresh account)")
+                # Don't fail the job — re-queue it as PENDING so it runs after the
+                # account is refreshed (delete+relogin) or on another account.
+                update_job_status(job_id, "pending", account="", error="dola_daily_limit (re-queued)")
                 self.qm.signals.job_updated.emit(job_id, "pending", "", "daily_limit_requeued")
-                self._log(f"[{worker.slot_id}] Daily limit — job re-queued to PENDING (will retry after re-login).")
                 if self._auto_delete and worker.account_email not in self._deleted_accounts:
+                    # BURN-RECREATE (user-verified this DOES reset the daily quota):
+                    # queue the account for delete → same-Gmail re-login → fresh
+                    # quota → reuse. Only _pending_delete here (NOT _exhausted) —
+                    # _pending_delete blocks new dispatch until the delete finishes,
+                    # and after re-login the account is re-detected and used again.
+                    # Adding it to _exhausted_accounts would permanently skip it and
+                    # defeat the whole burn-recreate cycle.
                     if worker.account_email not in self._pending_delete:
                         self._pending_delete.add(worker.account_email)
                         self._log(
-                            f"[DolaMode] {worker.account_email}: DAILY LIMIT message detected — "
-                            f"queued for deletion once all its generations finish."
+                            f"[DolaMode] {worker.account_email}: DAILY LIMIT — queued for "
+                            f"delete + re-login (fresh quota) once its generations finish."
                         )
+                else:
+                    # Auto-delete OFF → can't refresh quota, so just skip this
+                    # account for the run (no re-hammering) and let jobs route to
+                    # other accounts that still have quota.
+                    if worker.account_email and worker.account_email not in self._exhausted_accounts:
+                        self._exhausted_accounts.add(worker.account_email)
+                        self._log(
+                            f"[DolaMode] {worker.account_email}: daily limit — EXHAUSTED for this run, "
+                            f"skipping (auto-delete OFF, so no quota refresh)."
+                        )
+                worker.is_busy = False
+                return
+            elif ("content_refused" in str(err).lower() or "moderat" in str(err).lower()
+                  or "no_video_gen" in str(err).lower()):
+                # dola REFUSED this specific prompt — either an explicit content
+                # refusal, OR the ambiguous "no video queued + no gen text" case
+                # (almost always a refusal with wording we didn't match). The
+                # ACCOUNT is fine — do NOT mark it exhausted (that would wrongly
+                # skip an account that still has quota) and do NOT requeue (it
+                # would just be refused again). Fail only THIS job so the user can
+                # fix the prompt; other prompts keep running on the same account.
+                update_job_status(job_id, "failed", account=worker.account_email,
+                                  error="dola_prompt_refused (rejected — account still OK)")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, "prompt_refused")
+                self._log(f"[{worker.slot_id}] Prompt refused/no-video by dola — job failed (account still usable).")
+                worker.is_busy = False
+                return
+            elif "no conversation_id" in str(err).lower():
+                # dola returned a 200 with no conversation_id — almost always
+                # transient rate-limiting from too many rapid submits (the
+                # hammering the exhausted-skip above now prevents). Re-queue so it
+                # retries on another account instead of counting as a hard failure.
+                update_job_status(job_id, "pending", account="", error="dola_no_conv (rate-limited, re-queued)")
+                self.qm.signals.job_updated.emit(job_id, "pending", "", "no_conv_requeued")
+                self._log(f"[{worker.slot_id}] No conversation_id (rate-limited) — re-queued to PENDING.")
                 worker.is_busy = False
                 return
             elif ("ref_upload_failed" in str(err).lower() or "no uri" in str(err).lower()

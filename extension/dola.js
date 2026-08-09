@@ -460,7 +460,11 @@ async function dolaHandleWork(work) {
           }
           dolaProfileAccount = null; // new session → re-detect identity next cycle
           try { await chrome.tabs.update(tabId, { url: `${DOLA_ORIGIN}/chat/create-video` }); } catch (e) {}
-          await new Promise((r) => setTimeout(r, 2200));
+          // Longer settle: after a delete+re-login dola's backend needs a moment to
+          // finish provisioning the FRESH account (and its reset daily quota).
+          // Submitting too early lands on a half-provisioned session → a spurious
+          // daily_limit. 5s is comfortably past that window.
+          await new Promise((r) => setTimeout(r, 5000));
           console.log("[Dola] re-login done — session settling before submit.");
         } finally {
           dolaReloginInProgress = false;
@@ -621,9 +625,21 @@ function dolaMainSubmit(args) {
   // the signal that makes the backend produce a VIDEO. Without it, dola treats
   // the prompt as an IMAGE request even with ability_type 17. (Confirmed across
   // all real video HARs.)
-  const promptText = /^generated video:/i.test(String(prompt || ""))
-    ? String(prompt || "")
-    : "Generated video: " + String(prompt || "");
+  // Idempotent + robust: strip ANY number of leading "Generated video:" prefixes
+  // (and surrounding whitespace) first, then add exactly one. Guards against a
+  // re-queued/echoed prompt arriving already-prefixed (which produced the
+  // malformed "Generated video: Generated video: …" that dola then refused).
+  let _p = String(prompt || "");
+  while (/^\s*generated video:\s*/i.test(_p)) _p = _p.replace(/^\s*generated video:\s*/i, "");
+  // ★ Append the aspect ratio to the PROMPT TEXT (e.g. "…, 16:9"). dola's web UI
+  // does exactly this, and it is what actually ENFORCES the output aspect for
+  // text-to-video. ability_param.ratio alone is a weak hint the Seedance model
+  // sometimes ignores — inferring the aspect from the prompt content instead (a
+  // "close-up of a palm" came out 9:16 despite ratio:16:9). Strip any trailing
+  // ratio already present, then append the requested one exactly once.
+  _p = _p.replace(/\s*,\s*\d{1,2}\s*:\s*\d{1,2}\s*$/, "").trim();
+  const _ratio = String(ratio || "").trim();
+  const promptText = "Generated video: " + _p + (_ratio ? ", " + _ratio : "");
   const uuid = () =>
     "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
       const r = (Math.random() * 16) | 0;
@@ -760,7 +776,22 @@ function dolaMainSubmit(args) {
         low.indexOf("ready in 1-3") !== -1 ||
         low.indexOf("generating your video") !== -1 ||
         low.indexOf('"has_video_gen":"1"') !== -1;
+      // Content-moderation refusal — dola REFUSED this specific prompt (e.g.
+      // copyrighted characters, disallowed content): "I can't generate the
+      // requested content. Try something else." This is NOT a quota problem —
+      // the account is fine, only THIS prompt is bad. Must be a distinct error
+      // so dola_mode fails just this job and does NOT mark the account exhausted.
+      const contentRefused =
+        low.indexOf("generate the requested content") !== -1 ||
+        low.indexOf("create the requested content") !== -1 ||
+        low.indexOf("try something else") !== -1 ||
+        low.indexOf("can't generate the requested") !== -1 ||
+        low.indexOf("cannot generate the requested") !== -1 ||
+        low.indexOf("against our content policy") !== -1 ||
+        low.indexOf("violates our") !== -1;
       // Priority is deliberate — structured flag beats optimistic text:
+      // 0) content refusal → fail THIS job (definitive; account stays usable)
+      if (contentRefused) return { error: "content_refused", detail: "submit_verdict:content_moderation" };
       // 1) explicit daily-limit text  → fail (definitive)
       if (isLimit) return { error: "daily_limit_reached", detail: "submit_verdict:daily_limit" };
       // 2) explicit refusal ("I can't generate the video / no points were used")
@@ -773,8 +804,14 @@ function dolaMainSubmit(args) {
       if (hasVideoGen) return { convId, gen: true, detail: "gen_confirmed(has_video_gen)" };
       // 4) no video queued + a points warning → account is out of quota → fail.
       if (isPoints) return { error: "daily_limit_reached", detail: "submit_verdict:no_points_left" };
-      // 5) no video queued + no positive gen text at all → silent no-gen → fail.
-      if (!genOk) return { error: "daily_limit_reached", detail: "submit_verdict:no_video_gen" };
+      // 5) no video queued + no positive gen text at all → AMBIGUOUS. This is NOT
+      //    a confirmed daily-limit (those always carry the "reached the daily
+      //    limit / try again tomorrow" text, caught by isLimit above) — it's more
+      //    likely a refusal whose exact wording we didn't match. Return a DISTINCT
+      //    error so dola_mode fails just this job and does NOT mark the whole
+      //    account exhausted (which would wrongly skip an account that still has
+      //    quota but merely refused one prompt).
+      if (!genOk) return { error: "no_video_gen", detail: "submit_verdict:no_video_queued" };
       // 6) optimistic gen TEXT but no backend flag → uncertain. Poll but with
       //    gen:false so the "not started" fast-check bails in ~28s if no vid comes
       //    (instead of a doomed 12-min poll).
@@ -850,7 +887,7 @@ function dolaMainPull(args) {
           low.indexOf("couldn't generate the video") !== -1 ||
           low.indexOf("no points were used") !== -1 ||
           low.indexOf("unable to generate the video") !== -1,
-        refused: ["temporarily unable to generate", "unable to generate a video", "please try entering other requirements", "not able to create"].some((m) => low.indexOf(m) !== -1),
+        refused: ["temporarily unable to generate", "unable to generate a video", "please try entering other requirements", "not able to create", "generate the requested content", "create the requested content", "try something else", "against our content policy", "violates our"].some((m) => low.indexOf(m) !== -1),
         // Logged out / guest — dola accepts the message but generates nothing.
         notLoggedIn:
           low.indexOf("not available for guests") !== -1 ||
@@ -1126,6 +1163,9 @@ async function dolaDeleteInTab(request_id, tabId) {
         dolaProfileAccount = null;
         await dolaCloseOtherDolaTabs(tabId);
         const relogged = await dolaReLoginSameAccount(tabId);
+        // Let the freshly re-created account + its reset quota fully provision on
+        // dola's backend before the queue starts dispatching to it again.
+        if (relogged) await new Promise((r) => setTimeout(r, 5000));
         return { success: true, deleted: true, relogged: !!relogged };
       }
     }
