@@ -452,7 +452,7 @@ class DolaSession:
             return set()
 
     async def wait_for_video(self, conv_id: str, timeout: int = 240,
-                             poll_every: float = 6.0, exclude: set | None = None):
+                             poll_every: float = 3.0, exclude: set | None = None):
         """Poll until a NEW finished video appears (a vid not in `exclude`).
         Returns (vid, raw_message_text)."""
         exclude = exclude or set()
@@ -476,10 +476,10 @@ class DolaSession:
             # Silent exhaustion: dola accepted the submit (conversation_id) but the
             # assistant NEVER starts a generation (no gen text, no vid, no explicit
             # error) — almost always the account is out of points. A REAL generation
-            # confirms within ~6s, so if nothing has started by 20s the account is
-            # exhausted → fail fast so the caller burn-recreates immediately (no
-            # point waiting the full timeout on an account that can't generate).
-            if not saw_gen and (time.time() - start) > 20:
+            # confirms within ~6s; with 3s polling that's ~5 checks by 15s, so if
+            # nothing has started by 15s the account is exhausted → fail fast so the
+            # caller burn-recreates immediately (no point waiting the full timeout).
+            if not saw_gen and (time.time() - start) > 15:
                 raise DailyLimitReached("generation never started — account exhausted (no points)")
             # Periodic visibility: every ~30s log what dola is actually showing so
             # a stuck "generating" or a NEW/unknown error is visible in the log
