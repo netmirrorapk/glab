@@ -146,6 +146,17 @@ async def _cookies_for(acct, profile_dir):
     return ck
 
 
+async def _save_cookies(acct, ctx):
+    """Refresh the cached cookies with the CURRENT live session (Google + the
+    FRESH dola account after a login/burn-recreate) so the next run never seeds a
+    stale/burned account. Google cookies are stable; only the dola ones rotate."""
+    try:
+        ck = await ctx.cookies()
+        _json.dump(ck, open(os.path.join(PROFILES_DIR, f"{acct}_cookies.json"), "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
 async def _launch_cloak(cookies, proxy, headless):
     """Launch anti-detect CloakBrowser (passes dola's headless check) + inject the
     logged-in cookies. Returns (None, ctx) — no separate playwright object."""
@@ -205,6 +216,8 @@ async def _account_recreate(acct, main_session, state):
             state["healthy"].set()
             return
         await main_session._ensure_base()
+        if state.get("cloak") and state.get("ctx"):
+            await _save_cookies(state.get("acct", acct), state["ctx"])   # cache fresh account
         log(acct, "✅ fresh account ready — resuming all tabs")
         state["healthy"].set()                   # resume every tab
 
@@ -291,6 +304,8 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
         if not await main_session.login_via_google(timeout=90):
             log(acct, "login failed — retiring account"); return
         await main_session._ensure_base()
+        if cloak:
+            await _save_cookies(acct, ctx)     # cache the FRESH session (not the stale seed)
         # open `parallel` tabs (concurrent generations per account); tab 0 = main
         nslots = max(1, int(parallel or 1))
         log(acct, f"logged in ✅ — opening {nslots} tab(s) for parallel generation…")
@@ -303,7 +318,8 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
                 pass
             sessions.append(DolaSession(ctx, pg, logger=lambda *a: log(acct, *a)))
         state = {"healthy": asyncio.Event(), "busy": 0, "recreated": 0,
-                 "lock": asyncio.Lock(), "alive": True}
+                 "lock": asyncio.Lock(), "alive": True,
+                 "cloak": cloak, "ctx": ctx, "acct": acct}
         state["healthy"].set()
         log(acct, f"{len(sessions)} tab(s) ready — generating")
         await asyncio.gather(*[
