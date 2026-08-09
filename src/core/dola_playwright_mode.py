@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 from playwright.async_api import async_playwright
 
 from src.db.db_manager import (
-    get_all_jobs, get_output_directory, get_setting,
+    get_accounts, get_all_jobs, get_output_directory, get_setting,
     update_job_runtime_state, update_job_status,
 )
 from src.core.dola_api import (
@@ -46,9 +46,6 @@ from src.core.dola_mode import (
 from src.core.cloakbrowser_support import load_cloakbrowser_api
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PROFILES_DIR = os.path.join(ROOT, "data", "dola_profiles")
-REGISTRY = os.path.join(PROFILES_DIR, "registry.json")
-PROXIES = os.path.join(PROFILES_DIR, "proxies.json")
 CHROME_EXES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -133,18 +130,19 @@ async def _export_cookies(profile_dir):
             pass
 
 
-def _cookie_file(acct):
-    return os.path.join(PROFILES_DIR, f"{acct}_cookies.json")
+def _cookie_cache(session_path):
+    # cache the exported cookies inside the account's own session dir
+    return os.path.join(session_path, "_dola_cloak_cookies.json")
 
 
-async def _cookies_for(acct, profile_dir):
-    cf = _cookie_file(acct)
+async def _cookies_for(session_path):
+    cf = _cookie_cache(session_path)
     if os.path.isfile(cf):
         try:
             return json.load(open(cf, encoding="utf-8"))
         except Exception:
             pass
-    ck = await _export_cookies(profile_dir)
+    ck = await _export_cookies(session_path)
     try:
         json.dump(ck, open(cf, "w", encoding="utf-8"))
     except Exception:
@@ -152,16 +150,16 @@ async def _cookies_for(acct, profile_dir):
     return ck
 
 
-def _save_cookies_file(acct, cookies):
+def _save_cookies_file(session_path, cookies):
     try:
-        json.dump(cookies, open(_cookie_file(acct), "w", encoding="utf-8"))
+        json.dump(cookies, open(_cookie_cache(session_path), "w", encoding="utf-8"))
     except Exception:
         pass
 
 
-async def _save_cookies(acct, ctx):
+async def _save_cookies(session_path, ctx):
     try:
-        _save_cookies_file(acct, await ctx.cookies())
+        _save_cookies_file(session_path, await ctx.cookies())
     except Exception:
         pass
 
@@ -224,27 +222,21 @@ class PlaywrightDolaModeManager:
     def _bool_setting(key, default="1") -> bool:
         return str(get_setting(key, default) or default).strip().lower() in ("1", "true", "on", "yes")
 
-    def _enumerate_accounts(self) -> List[str]:
-        # explicit list (data/dola_profiles/registry.json), else every profile dir
-        accts: List[str] = []
-        if os.path.isfile(REGISTRY):
-            try:
-                accts = list(json.load(open(REGISTRY, encoding="utf-8")).keys())
-            except Exception:
-                accts = []
-        if not accts and os.path.isdir(PROFILES_DIR):
-            accts = [d for d in os.listdir(PROFILES_DIR)
-                     if os.path.isdir(os.path.join(PROFILES_DIR, d))]
-        # keep only profiles that actually exist on disk
-        return [a for a in accts if os.path.isdir(os.path.join(PROFILES_DIR, a))]
-
-    def _load_proxies(self) -> Dict[str, str]:
-        if os.path.isfile(PROXIES):
-            try:
-                return json.load(open(PROXIES, encoding="utf-8")) or {}
-            except Exception:
-                return {}
-        return {}
+    def _enumerate_accounts(self) -> List[Dict[str, str]]:
+        """The app's Account Manager accounts (db) with a valid Playwright session
+        dir. Each account = {name, session_path, proxy}; session_path is the
+        user-data-dir holding the Google/dola login (created by 'Login for dola')."""
+        out: List[Dict[str, str]] = []
+        try:
+            for a in (get_accounts() or []):
+                sp = str(a.get("session_path") or "").strip()
+                if sp and os.path.isdir(sp):
+                    out.append({"name": str(a.get("name") or sp),
+                                "session_path": sp,
+                                "proxy": str(a.get("proxy") or "").strip()})
+        except Exception:
+            pass
+        return out
 
     def _out_path(self, job) -> str:
         out_dir = get_output_directory() or os.getcwd()
@@ -298,20 +290,19 @@ class PlaywrightDolaModeManager:
 
         accounts = self._enumerate_accounts()
         if not accounts:
-            self._log("[DolaPW] No dedicated profiles found in data/dola_profiles/.\n"
-                      "  Set one up:  python tools/dola_profiles.py login --as acct1")
+            self._log("[DolaPW] No accounts found in Account Manager.\n"
+                      "  Add one:  Account Manager → 'Login for dola (Google)'.")
             return
-        proxies = self._load_proxies()
         self._n_accounts = len(accounts)
-        self._log(f"[DolaPW] accounts={accounts} | cloak={self._cloak} headless={self._headless} | "
-                  f"tabs/account={self._slots} | model={self._model} ratio={self._ratio} "
-                  f"duration={self._duration}s | auto_delete={self._auto_delete}")
+        self._log(f"[DolaPW] accounts={[a['name'] for a in accounts]} | cloak={self._cloak} "
+                  f"headless={self._headless} | tabs/account={self._slots} | model={self._model} "
+                  f"ratio={self._ratio} duration={self._duration}s | auto_delete={self._auto_delete}")
 
         tasks = [asyncio.create_task(self._feeder()),
                  asyncio.create_task(self._monitor())]
         for i, acct in enumerate(accounts):
             tasks.append(asyncio.create_task(
-                self._account_worker(acct, proxies.get(acct), launch_delay=i * LAUNCH_STAGGER)))
+                self._account_worker(acct, launch_delay=i * LAUNCH_STAGGER)))
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
@@ -365,42 +356,44 @@ class PlaywrightDolaModeManager:
                 stable = 0
 
     # ── per-account worker ─────────────────────────────────────────────────────
-    async def _account_worker(self, acct, proxy, launch_delay=0.0) -> None:
+    async def _account_worker(self, acct, launch_delay=0.0) -> None:
         if launch_delay:
             await asyncio.sleep(launch_delay)
         if not self._running():
             self._workers_done += 1
             return
-        profile_dir = os.path.join(PROFILES_DIR, acct)
-        alog = lambda *a: self._log(f"[DolaPW][{acct}] " + " ".join(str(x) for x in a))
+        name = acct["name"]
+        session_path = acct["session_path"]
+        proxy = acct.get("proxy") or ""
+        alog = lambda *a: self._log(f"[DolaPW][{name}] " + " ".join(str(x) for x in a))
         p = ctx = None
         try:
-            alog(f"opening profile ({'CloakBrowser' if self._cloak else 'Chrome'})…")
+            alog(f"opening account ({'CloakBrowser' if self._cloak else 'Chrome'})…")
             if self._cloak:
-                cookies = await _cookies_for(acct, profile_dir)
+                cookies = await _cookies_for(session_path)
                 p, ctx = await _launch_cloak(cookies, _proxy_dict(proxy), self._headless)
             else:
-                p, ctx = await _launch(profile_dir, proxy, self._headless)
+                p, ctx = await _launch(session_path, proxy, self._headless)
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             main_session = DolaSession(ctx, page, logger=alog)
 
             alog("checking dola login…")
             if not await main_session.login_via_google(timeout=90):
                 if self._cloak:
-                    alog("login failed — refreshing cookies from the dedicated profile & retrying…")
+                    alog("login failed — refreshing cookies from the account session & retrying…")
                     try:
-                        fresh = await _export_cookies(profile_dir)
+                        fresh = await _export_cookies(session_path)
                         await ctx.add_cookies(fresh)
-                        _save_cookies_file(acct, fresh)
+                        _save_cookies_file(session_path, fresh)
                     except Exception as e:
                         alog("cookie refresh failed:", str(e)[:80])
                 if not await main_session.login_via_google(timeout=90):
-                    alog(f"login failed — retiring account (re-run: "
-                         f"python tools/dola_profiles.py login --as {acct})")
+                    alog("login failed — retiring account (re-login it in Account Manager → "
+                         "'Login for dola (Google)')")
                     return
             await main_session._ensure_base()
             if self._cloak:
-                await _save_cookies(acct, ctx)
+                await _save_cookies(session_path, ctx)
 
             # open `slots` parallel tabs (each tab = 1 concurrent generation)
             sessions = [main_session]
@@ -414,12 +407,12 @@ class PlaywrightDolaModeManager:
 
             state = {"healthy": asyncio.Event(), "busy": 0, "recreated": 0,
                      "lock": asyncio.Lock(), "alive": True, "cloak": self._cloak,
-                     "ctx": ctx, "acct": acct}
+                     "ctx": ctx, "acct": name, "session_path": session_path}
             state["healthy"].set()
             self._states.append(state)
             alog(f"logged in ✅ — {len(sessions)} tab(s) generating")
             await asyncio.gather(*[
-                self._tab_loop(acct, i, s, main_session, state)
+                self._tab_loop(name, i, s, main_session, state)
                 for i, s in enumerate(sessions)])
         except Exception as e:
             alog("worker crashed:", str(e)[:120])
@@ -605,7 +598,7 @@ class PlaywrightDolaModeManager:
                 except Exception:
                     pass
             state["recreated"] += 1
-            if state.get("cloak") and state.get("ctx"):
-                await _save_cookies(acct, state["ctx"])
+            if state.get("cloak") and state.get("ctx") and state.get("session_path"):
+                await _save_cookies(state["session_path"], state["ctx"])
             alog("✅ fresh account ready — resuming all tabs")
             state["healthy"].set()
