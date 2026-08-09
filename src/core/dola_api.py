@@ -11,7 +11,8 @@ DOLA_ORIGIN = "https://www.dola.com"
 START_URL = "https://www.dola.com/chat/create-image"
 BOT_ID = "7339470689562525703"                 # Dola assistant bot id (constant)
 VIDEO_ABILITY_TYPE = 17                          # skill_type 17 = video_generation
-LOGIN_COOKIES = {"sessionid", "sid_tt", "sid_guard", "uid_tt", "sessionid_ss"}
+LOGIN_COOKIES = {"sessionid", "sid_tt", "sid_guard", "uid_tt", "sessionid_ss",
+                 "passport_csrf_token", "sid_ucp_v1"}
 SIGN_PARAMS = {"msToken", "a_bogus", "X-Bogus", "_signature", "x-signature"}
 
 # Options exposed by /samantha/skill/pack (skill_type 17). Kept as sane fallbacks; the
@@ -34,6 +35,16 @@ class DailyLimitReached(DolaError):
 
 class GenerationRefused(DolaError):
     """dola refused/moderated the prompt (won't produce a video)."""
+
+
+class NotLoggedIn(DolaError):
+    """dola shows the guest/logged-out state mid-generation — cannot generate
+    until re-login. Distinct from exhaustion: the fix is re-login, NOT burn."""
+
+
+class GotImagesNotVideo(DolaError):
+    """dola produced IMAGES instead of a video (wrong intent). Fail THIS job; the
+    account is fine (do NOT burn-recreate)."""
 
 
 # Terminal messages dola streams into the assistant reply. Detecting these lets us
@@ -84,6 +95,16 @@ _REFUSAL_MARKERS = (
 ) + _CONTENT_REFUSAL_MARKERS
 # Backend-authoritative "a video task was actually queued" flag.
 _HAS_VIDEO_GEN = '"has_video_gen":"1"'
+# Logged-out / guest — dola accepts the message but generates nothing (extension
+# dola.js:892-897). Re-login (NOT burn) is the fix.
+_NOTLOGGEDIN_MARKERS = (
+    "not available for guests", "log in to start creating",
+    "login required", "please log in", "please sign in",
+)
+# POSITIVE proof a video is actually being produced (extension dola.js:899-903).
+_GENVIDEO_MARKERS = (
+    "generating video", "video_block", '"creation_block"', "creation_loading_block",
+)
 
 
 def _points_left(text: str):
@@ -157,8 +178,14 @@ class DolaSession:
             if "www.dola.com/" not in req.url:
                 return
             q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(req.url).query))
-            if "device_id" in q and "aid" in q and not self._base:
-                self._base = {k: v for k, v in q.items() if k not in SIGN_PARAMS}
+            # Merge/union across endpoints (extension dola.js:79): some params
+            # (fp, tz_name, web_tab_id, …) only ride on certain requests, so we
+            # accumulate them all. First value per key wins → device_id/aid stay
+            # consistent. Only start once we've seen a fully-signed dola API call.
+            if "device_id" in q and "aid" in q:
+                for k, v in q.items():
+                    if k not in SIGN_PARAMS and k not in self._base:
+                        self._base[k] = v
         except Exception:
             pass
 
@@ -472,48 +499,56 @@ class DolaSession:
         while time.time() < deadline:
             await asyncio.sleep(poll_every)
             last = await self._pull_single(conv_id)
-            # A NEW finished vid wins immediately.
+            cyc += 1
+            low0 = last.lower()
+            # 1) A NEW finished vid wins immediately.
             for vid in _extract_all_vids(last):
                 if vid not in exclude:
                     return vid, last
-            low0 = last.lower()
-            if ("generating" in low0 or "the video will be generated" in low0
-                    or "will be ready" in low0 or _HAS_VIDEO_GEN in last):
-                saw_gen = True
-            # Silent exhaustion: dola accepted the submit (conversation_id) but the
-            # assistant NEVER starts a generation (no gen text, no vid, no explicit
-            # error) — almost always the account is out of points. A REAL generation
-            # confirms within ~6s; with 3s polling that's ~5 checks by 15s, so if
-            # nothing has started by 15s the account is exhausted → fail fast so the
-            # caller burn-recreates immediately (no point waiting the full timeout).
-            if not saw_gen and (time.time() - start) > 15:
-                raise DailyLimitReached("generation never started — account exhausted (no points)")
-            # Periodic visibility: every ~30s log what dola is actually showing so
-            # a stuck "generating" or a NEW/unknown error is visible in the log
-            # (esp. useful when the window is off-screen/headless).
-            cyc += 1
-            if cyc % 5 == 1:
-                low = last.lower()
-                gen = ("generating" in low or "the video will be generated" in low
-                       or _HAS_VIDEO_GEN in last)
-                # last assistant text_block, trimmed — surfaces any new wording
-                m = re.findall(r'"text_block":\{"text":"((?:[^"\\]|\\.){0,140})', last)
-                snippet = (m[-1] if m else "")[:120]
-                elapsed = int(cyc * poll_every)
-                self._log(f"  …still waiting ({elapsed}s): generating={bool(gen)} "
-                          f"points_left={self.last_points_left} | dola: {snippet!r}")
-            # Otherwise apply the FULL verdict classifier — catches the case where
-            # dola shows "generating" then flips to "can't generate / no points /
-            # daily limit / refused" mid-poll (fake-poll would otherwise run to the
-            # full timeout).
+            # 2) Logged-out / guest mid-generation (extension dola.js:551) — the fix
+            #    is RE-LOGIN, not burn. Distinct error so the runner re-logs in.
+            if any(m in low0 for m in _NOTLOGGEDIN_MARKERS):
+                raise NotLoggedIn("dola shows logged-out/guest state during generation")
+            # 3) Backend points-left (authoritative) — 0 ⇒ retire after this gen.
             pl = _points_left(last)
             if pl is not None:
                 self.last_points_left = pl
+            # 4) FULL verdict classifier — catches dola showing "generating" then
+            #    flipping to "can't generate / no points / daily limit / refused"
+            #    mid-poll (a fake-poll would otherwise run to the full timeout).
             verdict = _classify_reply(last)
             if verdict == "refused":
                 raise GenerationRefused("dola refused/moderated this prompt")
             if verdict == "limit":
                 raise DailyLimitReached("daily video-generation limit reached / no points left")
+            # 5) POSITIVE proof a video is being produced (extension dola.js:556).
+            if (_HAS_VIDEO_GEN in last or "generating" in low0
+                    or "the video will be generated" in low0 or "will be ready" in low0
+                    or any(m in low0 for m in _GENVIDEO_MARKERS)):
+                saw_gen = True
+            # 6) dola produced IMAGES instead of a video (extension dola.js:561) —
+            #    wrong intent, fail THIS job; the account is FINE (do NOT burn).
+            got_images = (("gen_image_block" in low0 or '"image_block":{' in low0)
+                          and "generating video" not in low0)
+            if not saw_gen and got_images and cyc >= 3:
+                raise GotImagesNotVideo("dola produced images instead of a video")
+            # 7) Silent exhaustion: submit accepted (conversation_id) but no gen ever
+            #    starts (no gen text/flag, no vid, no explicit error) — almost always
+            #    the account is out of points. A REAL gen confirms within ~6s; with 3s
+            #    polling that's ~5 checks by 15s, so if nothing has started by then the
+            #    account is exhausted → fail fast so the caller burn-recreates now.
+            if not saw_gen and (time.time() - start) > 15:
+                raise DailyLimitReached("generation never started — account exhausted (no points)")
+            # 8) Periodic visibility: every ~15s log what dola is actually showing so
+            #    a stuck "generating" or a NEW/unknown error is visible in the log
+            #    (esp. useful when the window is off-screen/headless).
+            if cyc % 5 == 1:
+                m = re.findall(r'"text_block":\{"text":"((?:[^"\\]|\\.){0,140})', last)
+                snippet = (m[-1] if m else "")[:120]
+                elapsed = int(cyc * poll_every)
+                self._log(f"  …still waiting ({elapsed}s): generating={saw_gen} "
+                          f"images={got_images} points_left={self.last_points_left} "
+                          f"| dola: {snippet!r}")
         raise DolaError("video not ready within timeout")
 
     # ---- account deletion (dola.com only — Google login stays intact) ---------
@@ -554,7 +589,18 @@ class DolaSession:
 
         self.page.on("response", _on_resp)
         self.page.on("dialog", _on_dialog)
+        try:
+            return await self._delete_flow(delete_url, state, log, dry_run, timeout)
+        finally:
+            # Detach the per-delete listeners so repeated delete_account() calls
+            # don't stack duplicate handlers on the page.
+            for _ev, _fn in (("response", _on_resp), ("dialog", _on_dialog)):
+                try:
+                    self.page.remove_listener(_ev, _fn)
+                except Exception:
+                    pass
 
+    async def _delete_flow(self, delete_url, state, log, dry_run, timeout) -> tuple:
         # 1) Open the delete-account page. dola's own login is auto_open: with an
         #    ACTIVE Google session it silently re-auths (prompt=none) and renders
         #    "Delete Now" — no pre-existing dola cookies needed. If Google is signed
@@ -598,8 +644,22 @@ class DolaSession:
             log("  re-auth complete — back on dola/delete-account")
             await asyncio.sleep(4)   # let /delete-account render the danger button
 
-        # 3) Locate the danger 'Delete Now' control (and click it unless dry-run).
-        clicked = await self._click_delete_control(log, do_click=not dry_run)
+        # 3) Locate + click the danger 'Delete Now' control. The button renders
+        #    LATE while the page finishes bouncing through the silent OAuth, so we
+        #    RETRY (extension dola.js:1130 — up to ~20×1.5s) instead of a single try.
+        clicked = False
+        for _ in range(18):   # ~27s
+            if await self._click_delete_control(log, do_click=not dry_run):
+                clicked = True
+                break
+            # A logout redirect here means the delete already went through.
+            try:
+                u = str(self.page.url or "").lower()
+            except Exception:
+                u = ""
+            if any(s in u for s in ("/login", "/passport/web/logout", "from_logout")):
+                return True, "account deletion confirmed (logout redirect)"
+            await asyncio.sleep(1.5)
         if not clicked:
             return False, "could not find the 'Delete Now' button on /delete-account"
         if dry_run:
@@ -612,6 +672,14 @@ class DolaSession:
             if state["confirm_ok"]:
                 await asyncio.sleep(2)  # let the follow-up logout settle
                 return True, "account deletion confirmed (passport cancel/confirm 200)"
+            # A logout redirect is ALSO a definitive success signal (extension
+            # dola.js:1623) — the delete drops the session and bounces to login.
+            try:
+                u = str(self.page.url or "").lower()
+            except Exception:
+                u = ""
+            if any(s in u for s in ("/login", "/passport/web/logout", "from_logout")):
+                return True, "account deletion confirmed (logout redirect)"
             if state["confirm_status"] and state["confirm_status"] != 200:
                 return False, f"cancel/confirm returned HTTP {state['confirm_status']}"
             # A secondary confirm modal may appear on some accounts — click it too.

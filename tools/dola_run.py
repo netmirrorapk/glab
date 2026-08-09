@@ -33,7 +33,8 @@ except Exception:
 import json as _json
 import tempfile
 from playwright.async_api import async_playwright
-from src.core.dola_api import DolaSession, DailyLimitReached, GenerationRefused, DolaError
+from src.core.dola_api import (DolaSession, DailyLimitReached, GenerationRefused,
+                               NotLoggedIn, GotImagesNotVideo, DolaError)
 from src.core.cloakbrowser_support import load_cloakbrowser_api
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -181,11 +182,17 @@ async def _account_recreate(acct, main_session, state):
     for in-flight generations to finish, delete + re-login on the main tab (fresh
     quota), then resume. Only ONE tab actually performs it (the lock); others that
     also hit the limit just return once the account is healthy again."""
+    seen = state["recreated"]                    # snapshot BEFORE we queue on the lock
     async with state["lock"]:
-        if state["healthy"].is_set():
-            # already recovered by whoever got here first
-            if state["alive"]:
-                return
+        # If another tab completed a burn-recreate while we waited for the lock, the
+        # account is already fresh → nothing to do. NOTE: healthy.is_set() alone is
+        # NOT a valid guard (it's set during normal operation too, so the FIRST tab
+        # to hit the limit would wrongly bail and no burn would ever happen — that
+        # was a real bug). The recreated counter reliably tells us who's first.
+        if state["recreated"] != seen:
+            return
+        if not state["alive"]:
+            return
         if state["recreated"] >= MAX_RECREATE:
             log(acct, f"recreate cap ({MAX_RECREATE}) reached — retiring account")
             state["alive"] = False
@@ -255,6 +262,13 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
             log(tag, f"✅ #{idx} saved ({n} bytes)")
             stats["done"] += 1
             attempts.pop(idx, None)
+            limit_hits.pop(idx, None)
+            # dola told us EXACTLY how many points remain — 0 means the NEXT submit
+            # will hit the limit. Burn-recreate NOW (authoritative signal) instead of
+            # wasting a submit to discover it. The counter guard makes this idempotent.
+            if session.last_points_left == 0:
+                log(tag, f"#{idx} done but dola reports 0 points left → burn-recreate now")
+                await _account_recreate(acct, main_session, state)
         except DailyLimitReached:
             state["busy"] -= 1
             # A REAL exhausted account, once burn-recreated, generates this prompt
@@ -276,6 +290,27 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
             state["busy"] -= 1
             log(tag, f"🚫 #{idx} refused (prompt) — skipping")
             stats["refused"] += 1
+        except GotImagesNotVideo:
+            # dola made images, not a video — the account is FINE, only this job
+            # failed. Skip it (do NOT burn-recreate a healthy account).
+            state["busy"] -= 1
+            log(tag, f"🚫 #{idx} produced images not video — skipping (account OK)")
+            stats["refused"] += 1
+        except NotLoggedIn:
+            # Session dropped to guest mid-gen — re-login (NOT burn) and requeue.
+            state["busy"] -= 1
+            attempts[idx] = attempts.get(idx, 0) + 1
+            if attempts[idx] > 4:
+                log(tag, f"#{idx} still logged-out after {attempts[idx]} tries — giving up")
+                stats["errors"] += 1
+            else:
+                log(tag, f"#{idx} session dropped (guest) → re-login + requeue")
+                try:
+                    if await session.login_via_google(timeout=90):
+                        await session._ensure_base()
+                except Exception:
+                    pass
+                await queue.put((idx, prompt))
         except DolaError as e:
             state["busy"] -= 1
             attempts[idx] = attempts.get(idx, 0) + 1
