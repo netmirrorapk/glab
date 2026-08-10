@@ -47,6 +47,13 @@ class GotImagesNotVideo(DolaError):
     account is fine (do NOT burn-recreate)."""
 
 
+class HighDemand(DolaError):
+    """dola is under high demand / servers busy — a TRANSIENT condition, NOT
+    account exhaustion. The fix is BACK OFF + retry the same prompt on the same
+    account (re-login if it logged out). Burning the account does NOT help — the
+    whole service is busy, not the account."""
+
+
 # Terminal messages dola streams into the assistant reply. Detecting these lets us
 # stop immediately instead of blindly polling until timeout.
 # Find a visible element by text/aria and return its CENTER for a trusted click.
@@ -95,6 +102,14 @@ _REFUSAL_MARKERS = (
 ) + _CONTENT_REFUSAL_MARKERS
 # Backend-authoritative "a video task was actually queued" flag.
 _HAS_VIDEO_GEN = '"has_video_gen":"1"'
+# Transient "servers busy / high demand" — NOT exhaustion. Back off + retry the
+# SAME account (re-login if it logged out). Do NOT burn.
+_HIGH_DEMAND_MARKERS = (
+    "high demand", "experiencing high", "servers are busy", "server is busy",
+    "service is busy", "currently busy", "too many requests", "try again later",
+    "try again in a", "please try again shortly", "please try again later",
+    "system is busy", "under heavy load", "overloaded", "rate limit",
+)
 # Logged-out / guest — dola accepts the message but generates nothing (extension
 # dola.js:892-897). Re-login (NOT burn) is the fix.
 _NOTLOGGEDIN_MARKERS = (
@@ -136,6 +151,10 @@ def _classify_reply(raw: str):
         return "limit"
     if any(m in low for m in _REFUSAL_MARKERS):
         return "refused"
+    # Transient server-busy — MUST win over the None→exhaustion fallthrough so the
+    # caller retries instead of burning a perfectly good account.
+    if any(m in low for m in _HIGH_DEMAND_MARKERS):
+        return "busy"
     if _HAS_VIDEO_GEN in raw or "the video will be generated" in low or "will be ready in" in low:
         return "gen"
     return None
@@ -453,6 +472,8 @@ class DolaSession:
             raise GenerationRefused("dola refused/moderated this prompt")
         if verdict == "limit":
             raise DailyLimitReached("daily video-generation limit reached / no points left")
+        if verdict == "busy":
+            raise HighDemand("dola under high demand at submit — transient, retry same account")
         conv = re.findall(r'"conversation_id":"(\d+)"', raw)
         if not conv:
             raise DolaError("submit ok but no conversation_id in SSE")
@@ -523,6 +544,8 @@ class DolaSession:
                 raise GenerationRefused("dola refused/moderated this prompt")
             if verdict == "limit":
                 raise DailyLimitReached("daily video-generation limit reached / no points left")
+            if verdict == "busy":
+                raise HighDemand("dola under high demand during generation — transient, retry")
             # 5) POSITIVE proof a video is being produced (extension dola.js:556).
             if (_HAS_VIDEO_GEN in last or "generating" in low0
                     or "the video will be generated" in low0 or "will be ready" in low0

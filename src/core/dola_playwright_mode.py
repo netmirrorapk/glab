@@ -34,7 +34,7 @@ from src.db.db_manager import (
 )
 from src.core.dola_api import (
     DolaSession, DailyLimitReached, GenerationRefused,
-    NotLoggedIn, GotImagesNotVideo, DolaError,
+    NotLoggedIn, GotImagesNotVideo, HighDemand, DolaError,
 )
 # Reuse the exact same resolvers / filename helpers / allowed-value sets as the
 # extension dola mode so both modes behave identically and share the UI settings.
@@ -543,6 +543,7 @@ class PlaywrightDolaModeManager:
                     self._log(f"[DolaPW][{tag}] ✅ saved {os.path.basename(out_path)}")
                     attempts.pop(job_id, None)
                     limit_hits.pop(job_id, None)
+                    state["hd_streak"] = 0      # a success clears the high-demand backoff
                     self._settle(job_id)
                     if self._auto_delete and session.last_points_left == 0:
                         self._log(f"[DolaPW][{tag}] dola reports 0 points left → burn-recreate")
@@ -574,6 +575,26 @@ class PlaywrightDolaModeManager:
                     self.qm.signals.job_updated.emit(job_id, "failed", acct, "got_images_not_video")
                     self._log(f"[DolaPW][{tag}] 🚫 produced images not video — skipping (account OK)")
                     self._settle(job_id)
+                except HighDemand:
+                    # Transient 'servers busy / high demand' — NOT exhaustion. Back off
+                    # and retry the SAME prompt on the SAME account (re-login if it got
+                    # logged out). Do NOT burn (the whole service is busy, not the
+                    # account). Rising backoff so a sustained busy spell doesn't hammer.
+                    state["busy"] -= 1
+                    hd = state.setdefault("hd_streak", 0) + 1
+                    state["hd_streak"] = hd
+                    wait = min(15 + hd * 15, 120)   # 30s,45s,… capped 120s
+                    self._log(f"[DolaPW][{tag}] ⏳ high demand (server busy) → back off {wait}s "
+                              f"+ retry same account (no burn)")
+                    try:
+                        if not await session.logged_in_for_real():
+                            if await session.login_via_google(timeout=90):
+                                await session._ensure_base()
+                    except Exception:
+                        pass
+                    await self._requeue(job)
+                    self.qm.signals.job_updated.emit(job_id, "pending", "", "high_demand_retry")
+                    await asyncio.sleep(wait)
                 except NotLoggedIn:
                     state["busy"] -= 1
                     attempts[job_id] = attempts.get(job_id, 0) + 1
