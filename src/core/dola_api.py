@@ -105,10 +105,13 @@ _HAS_VIDEO_GEN = '"has_video_gen":"1"'
 # Transient "servers busy / high demand" — NOT exhaustion. Back off + retry the
 # SAME account (re-login if it logged out). Do NOT burn.
 _HIGH_DEMAND_MARKERS = (
-    "high demand", "experiencing high", "servers are busy", "server is busy",
-    "service is busy", "currently busy", "too many requests", "try again later",
-    "try again in a", "please try again shortly", "please try again later",
-    "system is busy", "under heavy load", "overloaded", "rate limit",
+    # exact dola toast: "We are experiencing high demand right now. Please try again later."
+    "high demand", "experiencing high", "highdemand", "high_demand",
+    "sendmsg_fail_highdemand", "senddemand",
+    "servers are busy", "server is busy", "service is busy", "currently busy",
+    "too many requests", "try again later", "try again in a",
+    "please try again shortly", "please try again later",
+    "system is busy", "under heavy load", "overloaded", "rate limit", "rate_limit",
 )
 # Logged-out / guest — dola accepts the message but generates nothing (extension
 # dola.js:892-897). Re-login (NOT burn) is the fix.
@@ -463,6 +466,10 @@ class DolaSession:
                     "commerce_credit_config_enable": "0"},
         }
         r = await self.pf("/chat/completion", body)
+        # 429 Too Many Requests / 503 Service Unavailable = dola throttling / high
+        # demand (the web UI shows the 'experiencing high demand' toast). Transient.
+        if r["status"] in (429, 503):
+            raise HighDemand(f"submit HTTP {r['status']} — high demand / server busy")
         if r["status"] != 200:
             raise DolaError(f"submit failed: HTTP {r['status']}: {r['body'][:200]}")
         raw = r["body"] or ""
