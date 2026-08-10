@@ -456,6 +456,17 @@ class PlaywrightDolaModeManager:
                      "ctx": ctx, "acct": name, "session_path": session_path}
             state["healthy"].set()
             self._states.append(state)
+            # Report send-throttle status up front so the user sees which accounts
+            # are rate-limited and exactly how long until they recover.
+            try:
+                rl = await main_session.check_rate_limit()
+                if rl.get("is_limit"):
+                    alog(f"⏳ RATE-LIMITED — recovers in ~{rl['seconds']}s "
+                         f"({rl.get('limit_tips', '')[:50]})")
+                else:
+                    alog("send-rate: OK (not limited)")
+            except Exception:
+                pass
             alog(f"logged in ✅ — {len(sessions)} tab(s) generating")
             await asyncio.gather(*[
                 self._tab_loop(name, i, s, main_session, state)
@@ -576,15 +587,28 @@ class PlaywrightDolaModeManager:
                     self._log(f"[DolaPW][{tag}] 🚫 produced images not video — skipping (account OK)")
                     self._settle(job_id)
                 except HighDemand:
-                    # Transient 'servers busy / high demand' — NOT exhaustion. Back off
-                    # and retry the SAME prompt on the SAME account (re-login if it got
-                    # logged out). Do NOT burn (the whole service is busy, not the
-                    # account). Rising backoff so a sustained busy spell doesn't hammer.
+                    # Transient 'servers busy / high demand' — NOT exhaustion. Ask dola
+                    # EXACTLY how long this account is throttled (send_rate_limit →
+                    # limit_time) and wait that long, then retry the SAME prompt on the
+                    # SAME account. Do NOT burn (the whole service is busy, not the
+                    # account). Fall back to a rising backoff if dola gives no time.
                     state["busy"] -= 1
-                    hd = state.setdefault("hd_streak", 0) + 1
-                    state["hd_streak"] = hd
-                    wait = min(15 + hd * 15, 120)   # 30s,45s,… capped 120s
-                    self._log(f"[DolaPW][{tag}] ⏳ high demand (server busy) → back off {wait}s "
+                    info = {}
+                    try:
+                        info = await session.check_rate_limit()
+                    except Exception:
+                        info = {}
+                    secs = int(info.get("seconds") or 0)
+                    if secs > 0:
+                        wait = min(secs + 5, 900)   # +5s cushion, cap 15 min
+                        tip = (info.get("limit_tips") or "").strip()
+                        src = f"dola says {secs}s" + (f" — {tip[:50]}" if tip else "")
+                    else:
+                        hd = state.setdefault("hd_streak", 0) + 1
+                        state["hd_streak"] = hd
+                        wait = min(15 + hd * 15, 120)   # 30s,45s,… capped 120s
+                        src = f"backoff {wait}s (no exact time from dola)"
+                    self._log(f"[DolaPW][{tag}] ⏳ high demand / rate-limited → wait ({src}) "
                               f"+ retry same account (no burn)")
                     try:
                         if not await session.logged_in_for_real():

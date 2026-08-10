@@ -508,6 +508,38 @@ class DolaSession:
         r = await self.pf("/im/chain/single", body, content_type="application/json; encoding=utf-8")
         return r.get("body", "") or ""
 
+    async def check_rate_limit(self) -> dict:
+        """Ask dola how long this account is send-throttled (the 'high demand'
+        state). Returns {is_limit, limit_time, limit_tips, seconds} where `seconds`
+        is how long to wait before it can send again (0 if not limited).
+        Endpoint: POST /im/message/send_rate_limit (cmd 2260)."""
+        body = {"cmd": 2260,
+                "uplink_body": {"check_message_send_rate_limit_uplink_body": {}},
+                "sequence_id": str(uuid.uuid4()), "channel": 2, "version": "1"}
+        try:
+            r = await self.pf("/im/message/send_rate_limit", body,
+                              content_type="application/json; encoding=utf-8")
+            d = (json.loads(r["body"] or "{}")
+                 .get("downlink_body", {})
+                 .get("check_message_send_rate_limit_downlink_body", {}))
+        except Exception:
+            return {"is_limit": False, "limit_time": 0, "limit_tips": "", "seconds": 0}
+        is_limit = bool(d.get("is_limit"))
+        lt = int(d.get("limit_time") or 0)
+        tips = str(d.get("limit_tips") or "")
+        secs = 0
+        if is_limit and lt:
+            # limit_time may be an absolute epoch (ms or s) or a duration in seconds.
+            now = time.time()
+            if lt > 1e12:      # epoch milliseconds
+                secs = int(lt / 1000 - now)
+            elif lt > 1e9:     # epoch seconds
+                secs = int(lt - now)
+            else:              # plain duration (seconds)
+                secs = int(lt)
+            secs = max(0, secs)
+        return {"is_limit": is_limit, "limit_time": lt, "limit_tips": tips, "seconds": secs}
+
     async def snapshot_vids(self, conv_id: str) -> set:
         """Vids already present in a conversation (so we can ignore them and wait for the new one)."""
         try:
