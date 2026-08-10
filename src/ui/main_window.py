@@ -4505,7 +4505,7 @@ class MainWindow(QMainWindow):
         # Initial fetch after 1 second
         QTimer.singleShot(1000, self._refresh_extension_accounts)
 
-        self.acc_table = QTableWidget(0, 10)
+        self.acc_table = QTableWidget(0, 11)
         self.acc_table.setHorizontalHeaderLabels([
             "ID",
             "Account",
@@ -4517,6 +4517,7 @@ class MainWindow(QMainWindow):
             "Slots",
             "Details",
             "",
+            "Use",
         ])
         self.acc_table.verticalHeader().setVisible(False)
         self.acc_table.verticalHeader().setDefaultSectionSize(56)  # Taller rows
@@ -4603,6 +4604,11 @@ class MainWindow(QMainWindow):
         self.acc_table.setColumnWidth(7, 70)    # Slots
         self.acc_table.setColumnWidth(8, 160)   # Details
         self.acc_table.setColumnWidth(9, 60)    # Actions
+        self.acc_table.setColumnWidth(10, 55)   # Use (generation select)
+        self.acc_table.setHorizontalHeaderItem(10, QTableWidgetItem("Use"))
+        self.acc_table.horizontalHeaderItem(10).setToolTip(
+            "Tick the accounts to use for Dola generation. Only ticked accounts generate."
+        )
         # Prevent text eliding in the table itself (separate from cell widgets)
         self.acc_table.setTextElideMode(Qt.ElideNone)
         self._configure_table_scrolling(self.acc_table)
@@ -6956,6 +6962,49 @@ class MainWindow(QMainWindow):
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(account_name or "account")).strip("._-")
         return safe or "account"
 
+    def _dola_enabled_accounts(self):
+        """Set of account names ticked 'Use for generation'. None = ALL enabled
+        (backward-compat: no selection made yet → every account is used)."""
+        cur = get_setting("dola_selected_accounts", None)
+        if cur is None:
+            return None
+        return set(x for x in str(cur).split("||") if x)
+
+    def _on_dola_account_use_toggled(self, name, checked):
+        """Persist the per-account 'use for generation' tick to dola_selected_accounts."""
+        try:
+            enabled = self._dola_enabled_accounts()
+            if enabled is None:
+                # first change — start from ALL current accounts (they were all on)
+                enabled = {str(a.get("name") or "") for a in (self._latest_accounts or [])}
+                enabled = {n for n in enabled if n}
+            if checked:
+                enabled.add(name)
+            else:
+                enabled.discard(name)
+            set_setting("dola_selected_accounts", "||".join(sorted(enabled)))
+        except Exception:
+            pass
+
+    def _add_account_use_checkbox(self, row, name):
+        """A 'Use for generation' tick per account (Dola). Only ticked accounts run."""
+        try:
+            chk = QCheckBox()
+            chk.setToolTip("Use this account for Dola generation.\n"
+                           "Only ticked accounts will generate.")
+            enabled = self._dola_enabled_accounts()
+            chk.setChecked(enabled is None or name in enabled)
+            chk.toggled.connect(
+                lambda checked=False, n=name: self._on_dola_account_use_toggled(n, checked))
+            cell = QWidget()
+            lay = QHBoxLayout(cell)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setAlignment(Qt.AlignCenter)
+            lay.addWidget(chk)
+            self.acc_table.setCellWidget(row, 10, cell)
+        except Exception:
+            pass
+
     def _make_account_action_button(self, text, color, hover_color):
         btn = QPushButton(text)
         btn.setFixedSize(60, 26)
@@ -9131,6 +9180,7 @@ class MainWindow(QMainWindow):
                 self._get_or_create_table_item(self.acc_table, i, 7, "0/1")
                 self._set_account_detail_cell(i, real_name, "Queue stopped")
                 self._add_account_action_buttons(i, db_id, real_name or display_name)
+                self._add_account_use_checkbox(i, real_name)
         finally:
             self._loading_accounts_table = False
         self._refresh_account_runtime_cells()

@@ -271,12 +271,21 @@ class PlaywrightDolaModeManager:
         """The app's Account Manager accounts (db) with a valid Playwright session
         dir. Each account = {name, session_path, proxy}; session_path is the
         user-data-dir holding the Google/dola login (created by 'Login for dola')."""
+        # honor the Account Manager "Use for generation" ticks. Setting holds the
+        # enabled account names joined by '||'; unset (None) = use ALL (backward-compat).
+        sel = get_setting("dola_selected_accounts", None)
+        enabled = None
+        if sel is not None:
+            enabled = set(x for x in str(sel).split("||") if x)
         out: List[Dict[str, str]] = []
         try:
             for a in (get_accounts() or []):
+                name = str(a.get("name") or "")
                 sp = str(a.get("session_path") or "").strip()
+                if enabled is not None and name not in enabled:
+                    continue                      # unticked in Account Manager → skip
                 if sp and os.path.isdir(sp):
-                    out.append({"name": str(a.get("name") or sp),
+                    out.append({"name": name or sp,
                                 "session_path": sp,
                                 "proxy": str(a.get("proxy") or "").strip()})
         except Exception:
