@@ -63,8 +63,11 @@ def remove_image_watermark(path):
     if w < 200 or h < 200:
         return False
     short = min(w, h)
-    off = int(short * 0.073)      # sparkle centre offset in from the corner
-    half = int(short * 0.042)     # half box size (covers the sparkle + margin)
+    # The sparkle sits a ~FIXED ~112px in from the bottom-right corner (measured on
+    # both 1376x768 and 2752x1536 output), NOT proportional — so use a fixed offset
+    # (scaled up only for very large images) with a generous box.
+    off = max(112, int(short * 0.06))     # sparkle centre offset from the corner
+    half = max(70, int(short * 0.055))    # half box size (covers the sparkle + margin)
     cx, cy = w - off, h - off
     bx = max(1, cx - half)
     by = max(1, cy - half)
