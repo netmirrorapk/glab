@@ -30,6 +30,65 @@ from src.core.process_tracker import process_tracker, cleanup_session_locks
 from src.db.db_manager import get_output_directory, get_setting, update_job_runtime_state
 
 
+def _image_size(path):
+    """(w, h) of an image — PIL if available, else ffprobe. None on failure."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        w, h = out.split("x")[:2]
+        return int(w), int(h)
+    except Exception:
+        return None
+
+
+def remove_image_watermark(path):
+    """Remove the Nano Banana / Gemini bottom-right 'sparkle' (✦) watermark IN-PLACE
+    via ffmpeg's delogo (interpolates the region from surrounding pixels). The mark
+    sits a fixed offset in from the bottom-right corner (~7.3% of the shorter side),
+    so the box is computed from that corner and scales to any resolution. Graceful
+    no-op (image kept as-is) if ffmpeg/size aren't available. NOTE: this removes the
+    VISIBLE mark only — Google's invisible SynthID watermark is NOT affected."""
+    sz = _image_size(path)
+    if not sz:
+        return False
+    w, h = sz
+    if w < 200 or h < 200:
+        return False
+    short = min(w, h)
+    off = int(short * 0.073)      # sparkle centre offset in from the corner
+    half = int(short * 0.042)     # half box size (covers the sparkle + margin)
+    cx, cy = w - off, h - off
+    bx = max(1, cx - half)
+    by = max(1, cy - half)
+    bw = max(2, min(2 * half, w - bx - 2))
+    bh = max(2, min(2 * half, h - by - 2))
+    tmp = path + ".nw" + (os.path.splitext(path)[1] or ".png")
+    try:
+        rc = subprocess.run(
+            ["ffmpeg", "-y", "-i", path,
+             "-vf", f"delogo=x={bx}:y={by}:w={bw}:h={bh}", tmp],
+            capture_output=True, timeout=60).returncode
+        if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 1000:
+            os.replace(tmp, path)
+            return True
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    except Exception:
+        pass
+    return False
+
+
 class GoogleLabsBot:
     """Core Playwright engine for Google Labs interactions."""
     FLOW_PAGE_URL = "https://labs.google/fx/tools/flow"
@@ -1818,6 +1877,12 @@ class GoogleLabsBot:
         with open(output_path, "wb") as f:
             f.write(base64.b64decode(encoded))
 
+        if ext in (".png", ".jpg", ".jpeg", ".webp") and str(
+                get_setting("flow_remove_watermark", "1") or "1").strip().lower() in ("1", "true", "on", "yes"):
+            try:
+                remove_image_watermark(output_path)
+            except Exception:
+                pass
         return output_path
 
     def _extract_project_id(self, url):
@@ -2844,6 +2909,12 @@ class GoogleLabsBot:
         data = await resp.body()
         with open(output_path, "wb") as f:
             f.write(data)
+        if ext in (".png", ".jpg", ".jpeg", ".webp") and str(
+                get_setting("flow_remove_watermark", "1") or "1").strip().lower() in ("1", "true", "on", "yes"):
+            try:
+                await asyncio.to_thread(remove_image_watermark, output_path)
+            except Exception:
+                pass
         return output_path
 
     async def _download_video_to_output(

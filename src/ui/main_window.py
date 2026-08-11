@@ -5284,6 +5284,18 @@ class MainWindow(QMainWindow):
         self.chk_random_fingerprint.setChecked(get_bool_setting("random_fingerprint_per_session", False))
         browser_form.addRow("", self.chk_random_fingerprint)
 
+        self.chk_flow_remove_wm = QCheckBox("Remove AI watermark from images (Nano Banana / Flow)")
+        self.chk_flow_remove_wm.setToolTip(
+            "Auto-remove Google's bottom-right 'sparkle' watermark from every generated\n"
+            "image right after it downloads (ffmpeg delogo, in-place). Needs ffmpeg on PATH.\n"
+            "Note: only the VISIBLE mark is removed — Google's invisible SynthID stays."
+        )
+        self.chk_flow_remove_wm.setChecked(
+            str(get_setting("flow_remove_watermark", "1") or "1").strip().lower() in ("1", "true", "on", "yes"))
+        self.chk_flow_remove_wm.toggled.connect(
+            lambda checked=False: set_setting("flow_remove_watermark", "1" if checked else "0"))
+        browser_form.addRow("", self.chk_flow_remove_wm)
+
         # CloakBrowser version row (inside Browser card)
         self.cloak_update_widget = QWidget()
         cloak_update_layout = QHBoxLayout(self.cloak_update_widget)
