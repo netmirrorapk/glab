@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import glob
+import shutil
 import subprocess
 
 try:
@@ -21,6 +22,19 @@ except Exception:
     pass
 
 EXTS = ("*.jpg", "*.jpeg", "*.png", "*.webp")
+
+
+def _ff(tool):
+    """Resolve ffmpeg/ffprobe to an absolute path (GUI launches on macOS don't inherit
+    Homebrew's /opt/homebrew/bin on PATH). Falls back to the bare name."""
+    found = shutil.which(tool)
+    if not found:
+        for d in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin", "/bin"):
+            cand = os.path.join(d, tool)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                found = cand
+                break
+    return found or tool
 
 
 def _size(path):
@@ -32,7 +46,7 @@ def _size(path):
         pass
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [_ff("ffprobe"), "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
             capture_output=True, text=True, timeout=20).stdout.strip()
         w, h = out.split("x")[:2]
@@ -62,7 +76,7 @@ def dewatermark(path):
     tmp = path + ".nw" + (os.path.splitext(path)[1] or ".png")
     try:
         rc = subprocess.run(
-            ["ffmpeg", "-y", "-i", path,
+            [_ff("ffmpeg"), "-y", "-i", path,
              "-vf", f"delogo=x={bx}:y={by}:w={bw}:h={bh}", tmp],
             capture_output=True, timeout=60).returncode
         if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 1000:

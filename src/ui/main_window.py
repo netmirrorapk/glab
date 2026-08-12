@@ -228,6 +228,7 @@ from src.db.db_manager import (
 )
 from src.core.account_manager import AccountManager
 from src.core.app_paths import get_app_data_dir, get_outputs_dir, get_project_cache_path, get_session_clones_dir, get_sessions_dir
+from src.core.ffmpeg_path import ffmpeg_exe
 from src.core.bot_engine import GoogleLabsBot
 from src.core.process_tracker import process_tracker
 from src.core.queue_manager import AsyncQueueManager
@@ -1392,7 +1393,7 @@ class LiveJobCard(QFrame):
             _no_window = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
             subprocess.run(
                 [
-                    "ffmpeg",
+                    ffmpeg_exe(),
                     "-i",
                     target,
                     "-vf",

@@ -44,6 +44,7 @@ from src.core.dola_mode import (
     _ALLOWED_RATIO, _ALLOWED_MODELS,
 )
 from src.core.cloakbrowser_support import load_cloakbrowser_api
+from src.core.ffmpeg_path import ffmpeg_exe, ffprobe_exe
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CHROME_EXES = [
@@ -200,7 +201,7 @@ async def _dewatermark(path) -> bool:
     if ffmpeg/ffprobe aren't available or anything fails (original is left intact)."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         out, _ = await proc.communicate()
@@ -214,7 +215,7 @@ async def _dewatermark(path) -> bool:
     tmp = path + ".nw.mp4"
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", path,
+            ffmpeg_exe(), "-y", "-i", path,
             "-vf", f"delogo=x={x}:y={y}:w={bw}:h={bh}",
             "-preset", "veryfast", "-c:a", "copy", tmp,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)

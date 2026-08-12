@@ -21,6 +21,7 @@ except Exception:
     stealth_async = None
 
 from src.core.app_paths import get_session_clones_dir
+from src.core.ffmpeg_path import ffmpeg_exe, ffprobe_exe
 from src.core.cloakbrowser_support import (
     load_cloakbrowser_api,
 )
@@ -40,7 +41,7 @@ def _image_size(path):
         pass
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            [ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
             capture_output=True, text=True, timeout=20).stdout.strip()
         w, h = out.split("x")[:2]
@@ -79,7 +80,7 @@ def remove_image_watermark(path):
     tmp = path + ".nw" + (os.path.splitext(path)[1] or ".png")
     try:
         rc = subprocess.run(
-            ["ffmpeg", "-y", "-i", path,
+            [ffmpeg_exe(), "-y", "-i", path,
              "-vf", f"delogo=x={bx}:y={by}:w={bw}:h={bh}", tmp],
             capture_output=True, timeout=60).returncode
         if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 1000:
