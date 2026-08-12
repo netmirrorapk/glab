@@ -50,8 +50,10 @@ def dewatermark(path):
     if w < 200 or h < 200:
         return False
     short = min(w, h)
-    off = max(112, int(short * 0.06))
-    half = max(70, int(short * 0.055))
+    # sparkle centre ~fixed 100px in from the bottom-right corner (9:16/3:4/4:3 alike);
+    # keep the box tight so the delogo patch stays small on busy backgrounds.
+    off = max(103, int(short * 0.075))
+    half = max(52, int(short * 0.038))
     cx, cy = w - off, h - off
     bx = max(1, cx - half)
     by = max(1, cy - half)

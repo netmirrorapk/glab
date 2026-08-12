@@ -63,11 +63,14 @@ def remove_image_watermark(path):
     if w < 200 or h < 200:
         return False
     short = min(w, h)
-    # The sparkle sits a ~FIXED ~112px in from the bottom-right corner (measured on
-    # both 1376x768 and 2752x1536 output), NOT proportional — so use a fixed offset
-    # (scaled up only for very large images) with a generous box.
-    off = max(112, int(short * 0.06))     # sparkle centre offset from the corner
-    half = max(70, int(short * 0.055))    # half box size (covers the sparkle + margin)
+    # The sparkle centre sits a FIXED ~100px in from the bottom-right corner — measured
+    # at ~(97-103) px on 768x1376 (9:16), 896x1200 (3:4) and 1200x896 (4:3) alike, i.e.
+    # a fixed pixel inset, NOT proportional. Centre the box on that inset and keep it
+    # tight (~the sparkle is only ~45px across) so the delogo patch stays small and the
+    # smear is minimal even on busy backgrounds (grass, foliage). The 0.075/0.038 terms
+    # are only a safety net that kicks in for unusually large (upscaled) outputs.
+    off = max(103, int(short * 0.075))    # sparkle centre offset in from the corner
+    half = max(52, int(short * 0.038))    # half box size (covers the sparkle + margin)
     cx, cy = w - off, h - off
     bx = max(1, cx - half)
     by = max(1, cy - half)
