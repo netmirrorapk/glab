@@ -1007,10 +1007,12 @@ class DolaSession:
             pass
         await asyncio.sleep(1)
         # 3) Locate + click the danger 'Delete Now' control. The button renders
-        #    LATE while the page finishes bouncing through the silent OAuth, so we
-        #    RETRY (extension dola.js:1130 — up to ~20×1.5s) instead of a single try.
+        #    LATE — the page keeps bouncing through the silent Google OAuth for a few
+        #    seconds after we're "back on dola" before 'Delete Now' paints. So we RETRY
+        #    for ~45s (verified live: the button shows a little while after the re-auth,
+        #    not instantly) and break the instant it appears.
         clicked = False
-        for _ in range(25):   # ~25s, but breaks the instant the button appears
+        for i in range(45):   # ~45s, but breaks the instant the button appears
             if self.page.is_closed():   # browser context died (overload) — stop, don't spam
                 return False, "browser context closed during delete"
             if await self._click_delete_control(log, do_click=not dry_run):
@@ -1023,6 +1025,8 @@ class DolaSession:
                 u = ""
             if any(s in u for s in ("/login", "/passport/web/logout", "from_logout")):
                 return True, "account deletion confirmed (logout redirect)"
+            if i and i % 10 == 0 and log:
+                log(f"  …still waiting for the 'Delete Now' button to render ({i}s)")
             await asyncio.sleep(1.0)
         if not clicked:
             await self._dump_clickables(log)   # so we can see what the page actually shows
