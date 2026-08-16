@@ -52,3 +52,4 @@ outputs/*.log
 outputs/test_prompts.txt
 prompts.txt
 data/dola_profiles/*_cookies.json
+prompts1.txt
