@@ -239,8 +239,12 @@ async def _account_recreate(acct, main_session, state):
         state["healthy"].set()                   # resume every tab
 
 
-async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, state):
+async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, state,
+                    use_skill=False, duration=10, tab_stagger=0.0):
     tag = f"{acct}#t{tab_i+1}"
+    # stagger each tab's first submit so N tabs don't burst N sends at once
+    if tab_i and tab_stagger:
+        await asyncio.sleep(tab_i * tab_stagger)
     try:
         await session._ensure_base()
     except Exception:
@@ -266,7 +270,8 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
         out = os.path.join(OUT_DIR, f"{idx:04d}_{acct}.mp4")
         state["busy"] += 1
         try:
-            await session.generate_one(prompt, out, ratio=ratio, timeout=720)
+            await session.generate_one(prompt, out, ratio=ratio, duration=duration,
+                                       timeout=720, use_skill=use_skill)
             state["busy"] -= 1
             n = os.path.getsize(out) if os.path.exists(out) else 0
             log(tag, f"✅ #{idx} saved ({n} bytes)")
@@ -335,7 +340,8 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
 
 
 async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
-                 cloak=False, parallel=1, launch_delay=0.0):
+                 cloak=False, parallel=1, launch_delay=0.0,
+                 use_skill=False, duration=10, tab_stagger=0.0):
     if launch_delay:
         await asyncio.sleep(launch_delay)        # staggered launch (Ns gap between accounts)
     profile_dir = os.path.join(PROFILES_DIR, acct)
@@ -396,7 +402,8 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
         state["healthy"].set()
         log(acct, f"{len(sessions)} tab(s) ready — generating")
         await asyncio.gather(*[
-            _tab_loop(acct, i, s, main_session, queue, ratio, stats, state)
+            _tab_loop(acct, i, s, main_session, queue, ratio, stats, state,
+                      use_skill=use_skill, duration=duration, tab_stagger=tab_stagger)
             for i, s in enumerate(sessions)])
         log(acct, "all tabs done")
     except Exception as e:
@@ -440,11 +447,17 @@ async def main_async(args):
         print("[run] CloakBrowser mode — truly invisible headless (passes dola's detection)")
     stagger = float(getattr(args, "stagger", 5.0) or 0)
     parallel = int(getattr(args, "parallel", 1) or 1)
+    use_skill = bool(getattr(args, "skill", False))
+    duration = int(getattr(args, "duration", 10) or 10)
+    tab_stagger = float(getattr(args, "tab_stagger", 2.0) or 0)
     print(f"[run] parallel tabs/account={parallel}, launch stagger={stagger}s between accounts")
+    print(f"[run] route={'SKILL /creative-video' if use_skill else 'DIRECT ability'}, "
+          f"duration={duration}s, tab_stagger={tab_stagger}s")
     await asyncio.gather(*[
         worker(a, proxies.get(a), queue, args.ratio, args.headless, stats,
                cloak=getattr(args, "cloak", False), parallel=parallel,
-               launch_delay=i * stagger)                     # staggered: 0s, 5s, 10s, …
+               launch_delay=i * stagger,                     # staggered: 0s, 5s, 10s, …
+               use_skill=use_skill, duration=duration, tab_stagger=tab_stagger)
         for i, a in enumerate(accounts)
     ])
     print(f"[run] FINISHED — done={stats['done']} refused={stats['refused']} "
@@ -459,6 +472,9 @@ def main():
     ap.add_argument("--headless", action="store_true", help="invisible: off-screen headed (regular Chrome) — dola passes this")
     ap.add_argument("--cloak", action="store_true", help="use anti-detect CloakBrowser in TRUE headless (truly invisible; cookies auto-injected from the dedicated profile)")
     ap.add_argument("--parallel", type=int, default=1, help="parallel tabs (concurrent generations) PER account")
+    ap.add_argument("--skill", action="store_true", help="use the creative-video SKILL route (/creative-video + auto-yes) instead of the direct ability route")
+    ap.add_argument("--duration", type=int, default=10, help="video duration in seconds (default 10)")
+    ap.add_argument("--tab-stagger", type=float, default=2.0, dest="tab_stagger", help="seconds between each tab's first submit (avoids high-demand burst; default 2)")
     ap.add_argument("--stagger", type=float, default=5.0, help="seconds between opening each account's profile (default 5)")
     args = ap.parse_args()
     asyncio.run(main_async(args))
