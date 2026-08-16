@@ -1025,6 +1025,7 @@ class DolaSession:
                 return True, "account deletion confirmed (logout redirect)"
             await asyncio.sleep(1.0)
         if not clicked:
+            await self._dump_clickables(log)   # so we can see what the page actually shows
             return False, "could not find the 'Delete Now' button on /delete-account"
         if dry_run:
             return True, "dry run OK — 'Delete Now' button found, NOT clicked (no deletion)"
@@ -1060,6 +1061,41 @@ class DolaSession:
             detail += f" (user_check HTTP {state['user_check_status']})"
         return False, detail
 
+    async def _dump_clickables(self, log=None) -> None:
+        """Diagnostic: log the visible clickable elements on the current page so we can
+        see what the /delete-account page actually renders when the 'Delete Now' button
+        isn't matched (dola occasionally changes the button text/markup)."""
+        if not log:
+            return
+        try:
+            items = await self.page.evaluate(r"""() => {
+                const norm=(s)=>(s||'').replace(/\s+/g,' ').trim();
+                const vis=(el)=>{const st=getComputedStyle(el);if(!st)return false;
+                    const r=el.getBoundingClientRect();
+                    return st.display!=='none'&&st.visibility!=='hidden'&&r.width>4&&r.height>4;};
+                return Array.from(document.querySelectorAll("button,[role='button'],a,div,span"))
+                  .filter(vis)
+                  .map(e=>({t:norm(e.textContent).slice(0,45),
+                            c:(e.className||'').toString().slice(0,60),
+                            cur:getComputedStyle(e).cursor}))
+                  .filter(x=>x.t && x.t.length>0 && x.t.length<=45)
+                  .filter(x=>x.cur==='pointer' || /delete|confirm|account|remove|permanent/i.test(x.t))
+                  .slice(0,30);
+            }""")
+            try:
+                log(f"  [diag] delete page url: {str(self.page.url)[:80]}")
+            except Exception:
+                pass
+            seen = set()
+            for it in (items or []):
+                key = (it.get("t"), it.get("c"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                log(f"  [diag] clickable: '{it.get('t')}' | cursor={it.get('cur')} | class={it.get('c')}")
+        except Exception as e:
+            log(f"  [diag] dump failed: {str(e)[:80]}")
+
     async def _click_delete_control(self, log=None, do_click=True) -> bool:
         """Find the 'Delete Now' danger button (text + class fallbacks).
         Clicks it when do_click is True; otherwise only reports it was found."""
@@ -1074,10 +1110,18 @@ class DolaSession:
             };
             const nodes = Array.from(document.querySelectorAll("div,button,[role='button'],span,a")).filter(vis);
             const cls = (e) => (e.className || "").toString();
+            const isBtn = (e) => e.tagName === "BUTTON" || e.getAttribute("role") === "button"
+                || cls(e).includes("clickable") || getComputedStyle(e).cursor === "pointer";
             let el =
                 nodes.find((e) => cls(e).includes("confirm-button") && cls(e).includes("type-danger")) ||
                 nodes.find((e) => ["delete now", "delete account"].includes(norm(e.textContent)) && cls(e).includes("clickable")) ||
-                nodes.find((e) => ["delete now", "delete account", "delete", "confirm"].includes(norm(e.textContent)) && getComputedStyle(e).cursor === "pointer");
+                nodes.find((e) => ["delete now", "delete account", "delete", "confirm"].includes(norm(e.textContent)) && getComputedStyle(e).cursor === "pointer") ||
+                // contains-match: a short danger button whose label INCLUDES a delete phrase
+                nodes.find((e) => { const t = norm(e.textContent);
+                    return t.length <= 28 && isBtn(e)
+                        && (t.includes("delete now") || t.includes("delete account")
+                            || t.includes("permanently delete") || t.includes("delete my account")
+                            || t.includes("confirm delete")); });
             if (!el) return { ok: false };
             const label = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
             if (!doClick) return { ok: true, label, clicked: false };
