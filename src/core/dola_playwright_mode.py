@@ -165,7 +165,47 @@ async def _save_cookies(session_path, ctx):
         pass
 
 
-async def _launch_cloak(cookies, proxy, headless):
+async def _add_cookies_robust(ctx, cookies, log=None):
+    """Inject cookies into a context ONE-BY-ONE with sanitisation, so a single malformed
+    cookie (bad sameSite, a __Host-/__Secure- prefix with a domain, a partitionKey field,
+    etc.) can't make the WHOLE add_cookies batch throw and leave the session logged out
+    (the old `try: add_cookies(all) except: pass` dropped every cookie on one bad one).
+    Returns (ok, total, google_ok) — google_ok = how many *.google.com cookies landed
+    (those are what the delete-page OAuth re-auth needs)."""
+    ok = google_ok = 0
+    total = len(cookies or [])
+    for c in (cookies or []):
+        try:
+            cc = {k: c[k] for k in c if k not in
+                  ("partitionKey", "priority", "sameParty", "sourceScheme", "sourcePort", "size")}
+            ss = str(cc.get("sameSite", "")).lower()
+            cc["sameSite"] = {"lax": "Lax", "strict": "Strict", "none": "None",
+                              "no_restriction": "None"}.get(ss, "Lax")
+            name = str(cc.get("name", ""))
+            if name.startswith("__Host-"):
+                cc.pop("domain", None); cc["path"] = "/"; cc["secure"] = True
+            elif name.startswith("__Secure-"):
+                cc["secure"] = True
+            dom = str(c.get("domain", "") or "")
+            try:
+                await ctx.add_cookies([cc])
+            except Exception:
+                # retry via url= (some engines reject a leading-dot domain)
+                cc2 = {k: cc[k] for k in cc if k not in ("domain", "path")}
+                host = dom.lstrip(".") or "www.dola.com"
+                cc2["url"] = "https://" + host + "/"
+                await ctx.add_cookies([cc2])
+            ok += 1
+            if "google.com" in dom:
+                google_ok += 1
+        except Exception:
+            pass
+    if log:
+        log(f"cookies injected: {ok}/{total} (google={google_ok})")
+    return ok, total, google_ok
+
+
+async def _launch_cloak(cookies, proxy, headless, log=None):
     api = load_cloakbrowser_api()
     persistent = api.get("persistent_async")
     if not api.get("available") or persistent is None:
@@ -175,10 +215,7 @@ async def _launch_cloak(cookies, proxy, headless):
         session_path, headless=headless,
         args=["--no-first-run", "--no-default-browser-check"],
         proxy=proxy or None, humanize={"preset": "careful"})
-    try:
-        await ctx.add_cookies(cookies)
-    except Exception:
-        pass
+    await _add_cookies_robust(ctx, cookies, log=log)
     return None, ctx
 
 
@@ -454,7 +491,7 @@ class PlaywrightDolaModeManager:
             alog(f"opening account ({'CloakBrowser' if self._cloak else 'Chrome'})…")
             if self._cloak:
                 cookies = await _cookies_for(session_path)
-                p, ctx = await _launch_cloak(cookies, _proxy_dict(proxy), self._headless)
+                p, ctx = await _launch_cloak(cookies, _proxy_dict(proxy), self._headless, log=alog)
             else:
                 p, ctx = await _launch(session_path, proxy, self._headless)
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -463,10 +500,10 @@ class PlaywrightDolaModeManager:
             alog("checking dola login…")
             if not await main_session.login_via_google(timeout=90):
                 if self._cloak:
-                    alog("login failed — refreshing cookies from the account session & retrying…")
+                    alog("login failed — re-exporting FRESH cookies from the dedicated profile & retrying…")
                     try:
                         fresh = await _export_cookies(session_path)
-                        await ctx.add_cookies(fresh)
+                        await _add_cookies_robust(ctx, fresh, log=alog)
                         _save_cookies_file(session_path, fresh)
                     except Exception as e:
                         alog("cookie refresh failed:", str(e)[:80])

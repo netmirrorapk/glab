@@ -158,7 +158,42 @@ async def _save_cookies(acct, ctx):
         pass
 
 
-async def _launch_cloak(cookies, proxy, headless):
+async def _add_cookies_robust(ctx, cookies, log=None):
+    """Inject cookies ONE-BY-ONE with sanitisation so a single malformed cookie can't make
+    the whole add_cookies batch throw and leave the session logged out. Returns (ok, total,
+    google_ok)."""
+    ok = google_ok = 0
+    total = len(cookies or [])
+    for c in (cookies or []):
+        try:
+            cc = {k: c[k] for k in c if k not in
+                  ("partitionKey", "priority", "sameParty", "sourceScheme", "sourcePort", "size")}
+            ss = str(cc.get("sameSite", "")).lower()
+            cc["sameSite"] = {"lax": "Lax", "strict": "Strict", "none": "None",
+                              "no_restriction": "None"}.get(ss, "Lax")
+            name = str(cc.get("name", ""))
+            if name.startswith("__Host-"):
+                cc.pop("domain", None); cc["path"] = "/"; cc["secure"] = True
+            elif name.startswith("__Secure-"):
+                cc["secure"] = True
+            dom = str(c.get("domain", "") or "")
+            try:
+                await ctx.add_cookies([cc])
+            except Exception:
+                cc2 = {k: cc[k] for k in cc if k not in ("domain", "path")}
+                cc2["url"] = "https://" + (dom.lstrip(".") or "www.dola.com") + "/"
+                await ctx.add_cookies([cc2])
+            ok += 1
+            if "google.com" in dom:
+                google_ok += 1
+        except Exception:
+            pass
+    if log:
+        log(f"cookies injected: {ok}/{total} (google={google_ok})")
+    return ok, total, google_ok
+
+
+async def _launch_cloak(cookies, proxy, headless, log=None):
     """Launch anti-detect CloakBrowser (passes dola's headless check) + inject the
     logged-in cookies. Returns (None, ctx) — no separate playwright object."""
     api = load_cloakbrowser_api()
@@ -170,10 +205,7 @@ async def _launch_cloak(cookies, proxy, headless):
         session_path, headless=headless,
         args=["--no-first-run", "--no-default-browser-check"],
         proxy=proxy or None, humanize={"preset": "careful"})
-    try:
-        await ctx.add_cookies(cookies)
-    except Exception:
-        pass
+    await _add_cookies_robust(ctx, cookies, log=log)
     return None, ctx
 
 
@@ -353,7 +385,7 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
         if cloak:
             cookies = await _cookies_for(acct, profile_dir)
             cproxy = _proxy_dict(proxy) if isinstance(proxy, str) else proxy
-            p, ctx = await _launch_cloak(cookies, cproxy, headless)
+            p, ctx = await _launch_cloak(cookies, cproxy, headless, log=lambda *a: log(acct, *a))
         else:
             p, ctx = await _launch(profile_dir, proxy, headless)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -373,7 +405,7 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
                 log(acct, "login failed — refreshing cookies from the dedicated profile & retrying…")
                 try:
                     fresh = await _export_cookies(profile_dir)
-                    await ctx.add_cookies(fresh)
+                    await _add_cookies_robust(ctx, fresh, log=lambda *a: log(acct, *a))
                     _json.dump(fresh, open(os.path.join(PROFILES_DIR, f"{acct}_cookies.json"), "w", encoding="utf-8"))
                     log(acct, f"refreshed {len(fresh)} cookies")
                 except Exception as e:

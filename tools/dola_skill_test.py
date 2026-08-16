@@ -83,7 +83,7 @@ async def run(args):
         if args.cloak:
             cookies = await R._cookies_for(acct, profile_dir)
             cproxy = R._proxy_dict(proxy) if isinstance(proxy, str) else proxy
-            p, ctx = await R._launch_cloak(cookies, cproxy, args.headless)
+            p, ctx = await R._launch_cloak(cookies, cproxy, args.headless, log=log)
         else:
             p, ctx = await R._launch(profile_dir, proxy, args.headless)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -100,7 +100,7 @@ async def run(args):
                 log("login failed — refreshing cookies from the dedicated profile & retrying…")
                 try:
                     fresh = await R._export_cookies(profile_dir)
-                    await ctx.add_cookies(fresh)
+                    await R._add_cookies_robust(ctx, fresh, log=log)
                 except Exception as e:
                     log("cookie refresh failed:", str(e)[:80])
             if not await session.login_via_google(timeout=90):

@@ -71,9 +71,10 @@ async def run(args):
     p = ctx = None
     try:
         if cloak:
-            cookies = await R._cookies_for(acct, profile_dir)
+            log("exporting FRESH cookies from the dedicated profile (not the stale cache)…")
+            cookies = await R._export_cookies(profile_dir)   # FRESH, so the Google session carries over
             cproxy = R._proxy_dict(proxy) if isinstance(proxy, str) else proxy
-            p, ctx = await R._launch_cloak(cookies, cproxy, False)   # headed so we can watch
+            p, ctx = await R._launch_cloak(cookies, cproxy, False, log=log)   # headed so we can watch
         else:
             p, ctx = await R._launch(profile_dir, proxy, False)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -83,7 +84,7 @@ async def run(args):
             if cloak:
                 try:
                     fresh = await R._export_cookies(profile_dir)
-                    await ctx.add_cookies(fresh)
+                    await R._add_cookies_robust(ctx, fresh, log=log)
                 except Exception:
                     pass
             if not await session.login_via_google(timeout=90):
