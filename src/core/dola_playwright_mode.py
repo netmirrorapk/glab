@@ -787,6 +787,17 @@ class PlaywrightDolaModeManager:
                     break
                 await asyncio.sleep(2)
             alog(f"burn-recreate #{state['recreated'] + 1}: delete → re-login…")
+            # In cloak mode the injected Google cookies may have rotated during the run;
+            # the /delete-account OAuth re-auth needs a FRESH Google session, so re-export
+            # + robustly inject fresh cookies from the dedicated profile right before the
+            # delete (this is exactly what made the delete succeed in dola_delete_test).
+            if state.get("cloak") and state.get("ctx") and state.get("session_path"):
+                try:
+                    fresh = await _export_cookies(state["session_path"])
+                    await _add_cookies_robust(state["ctx"], fresh, log=alog)
+                    _save_cookies_file(state["session_path"], fresh)
+                except Exception as e:
+                    alog("pre-delete cookie refresh failed:", str(e)[:60])
             try:
                 ok, detail = await main_session.delete_account(timeout=90, log=alog)
             except Exception as e:
