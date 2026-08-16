@@ -913,11 +913,14 @@ class DolaSession:
         def _on_resp(resp):
             try:
                 u = resp.url
-                if "/passport/web/cancel/confirm/" in u:
+                # Match BOTH the web flow (/passport/web/cancel/confirm/) and the plain
+                # variant (/passport/cancel/confirm/) — dola's passport SDK uses the web
+                # one for the /delete-account page, but this stays correct if that changes.
+                if "cancel/confirm/" in u and "/passport/" in u:
                     state["confirm_status"] = resp.status
                     if resp.status == 200:
                         state["confirm_ok"] = True
-                elif "/passport/cancel/user_check/" in u:
+                elif "cancel/user_check/" in u and "/passport/" in u:
                     state["user_check_status"] = resp.status
             except Exception:
                 pass
