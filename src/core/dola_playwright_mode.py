@@ -696,6 +696,23 @@ class PlaywrightDolaModeManager:
                         await self._requeue(job)
                         self.qm.signals.job_updated.emit(job_id, "pending", "", "error_requeued")
                         await asyncio.sleep(6)
+                except Exception as e:
+                    # ANY other error (e.g. a Playwright network 'socket hang up' during
+                    # download, a CDP blip) must NOT propagate — it would crash the whole
+                    # worker and take down all this account's tabs. Treat it like a transient
+                    # DolaError: requeue + retry the SAME job, give up only after repeats.
+                    state["busy"] -= 1
+                    attempts[job_id] = attempts.get(job_id, 0) + 1
+                    if attempts[job_id] > 4:
+                        update_job_status(job_id, "failed", account=acct, error=str(e)[:100])
+                        self.qm.signals.job_updated.emit(job_id, "failed", acct, str(e)[:100])
+                        self._log(f"[DolaPW][{tag}] failed {attempts[job_id]}x ({str(e)[:60]}) — giving up")
+                        self._settle(job_id)
+                    else:
+                        self._log(f"[DolaPW][{tag}] transient error ({str(e)[:60]}) → requeue + retry")
+                        await self._requeue(job)
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "error_requeued")
+                        await asyncio.sleep(6)
             finally:
                 self._job_q.task_done()
 
@@ -704,7 +721,7 @@ class PlaywrightDolaModeManager:
         """Wrapper so a burn-recreate crash retires ONE account cleanly instead of
         propagating out of the tab loop and killing the whole worker."""
         try:
-            await self._safe_recreate(acct, main_session, state)
+            await self._account_recreate(acct, main_session, state)
         except Exception as e:
             self._log(f"[DolaPW][{acct}] recreate crashed ({str(e)[:60]}) → retiring account")
             state["alive"] = False

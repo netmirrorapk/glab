@@ -1142,14 +1142,25 @@ class DolaSession:
                 await asyncio.sleep(delay)
         raise DolaError("get_play_info returned no plain mp4 url after retries")
 
-    async def download(self, url: str, out_path: str) -> int:
-        """Download via the browser network stack (shares auth/cookies). Returns bytes written."""
-        resp = await self.ctx.request.get(url)
-        data = await resp.body()
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        with open(out_path, "wb") as f:
-            f.write(data)
-        return len(data)
+    async def download(self, url: str, out_path: str, tries: int = 3) -> int:
+        """Download via the browser network stack (shares auth/cookies). Returns bytes
+        written. Retries transient network blips (e.g. 'socket hang up' from the dola CDN)
+        a few times so a flaky download does NOT force a whole re-generation — the video is
+        already made; only the transfer failed."""
+        last = None
+        for i in range(max(1, tries)):
+            try:
+                resp = await self.ctx.request.get(url)
+                data = await resp.body()
+                os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+                with open(out_path, "wb") as f:
+                    f.write(data)
+                return len(data)
+            except Exception as e:
+                last = e
+                if i < tries - 1:
+                    await asyncio.sleep(2 * (i + 1))
+        raise DolaError(f"download failed after {tries} tries: {str(last)[:100]}")
 
     # ---- high-level convenience ------------------------------------------------
     async def generate_one(self, prompt: str, out_path: str, *, model="seedance_v2.0",
