@@ -1032,6 +1032,18 @@ class DolaSession:
                 log(f"  …still waiting for the 'Delete Now' button to render ({i}s)")
             await asyncio.sleep(1.0)
         if not clicked:
+            # Distinguish the REAL cause: if we're stuck on Google's own login/account
+            # chooser (accounts.google.com), the account's Google session is SIGNED OUT —
+            # cookies alone couldn't re-auth it, so 'Delete Now' can never render. Report
+            # that clearly (the fix is a full re-login) instead of the misleading
+            # "button not found". Otherwise dump the page for inspection.
+            try:
+                cur = str(self.page.url or "").lower()
+            except Exception:
+                cur = ""
+            if "accounts.google.com" in cur or "signin" in cur:
+                return False, ("Google session SIGNED OUT for this account — re-auth "
+                               "couldn't complete (run: dola_profiles.py login --as <acct>)")
             await self._dump_clickables(log)   # so we can see what the page actually shows
             return False, "could not find the 'Delete Now' button on /delete-account"
         if dry_run:
