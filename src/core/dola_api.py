@@ -532,26 +532,36 @@ class DolaSession:
     # ---- creative-video SKILL route (toggle: dola_use_skill_flow) --------------
     @staticmethod
     def _build_skill_text(prompt: str, ratio: str, duration: int) -> str:
-        """`/creative-video <prompt>, <ratio>, <duration>s`. The agent parses the ratio
-        and duration from natural language (there is no ability_param on this route), and
-        rewrites the prompt cinematically before generating."""
+        """`/creative-video <prompt>[, <ratio>][, <duration>s]`. The agent parses the ratio
+        and duration from natural language and rewrites the prompt cinematically. Because
+        the prompt itself may already state its own ratio/duration (e.g. '16:9 widescreen'
+        or 'Prompt 1 (12s)'), we are PROMPT-DRIVEN: only append the global ratio/duration
+        that the prompt does NOT already specify, so a prompt's own dimensions win instead
+        of being overridden. (Duration is still capped by dola's platform limit — free tier
+        tops out at ~10s regardless of what the prompt asks for.)"""
         p = str(prompt or "")
         while re.match(r"(?i)^\s*/?creative-video[:,\s]+", p):
             p = re.sub(r"(?i)^\s*/?creative-video[:,\s]+", "", p)
         while re.match(r"(?i)^\s*generated video:\s*", p):
             p = re.sub(r"(?i)^\s*generated video:\s*", "", p)
-        p = re.sub(r"\s*,\s*\d{1,2}\s*:\s*\d{1,2}\s*$", "", p).strip()
-        parts = [p]
+        p = p.strip()
+        # Already stated in the prompt? (ratio like 16:9 ; duration like 12s / 15 sec)
+        has_ratio = re.search(r"\b\d{1,2}\s*:\s*\d{1,2}\b", p) is not None
+        has_dur = re.search(r"\b\d{1,3}\s*(?:s|sec|secs|second|seconds)\b", p, re.I) is not None
+        tail = []
         r = str(ratio or "").strip()
-        if r:
-            parts.append(r)
+        if r and not has_ratio:
+            tail.append(r)
         try:
             d = int(duration)
         except (TypeError, ValueError):
             d = 0
-        if d:
-            parts.append(f"{d}s")
-        return "/" + CREATIVE_VIDEO_SKILL + " " + ", ".join(parts)
+        if d and not has_dur:
+            tail.append(f"{d}s")
+        text = "/" + CREATIVE_VIDEO_SKILL + " " + p
+        if tail:
+            text += ", " + ", ".join(tail)
+        return text
 
     def _text_message(self, text: str) -> tuple:
         """A single text content-block message; returns (message_dict, local_message_id)."""
