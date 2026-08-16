@@ -355,6 +355,10 @@ class PlaywrightDolaModeManager:
         # the prompt cinematically, auto-confirmed) instead of the direct ability route.
         # OFF by default — the ability route is the proven fast one-shot path.
         self._use_skill = self._bool_setting("dola_use_skill_flow", "0")
+        # Toggle (skill route only): take each video's length from the prompt itself
+        # (e.g. 'Prompt 1 (12s)' -> 12s, '8 sec' -> 8s), clamped to dola's 15s max,
+        # instead of the fixed Dur dropdown. OFF = use the Dur setting for every job.
+        self._prompt_duration = self._bool_setting("dola_prompt_duration", "0")
         # If cloak is requested but the CloakBrowser binary isn't available, fall
         # back to real Chrome (off-screen when headless) so the mode still runs.
         if self._cloak:
@@ -374,7 +378,8 @@ class PlaywrightDolaModeManager:
         self._log(f"[DolaPW] accounts={[a['name'] for a in accounts]} | cloak={self._cloak} "
                   f"headless={self._headless} | tabs/account={self._slots} | model={self._model} "
                   f"ratio={self._ratio} duration={self._duration}s | auto_delete={self._auto_delete} "
-                  f"| skill_flow={self._use_skill} tab_stagger={self._tab_stagger}s")
+                  f"| skill_flow={self._use_skill} prompt_duration={self._prompt_duration} "
+                  f"tab_stagger={self._tab_stagger}s")
 
         tasks = [asyncio.create_task(self._feeder()),
                  asyncio.create_task(self._monitor())]
@@ -582,7 +587,8 @@ class PlaywrightDolaModeManager:
                 try:
                     await session.generate_one(prompt, out_path, model=model, ratio=ratio,
                                                duration=self._duration, timeout=GEN_TIMEOUT,
-                                               use_skill=self._use_skill, ref_image=(ref_path or None))
+                                               use_skill=self._use_skill, ref_image=(ref_path or None),
+                                               prompt_duration=self._prompt_duration)
                     state["busy"] -= 1
                     # auto-remove the "Dola AI" watermark (in-place, async, ~<1s)
                     if self._remove_wm:

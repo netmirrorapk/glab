@@ -531,33 +531,54 @@ class DolaSession:
 
     # ---- creative-video SKILL route (toggle: dola_use_skill_flow) --------------
     @staticmethod
-    def _build_skill_text(prompt: str, ratio: str, duration: int) -> str:
-        """`/creative-video <prompt>[, <ratio>][, <duration>s]`. The agent parses the ratio
-        and duration from natural language and rewrites the prompt cinematically. Because
-        the prompt itself may already state its own ratio/duration (e.g. '16:9 widescreen'
-        or 'Prompt 1 (12s)'), we are PROMPT-DRIVEN: only append the global ratio/duration
-        that the prompt does NOT already specify, so a prompt's own dimensions win instead
-        of being overridden. (Duration is still capped by dola's platform limit — free tier
-        tops out at ~10s regardless of what the prompt asks for.)"""
+    def _parse_prompt_duration(text: str):
+        """Best-effort intended video length (seconds) stated in a prompt: an explicit
+        'N sec(onds)', a '(Ns)' label like 'Prompt 1 (12s)', or the largest scene
+        timestamp (e.g. '9-12s' -> 12). Returns an int in [3, 15] or None."""
+        t = str(text or "")
+        m = (re.search(r"(\d{1,2})\s*(?:seconds|second|secs|sec)\b", t, re.I)
+             or re.search(r"\((\d{1,2})\s*s\)", t, re.I))
+        if m:
+            return max(3, min(15, int(m.group(1))))
+        ts = [int(x) for x in re.findall(r"(\d{1,2})\s*s\b", t)]
+        return max(3, min(15, max(ts))) if ts else None
+
+    @staticmethod
+    def _build_skill_text(prompt: str, ratio: str, duration: int,
+                          prompt_duration: bool = False) -> str:
+        """`/creative-video <prompt>[, <ratio>][, <duration>]`. The agent parses ratio and
+        duration from natural language and rewrites the prompt cinematically.
+        - Ratio: PROMPT-DRIVEN — only append the global ratio if the prompt doesn't state one.
+        - Duration: if `prompt_duration` is True, use the EXACT length stated in the prompt
+          (e.g. 'Prompt 1 (12s)' -> '12 seconds', '9-12s' timeline -> '12 seconds'), clamped
+          to dola's 15s max; fall back to the global only when the prompt states nothing.
+          If `prompt_duration` is False, append the global duration unless the prompt already
+          states one (so an explicit '15 sec' still wins)."""
         p = str(prompt or "")
         while re.match(r"(?i)^\s*/?creative-video[:,\s]+", p):
             p = re.sub(r"(?i)^\s*/?creative-video[:,\s]+", "", p)
         while re.match(r"(?i)^\s*generated video:\s*", p):
             p = re.sub(r"(?i)^\s*generated video:\s*", "", p)
         p = p.strip()
-        # Already stated in the prompt? (ratio like 16:9 ; duration like 12s / 15 sec)
         has_ratio = re.search(r"\b\d{1,2}\s*:\s*\d{1,2}\b", p) is not None
-        has_dur = re.search(r"\b\d{1,3}\s*(?:s|sec|secs|second|seconds)\b", p, re.I) is not None
         tail = []
         r = str(ratio or "").strip()
         if r and not has_ratio:
             tail.append(r)
         try:
-            d = int(duration)
+            d_global = int(duration)
         except (TypeError, ValueError):
-            d = 0
-        if d and not has_dur:
-            tail.append(f"{d}s")
+            d_global = 0
+        if prompt_duration:
+            n = DolaSession._parse_prompt_duration(p)
+            if n:
+                tail.append(f"{n} seconds")          # exact per-prompt length, stated clearly
+            elif d_global:
+                tail.append(f"{d_global}s")          # no length in prompt -> global fallback
+        else:
+            has_dur = re.search(r"\b\d{1,3}\s*(?:s|sec|secs|second|seconds)\b", p, re.I) is not None
+            if d_global and not has_dur:
+                tail.append(f"{d_global}s")
         text = "/" + CREATIVE_VIDEO_SKILL + " " + p
         if tail:
             text += ", " + ", ".join(tail)
@@ -651,14 +672,16 @@ class DolaSession:
         return att
 
     async def submit_skill(self, prompt: str, ratio: str = "9:16", duration: int = 10,
-                           attachment: dict | None = None) -> tuple:
+                           attachment: dict | None = None,
+                           prompt_duration: bool = False) -> tuple:
         """Submit a creative-video SKILL request. The agent replies asking to confirm
         (it does NOT generate yet). Returns (conversation_id, section_id, raw).
         If `attachment` is given (an uploaded reference image), it is prepended as a
         separate attachment message and the task is threaded off THAT message id
-        (reference-image → video)."""
+        (reference-image → video). `prompt_duration` makes the length come from the
+        prompt itself (see _build_skill_text)."""
         base = prompt if str(prompt or "").strip() else ("animate the reference image" if attachment else prompt)
-        text = self._build_skill_text(base, ratio, duration)
+        text = self._build_skill_text(base, ratio, duration, prompt_duration=prompt_duration)
         text_msg, text_local = self._text_message(text)
         if attachment:
             att_msg, att_local = self._attachment_message(attachment)
@@ -1131,7 +1154,7 @@ class DolaSession:
     # ---- high-level convenience ------------------------------------------------
     async def generate_one(self, prompt: str, out_path: str, *, model="seedance_v2.0",
                            ratio="9:16", duration=10, timeout=720, use_skill=False,
-                           ref_image: str | None = None) -> str:
+                           ref_image: str | None = None, prompt_duration: bool = False) -> str:
         """Full pipeline for a single prompt -> saved mp4. Returns out_path.
         use_skill=True routes through the creative-video SKILL (agent rewrites the prompt
         cinematically, then we auto-confirm) instead of the direct ability route.
@@ -1144,7 +1167,8 @@ class DolaSession:
                 attachment = await self.upload_reference_image(ref_image)
             self._log(f"submit (skill /creative-video{'+ref' if attachment else ''}): {str(prompt)[:50]}...")
             conv, section, _raw0 = await self.submit_skill(prompt, ratio=ratio, duration=duration,
-                                                           attachment=attachment)
+                                                           attachment=attachment,
+                                                           prompt_duration=prompt_duration)
             try:
                 await self.page.goto(f"{DOLA_ORIGIN}/chat/{conv}", wait_until="domcontentloaded")
             except Exception:

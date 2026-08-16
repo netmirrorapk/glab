@@ -3622,6 +3622,7 @@ class MainWindow(QMainWindow):
             self._dola_autodelete_checks = []
             self._dola_watermark_checks = []
             self._dola_skillflow_checks = []
+            self._dola_promptdur_checks = []
         try:
             cur_model = str(get_setting("dola_model", "seedance_v2.0") or "seedance_v2.0")
             cur_ratio = str(get_setting("dola_ratio", "9:16") or "9:16")
@@ -3691,10 +3692,21 @@ class MainWindow(QMainWindow):
             self._dola_skillflow_checks.append(chk_sk)
             chk_sk.toggled.connect(lambda checked=False: self._on_dola_skillflow_toggled(checked))
 
+            chk_pd = QCheckBox("Prompt duration")
+            chk_pd.setToolTip(
+                "Skill mode only: take each video's length from the PROMPT itself — e.g. "
+                "'Prompt 1 (12s)' → 12s, '8 sec' → 8s, or the last scene timestamp — instead "
+                "of the fixed Dur setting. Clamped to dola's 15s max. OFF = every job uses the "
+                "Dur dropdown. (dola makes exact-length videos on the skill route.)"
+            )
+            chk_pd.setChecked(str(get_setting("dola_prompt_duration", "0") or "0").strip() in ("1", "true", "on", "yes"))
+            self._dola_promptdur_checks.append(chk_pd)
+            chk_pd.toggled.connect(lambda checked=False: self._on_dola_promptdur_toggled(checked))
+
             lbl = self._make_setting_label("Dola:")
             field = self._make_inline_row(
                 m, self._make_setting_label("Ratio:"), r,
-                self._make_setting_label("Dur:"), d, chk, chk_wm, chk_sk,
+                self._make_setting_label("Dur:"), d, chk, chk_wm, chk_sk, chk_pd,
             )
             form.addRow(lbl, field)
             lbl.setVisible(False)
@@ -3735,6 +3747,18 @@ class MainWindow(QMainWindow):
         try:
             set_setting("dola_use_skill_flow", "1" if checked else "0")
             for c in getattr(self, "_dola_skillflow_checks", []):
+                if c.isChecked() != bool(checked):
+                    c.blockSignals(True)
+                    c.setChecked(bool(checked))
+                    c.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_dola_promptdur_toggled(self, checked):
+        """Persist the 'take duration from the prompt' opt-in and mirror across tabs."""
+        try:
+            set_setting("dola_prompt_duration", "1" if checked else "0")
+            for c in getattr(self, "_dola_promptdur_checks", []):
                 if c.isChecked() != bool(checked):
                     c.blockSignals(True)
                     c.setChecked(bool(checked))
