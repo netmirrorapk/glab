@@ -322,7 +322,7 @@ class PlaywrightDolaModeManager:
         self._ratio = _resolve_dola_ratio(get_setting("dola_ratio", "9:16"))
         self._duration = _resolve_dola_duration(get_setting("dola_duration", "10"))
         try:
-            self._slots = max(1, min(8, int(str(get_setting("slots_per_account", "1") or "1"))))
+            self._slots = max(1, min(16, int(str(get_setting("slots_per_account", "1") or "1"))))
         except Exception:
             self._slots = 1
         # Honor the app's "Browser & Stealth" settings so the visible choices drive
@@ -334,6 +334,13 @@ class PlaywrightDolaModeManager:
         self._headless = (cdisp == "headless") if self._cloak else (bmode == "headless")
         self._auto_delete = self._bool_setting("dola_auto_delete", "1")
         self._remove_wm = self._bool_setting("dola_remove_watermark", "1")
+        # Seconds to stagger each tab's FIRST submit so N tabs on one account don't fire
+        # N sends in one burst (the #1 trigger for dola's "high demand" throttle). With
+        # 10 tabs @ 2s that spreads the first round over ~18s. 0 = all at once.
+        try:
+            self._tab_stagger = max(0.0, float(str(get_setting("dola_tab_stagger", "2") or "2")))
+        except Exception:
+            self._tab_stagger = 2.0
         # Toggle: route video gen through the newer creative-video SKILL (agent rewrites
         # the prompt cinematically, auto-confirmed) instead of the direct ability route.
         # OFF by default — the ability route is the proven fast one-shot path.
@@ -357,7 +364,7 @@ class PlaywrightDolaModeManager:
         self._log(f"[DolaPW] accounts={[a['name'] for a in accounts]} | cloak={self._cloak} "
                   f"headless={self._headless} | tabs/account={self._slots} | model={self._model} "
                   f"ratio={self._ratio} duration={self._duration}s | auto_delete={self._auto_delete} "
-                  f"| skill_flow={self._use_skill}")
+                  f"| skill_flow={self._use_skill} tab_stagger={self._tab_stagger}s")
 
         tasks = [asyncio.create_task(self._feeder()),
                  asyncio.create_task(self._monitor())]
@@ -504,6 +511,10 @@ class PlaywrightDolaModeManager:
     # ── per-tab generation loop ────────────────────────────────────────────────
     async def _tab_loop(self, acct, tab_i, session, main_session, state) -> None:
         tag = f"{acct}#t{tab_i + 1}"
+        # Spread the tabs' first submits so N tabs don't burst N sends at once
+        # (avoids tripping dola's "high demand" send-throttle).
+        if tab_i and getattr(self, "_tab_stagger", 0):
+            await asyncio.sleep(tab_i * self._tab_stagger)
         try:
             await session._ensure_base()
         except Exception:
