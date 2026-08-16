@@ -531,10 +531,16 @@ class PlaywrightDolaModeManager:
                     self.qm.signals.job_updated.emit(job_id, "failed", acct, "empty_prompt")
                     self._settle(job_id)
                     continue
-                if _job_ref(job) and not self._ref_warned:
-                    self._ref_warned = True
-                    self._log("[DolaPW] Note: reference-image→video is not supported in "
-                              "Playwright mode yet — generating text-only for ref jobs.")
+                # reference-image → video: upload the local image via dola's page
+                # uploader and attach it (forces the creative-video skill route). Only
+                # local files work; a URL/missing file falls back to text-only.
+                ref_path = _job_ref(job)
+                if ref_path and not os.path.isfile(ref_path):
+                    if not self._ref_warned:
+                        self._ref_warned = True
+                        self._log(f"[DolaPW] Note: reference image not a local file ({ref_path[:60]}) "
+                                  "— generating text-only for that job.")
+                    ref_path = ""
                 ratio = job.get("video_ratio") if job.get("video_ratio") in _ALLOWED_RATIO else self._ratio
                 model = job.get("video_model") if job.get("video_model") in _ALLOWED_MODELS else self._model
 
@@ -555,7 +561,7 @@ class PlaywrightDolaModeManager:
                 try:
                     await session.generate_one(prompt, out_path, model=model, ratio=ratio,
                                                duration=self._duration, timeout=GEN_TIMEOUT,
-                                               use_skill=self._use_skill)
+                                               use_skill=self._use_skill, ref_image=(ref_path or None))
                     state["busy"] -= 1
                     # auto-remove the "Dola AI" watermark (in-place, async, ~<1s)
                     if self._remove_wm:

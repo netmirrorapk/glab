@@ -568,19 +568,105 @@ class DolaSession:
         }
         return msg, local_msg
 
-    async def submit_skill(self, prompt: str, ratio: str = "9:16", duration: int = 10) -> tuple:
+    def _attachment_message(self, att: dict) -> tuple:
+        """An image-attachment message (block_type 10052) referencing an image already
+        uploaded to dola's ImageX (att = {uri, name, width, height}). Returns
+        (message_dict, local_message_id). Used for reference-image → video."""
+        local_msg = str(uuid.uuid4())
+        block = {
+            "block_type": 10052,
+            "content": {"attachment_block": {"attachments": [{
+                "type": 1,
+                "identifier": str(uuid.uuid4()),
+                "image": {"name": att.get("name", ""), "uri": att["uri"],
+                          "image_ori": {"url": "", "width": int(att.get("width") or 0),
+                                        "height": int(att.get("height") or 0),
+                                        "format": "", "url_formats": {}}},
+                "parse_state": 0, "review_state": 1, "upload_status": 1, "progress": 100, "src": "",
+            }]}, "pc_event_block": ""},
+            "block_id": str(uuid.uuid4()), "parent_id": "", "meta_info": [], "append_fields": [],
+        }
+        return {"local_message_id": local_msg, "content_block": [block], "message_status": 0}, local_msg
+
+    async def upload_reference_image(self, image_path: str, timeout: int = 60) -> dict:
+        """Upload a LOCAL reference image through dola's own page uploader (which signs
+        the ImageX Apply→PUT→Commit calls with the browser's STS creds — we can't sign
+        those from Python). Returns {uri, name, width, height} for _attachment_message.
+        Reliable because the web app does the signing exactly as a real user would."""
+        if not image_path or not os.path.isfile(image_path):
+            raise DolaError(f"reference image not found: {image_path}")
+        # Make sure the composer (with its file <input>) is present.
+        try:
+            if "/chat" not in (self.page.url or ""):
+                await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+        inp = await self.page.query_selector('input[type="file"]')
+        if inp is None:
+            # reveal a hidden input by clicking an attach/upload control
+            for sel in ('button[aria-label*="attach" i]', 'button[aria-label*="upload" i]',
+                        'button[aria-label*="image" i]', '[data-testid*="upload"]',
+                        '[class*="upload"] button', '[class*="attach"]'):
+                try:
+                    b = await self.page.query_selector(sel)
+                    if b:
+                        await b.click()
+                        await asyncio.sleep(0.6)
+                        inp = await self.page.query_selector('input[type="file"]')
+                        if inp:
+                            break
+                except Exception:
+                    pass
+        if inp is None:
+            raise DolaError("could not find dola's file-upload input for the reference image")
+        # Arm the response waiter BEFORE setting the file so we don't miss the Commit.
+        try:
+            async with self.page.expect_response(
+                    lambda r: "CommitImageUpload" in r.url, timeout=timeout * 1000) as rinfo:
+                await inp.set_input_files(image_path)
+            resp = await rinfo.value
+            body = await resp.text()
+        except Exception as e:
+            raise DolaError(f"reference image upload failed / no Commit response: {str(e)[:120]}")
+        m = re.search(r'"Uri":"(tos-[^"]+)"', body)
+        if not m:
+            raise DolaError("reference image upload: no Uri in CommitImageUpload response")
+        uri = m.group(1)
+        w = re.search(r'"ImageWidth":(\d+)', body)
+        h = re.search(r'"ImageHeight":(\d+)', body)
+        att = {"uri": uri, "name": os.path.basename(image_path),
+               "width": int(w.group(1)) if w else 0, "height": int(h.group(1)) if h else 0}
+        self._log(f"reference image uploaded → {uri} ({att['width']}x{att['height']})")
+        return att
+
+    async def submit_skill(self, prompt: str, ratio: str = "9:16", duration: int = 10,
+                           attachment: dict | None = None) -> tuple:
         """Submit a creative-video SKILL request. The agent replies asking to confirm
-        (it does NOT generate yet). Returns (conversation_id, section_id, raw)."""
-        text = self._build_skill_text(prompt, ratio, duration)
-        msg, local_msg = self._text_message(text)
+        (it does NOT generate yet). Returns (conversation_id, section_id, raw).
+        If `attachment` is given (an uploaded reference image), it is prepended as a
+        separate attachment message and the task is threaded off THAT message id
+        (reference-image → video)."""
+        base = prompt if str(prompt or "").strip() else ("animate the reference image" if attachment else prompt)
+        text = self._build_skill_text(base, ratio, duration)
+        text_msg, text_local = self._text_message(text)
+        if attachment:
+            att_msg, att_local = self._attachment_message(attachment)
+            messages = [att_msg, text_msg]
+            thread_id = att_local
+            collection_id = str(uuid.uuid4())
+        else:
+            messages = [text_msg]
+            thread_id = text_local
+            collection_id = ""
         body = {
             "client_meta": {"local_conversation_id": f"local_{int(time.time() * 1000)}",
                             "conversation_id": "", "bot_id": BOT_ID,
                             "last_section_id": "", "last_message_index": None},
-            "messages": [msg],
-            "option": _skill_option(local_msg, need_create=True, selected=True),
+            "messages": messages,
+            "option": _skill_option(thread_id, need_create=True, selected=True),
             "user_context": [],
-            "ext": {"use_deep_think": "4", "sub_conv_firstmet_type": "1", "collection_id": "",
+            "ext": {"use_deep_think": "4", "sub_conv_firstmet_type": "1", "collection_id": collection_id,
                     "conversation_init_option": "{\"need_ack_conversation\":true}",
                     "commerce_credit_config_enable": "0"},
         }
@@ -1034,13 +1120,21 @@ class DolaSession:
 
     # ---- high-level convenience ------------------------------------------------
     async def generate_one(self, prompt: str, out_path: str, *, model="seedance_v2.0",
-                           ratio="9:16", duration=10, timeout=720, use_skill=False) -> str:
+                           ratio="9:16", duration=10, timeout=720, use_skill=False,
+                           ref_image: str | None = None) -> str:
         """Full pipeline for a single prompt -> saved mp4. Returns out_path.
         use_skill=True routes through the creative-video SKILL (agent rewrites the prompt
-        cinematically, then we auto-confirm) instead of the direct ability route."""
-        if use_skill:
-            self._log(f"submit (skill /creative-video): {prompt[:50]}...")
-            conv, section, _raw0 = await self.submit_skill(prompt, ratio=ratio, duration=duration)
+        cinematically, then we auto-confirm) instead of the direct ability route.
+        ref_image (a LOCAL path) turns this into reference-image → video: the image is
+        uploaded via dola's page uploader and attached — this REQUIRES the skill route."""
+        if use_skill or ref_image:
+            attachment = None
+            if ref_image:
+                self._log(f"uploading reference image: {os.path.basename(str(ref_image))}…")
+                attachment = await self.upload_reference_image(ref_image)
+            self._log(f"submit (skill /creative-video{'+ref' if attachment else ''}): {str(prompt)[:50]}...")
+            conv, section, _raw0 = await self.submit_skill(prompt, ratio=ratio, duration=duration,
+                                                           attachment=attachment)
             try:
                 await self.page.goto(f"{DOLA_ORIGIN}/chat/{conv}", wait_until="domcontentloaded")
             except Exception:

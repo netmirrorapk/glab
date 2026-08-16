@@ -119,12 +119,18 @@ async def run(args):
         except Exception:
             pass
 
+        ref = args.ref or None
+        if ref:
+            if not os.path.isfile(ref):
+                log(f"❌ reference image not found: {ref}")
+                return
+            log(f"reference image: {ref}")
         out = os.path.join(OUT_DIR, f"skilltest_{acct}_{int(time.time())}.mp4")
         t0 = time.time()
-        log(f"▶ generating (use_skill={use_skill})…")
+        log(f"▶ generating (use_skill={use_skill or bool(ref)}, ref={'yes' if ref else 'no'})…")
         await session.generate_one(args.prompt, out, ratio=args.ratio,
                                    duration=args.duration, timeout=args.timeout,
-                                   use_skill=use_skill)
+                                   use_skill=use_skill, ref_image=ref)
         dt = int(time.time() - t0)
         n = os.path.getsize(out) if os.path.exists(out) else 0
         log(f"✅ VIDEO SAVED in {dt}s — {n} bytes -> {out}")
@@ -171,6 +177,7 @@ async def run(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default="a cute cat walking gracefully across a sunny room")
+    ap.add_argument("--ref", default=None, help="LOCAL reference image path → reference-image→video (forces skill route)")
     ap.add_argument("--account", default=None, help="profile name (default: first in registry)")
     ap.add_argument("--ratio", default="9:16")
     ap.add_argument("--duration", type=int, default=10)
