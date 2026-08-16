@@ -4645,11 +4645,44 @@ class MainWindow(QMainWindow):
         self.btn_refresh_accs.setProperty("role", "secondary")
         self.btn_refresh_accs.clicked.connect(self.refresh_accounts)
 
+        # Quick tick/untick of the per-account "Use" column.
+        self.btn_dola_tick_all = QPushButton("Tick All")
+        self.btn_dola_tick_all.setProperty("role", "secondary")
+        self.btn_dola_tick_all.setToolTip("Tick 'Use' for every account (use all for generation).")
+        self.btn_dola_tick_all.clicked.connect(lambda: self._set_all_account_use(True))
+        self.btn_dola_untick_all = QPushButton("Untick All")
+        self.btn_dola_untick_all.setProperty("role", "secondary")
+        self.btn_dola_untick_all.setToolTip("Untick 'Use' for every account.")
+        self.btn_dola_untick_all.clicked.connect(lambda: self._set_all_account_use(False))
+
+        # "How many accounts to use" cap (of the ticked/eligible ones). 0 = All.
+        use_lbl = QLabel("Use accounts:")
+        self.cmb_dola_max_accounts = QComboBox()
+        self.cmb_dola_max_accounts.addItem("All", 0)
+        for _i in range(1, 41):
+            self.cmb_dola_max_accounts.addItem(str(_i), _i)
+        try:
+            _curmax = max(0, min(40, get_int_setting("dola_max_accounts", 0)))
+        except Exception:
+            _curmax = 0
+        _mi = self.cmb_dola_max_accounts.findData(_curmax)
+        if _mi >= 0:
+            self.cmb_dola_max_accounts.setCurrentIndex(_mi)
+        self.cmb_dola_max_accounts.setToolTip(
+            "How many accounts to actually use for generation, out of the ticked ones.\n"
+            "'All' = every ticked account. e.g. 5 = use only the first 5 ticked accounts.")
+        self.cmb_dola_max_accounts.currentIndexChanged.connect(self._on_dola_max_accounts_changed)
+
         self.btn_delete_acc = QPushButton("Delete Selected")
         self.btn_delete_acc.setProperty("role", "subtleDanger")
         self.btn_delete_acc.clicked.connect(self.delete_selected_account)
-        
+
         bottom_layout.addWidget(self.btn_refresh_accs)
+        bottom_layout.addWidget(self.btn_dola_tick_all)
+        bottom_layout.addWidget(self.btn_dola_untick_all)
+        bottom_layout.addSpacing(12)
+        bottom_layout.addWidget(use_lbl)
+        bottom_layout.addWidget(self.cmb_dola_max_accounts)
         bottom_layout.addStretch()
         bottom_layout.addWidget(self.btn_delete_acc)
         layout.addLayout(bottom_layout)
@@ -7021,6 +7054,27 @@ class MainWindow(QMainWindow):
             else:
                 enabled.discard(name)
             set_setting("dola_selected_accounts", "||".join(sorted(enabled)))
+        except Exception:
+            pass
+
+    def _on_dola_max_accounts_changed(self, *_):
+        """Persist 'how many accounts to use' (0 = All)."""
+        try:
+            n = self.cmb_dola_max_accounts.currentData()
+            set_setting("dola_max_accounts", str(int(n or 0)))
+        except Exception:
+            pass
+
+    def _set_all_account_use(self, checked):
+        """Tick/untick the 'Use' checkbox on every account row at once."""
+        try:
+            for row in range(self.acc_table.rowCount()):
+                cell = self.acc_table.cellWidget(row, 10)
+                if not cell:
+                    continue
+                chk = cell.findChild(QCheckBox)
+                if chk is not None and chk.isChecked() != bool(checked):
+                    chk.setChecked(bool(checked))
         except Exception:
             pass
 

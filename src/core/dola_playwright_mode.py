@@ -291,6 +291,16 @@ class PlaywrightDolaModeManager:
                                 "proxy": str(a.get("proxy") or "").strip()})
         except Exception:
             pass
+        # "how many accounts to use" cap (Account Manager). 0/unset = use all that
+        # passed the Use-tick filter above; otherwise use only the first N of them.
+        try:
+            maxn = int(str(get_setting("dola_max_accounts", "0") or "0"))
+        except Exception:
+            maxn = 0
+        if maxn > 0 and len(out) > maxn:
+            self._log(f"[DolaPW] using {maxn} of {len(out)} eligible account(s) "
+                      f"(dola_max_accounts={maxn})")
+            out = out[:maxn]
         return out
 
     def _out_path(self, job) -> str:
