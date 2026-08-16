@@ -11,6 +11,12 @@ DOLA_ORIGIN = "https://www.dola.com"
 START_URL = "https://www.dola.com/chat/create-image"
 BOT_ID = "7339470689562525703"                 # Dola assistant bot id (constant)
 VIDEO_ABILITY_TYPE = 17                          # skill_type 17 = video_generation
+# The newer "Skills" / general-agent route: `/creative-video <prompt>` invokes the
+# creative-video skill (a MoA agent that rewrites the prompt cinematically, then
+# asks to confirm before generating). Same /chat/completion endpoint + same polling;
+# only the request shape and the extra "yes" confirm differ from the ability route.
+CREATIVE_VIDEO_SKILL_ID = "294222337297"
+CREATIVE_VIDEO_SKILL = "creative-video"
 LOGIN_COOKIES = {"sessionid", "sid_tt", "sid_guard", "uid_tt", "sessionid_ss",
                  "passport_csrf_token", "sid_ucp_v1"}
 SIGN_PARAMS = {"msToken", "a_bogus", "X-Bogus", "_signature", "x-signature"}
@@ -181,6 +187,34 @@ def _full_option() -> dict:
         "recovery_option": {"is_recovery": False, "req_create_time_sec": now, "append_sse_event_scene": 0},
         "message_storage_type": 0, "related_deleted_message_ids": {},
     }
+
+
+def _skill_option(local_msg_id: str, *, need_create: bool, selected: bool) -> dict:
+    """`option` block for the creative-video SKILL route. Mirrors _full_option but adds
+    the general-agent fields dola's web UI sends: Deep-Think mode (4), agent_mode, and
+    general_task_param carrying the selected skill. On the confirm ("yes") turn the skill
+    is NOT re-selected (selected=False) and no new conversation is created."""
+    o = _full_option()
+    o["need_deep_think"] = 4
+    o["agent_mode"] = 1
+    o["need_create_conversation"] = need_create
+    o["general_task_param"] = {
+        "action": 0,
+        "thread_local_message_id": [local_msg_id],
+        "selected_skills": [CREATIVE_VIDEO_SKILL] if selected else [],
+        "skill_selections": ([{"name": CREATIVE_VIDEO_SKILL,
+                               "skill_id": CREATIVE_VIDEO_SKILL_ID, "skill_type": 2}]
+                             if selected else []),
+    }
+    o["model_config"] = {"model_item_key": "", "model_extra_params": {}}
+    o["aggregate_params"] = {"model_item_key": "", "provider_id": ""}
+    return o
+
+
+def _max_conv_index(raw: str) -> int:
+    """Highest message index present in a pulled conversation chain (0 if none)."""
+    idx = [int(x) for x in re.findall(r'"index_in_conv":\s*\\*"?(\d+)', raw or "")]
+    return max(idx) if idx else 0
 
 
 class DolaSession:
@@ -494,6 +528,131 @@ class DolaSession:
         # trips the 15s "generation never started" fast-fail there. Only EXPLICIT
         # limit/refusal text (handled above) fails instantly at submit.
         return conv[0]
+
+    # ---- creative-video SKILL route (toggle: dola_use_skill_flow) --------------
+    @staticmethod
+    def _build_skill_text(prompt: str, ratio: str, duration: int) -> str:
+        """`/creative-video <prompt>, <ratio>, <duration>s`. The agent parses the ratio
+        and duration from natural language (there is no ability_param on this route), and
+        rewrites the prompt cinematically before generating."""
+        p = str(prompt or "")
+        while re.match(r"(?i)^\s*/?creative-video[:,\s]+", p):
+            p = re.sub(r"(?i)^\s*/?creative-video[:,\s]+", "", p)
+        while re.match(r"(?i)^\s*generated video:\s*", p):
+            p = re.sub(r"(?i)^\s*generated video:\s*", "", p)
+        p = re.sub(r"\s*,\s*\d{1,2}\s*:\s*\d{1,2}\s*$", "", p).strip()
+        parts = [p]
+        r = str(ratio or "").strip()
+        if r:
+            parts.append(r)
+        try:
+            d = int(duration)
+        except (TypeError, ValueError):
+            d = 0
+        if d:
+            parts.append(f"{d}s")
+        return "/" + CREATIVE_VIDEO_SKILL + " " + ", ".join(parts)
+
+    def _text_message(self, text: str) -> tuple:
+        """A single text content-block message; returns (message_dict, local_message_id)."""
+        local_msg = str(uuid.uuid4())
+        msg = {
+            "local_message_id": local_msg,
+            "content_block": [{
+                "block_type": 10000,
+                "content": {"text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
+                            "pc_event_block": ""},
+                "block_id": str(uuid.uuid4()), "parent_id": "", "meta_info": [], "append_fields": [],
+            }],
+            "message_status": 0,
+        }
+        return msg, local_msg
+
+    async def submit_skill(self, prompt: str, ratio: str = "9:16", duration: int = 10) -> tuple:
+        """Submit a creative-video SKILL request. The agent replies asking to confirm
+        (it does NOT generate yet). Returns (conversation_id, section_id, raw)."""
+        text = self._build_skill_text(prompt, ratio, duration)
+        msg, local_msg = self._text_message(text)
+        body = {
+            "client_meta": {"local_conversation_id": f"local_{int(time.time() * 1000)}",
+                            "conversation_id": "", "bot_id": BOT_ID,
+                            "last_section_id": "", "last_message_index": None},
+            "messages": [msg],
+            "option": _skill_option(local_msg, need_create=True, selected=True),
+            "user_context": [],
+            "ext": {"use_deep_think": "4", "sub_conv_firstmet_type": "1", "collection_id": "",
+                    "conversation_init_option": "{\"need_ack_conversation\":true}",
+                    "commerce_credit_config_enable": "0"},
+        }
+        r = await self.pf("/chat/completion", body)
+        if r["status"] in (429, 503):
+            raise HighDemand(f"skill submit HTTP {r['status']} — high demand / server busy")
+        if r["status"] != 200:
+            raise DolaError(f"skill submit failed: HTTP {r['status']}: {r['body'][:200]}")
+        raw = r["body"] or ""
+        verdict = _classify_reply(raw)
+        if verdict == "refused":
+            raise GenerationRefused("dola refused/moderated this prompt")
+        if verdict == "limit":
+            raise DailyLimitReached("daily video-generation limit reached / no points left")
+        if verdict == "busy":
+            raise HighDemand("dola under high demand at skill submit — transient, retry same account")
+        conv = re.findall(r'"conversation_id":"(\d+)"', raw)
+        if not conv:
+            raise DolaError("skill submit ok but no conversation_id in SSE")
+        section = re.search(r'"section_id":"(\d+)"', raw)
+        return conv[0], (section.group(1) if section else ""), raw
+
+    async def _await_skill_ready(self, conv_id: str, query_idx: int = 1, timeout: int = 60) -> tuple:
+        """Wait for the agent's confirm turn to settle (or for it to start generating
+        outright). Returns (last_message_index, already_generating). Polls the chain and
+        treats the turn as 'done' once the message index has grown past the user's query
+        and stopped moving for two consecutive polls."""
+        deadline = time.time() + timeout
+        last_max, stable = query_idx, 0
+        while time.time() < deadline:
+            raw = await self._pull_single(conv_id)
+            low = raw.lower()
+            # already producing a video? (a real vid, or an ACTIVE loading block —
+            # not the schema's null placeholder) → no confirm needed.
+            if _extract_all_vids(raw) or 'creation_loading_block":{' in low or "generating video" in low:
+                return _max_conv_index(raw) or last_max, True
+            verdict = _classify_reply(raw)
+            if verdict == "refused":
+                raise GenerationRefused("dola refused/moderated this prompt")
+            if verdict == "limit":
+                raise DailyLimitReached("daily video-generation limit reached / no points left")
+            if verdict == "busy":
+                raise HighDemand("dola under high demand during skill confirm — transient, retry")
+            mx = _max_conv_index(raw)
+            if mx > query_idx:
+                if mx == last_max:
+                    stable += 1
+                    if stable >= 2:
+                        return mx, False
+                else:
+                    stable, last_max = 0, mx
+            await asyncio.sleep(2.0)
+        return last_max, False
+
+    async def confirm_skill(self, conv_id: str, section_id: str, last_index: int,
+                            text: str = "yes") -> str:
+        """Send the confirm ("yes") turn that actually triggers generation. Returns raw."""
+        msg, local_msg = self._text_message(text)
+        body = {
+            "client_meta": {"conversation_id": conv_id, "bot_id": BOT_ID,
+                            "last_section_id": section_id or "", "last_message_index": last_index},
+            "messages": [msg],
+            "option": _skill_option(local_msg, need_create=False, selected=False),
+            "user_context": [],
+            "ext": {"use_deep_think": "4", "collection_id": "", "commerce_credit_config_enable": "0"},
+        }
+        r = await self.pf("/chat/completion", body)
+        if r["status"] in (429, 503):
+            raise HighDemand(f"skill confirm HTTP {r['status']} — high demand / server busy")
+        if r["status"] != 200:
+            raise DolaError(f"skill confirm failed: HTTP {r['status']}: {r['body'][:200]}")
+        return r["body"] or ""
 
     async def _pull_single(self, conv_id: str) -> str:
         body = {"cmd": 3100, "uplink_body": {"pull_singe_chain_uplink_body": {
@@ -875,8 +1034,30 @@ class DolaSession:
 
     # ---- high-level convenience ------------------------------------------------
     async def generate_one(self, prompt: str, out_path: str, *, model="seedance_v2.0",
-                           ratio="9:16", duration=10, timeout=720) -> str:
-        """Full pipeline for a single prompt -> saved mp4. Returns out_path."""
+                           ratio="9:16", duration=10, timeout=720, use_skill=False) -> str:
+        """Full pipeline for a single prompt -> saved mp4. Returns out_path.
+        use_skill=True routes through the creative-video SKILL (agent rewrites the prompt
+        cinematically, then we auto-confirm) instead of the direct ability route."""
+        if use_skill:
+            self._log(f"submit (skill /creative-video): {prompt[:50]}...")
+            conv, section, _raw0 = await self.submit_skill(prompt, ratio=ratio, duration=duration)
+            try:
+                await self.page.goto(f"{DOLA_ORIGIN}/chat/{conv}", wait_until="domcontentloaded")
+            except Exception:
+                pass
+            # Snapshot BEFORE the agent generates so wait_for_video only accepts the new vid.
+            seen_before = await self.snapshot_vids(conv)
+            last_index, already = await self._await_skill_ready(conv)
+            if not already:
+                self._log(f"conversation_id={conv}; auto-confirming (\"yes\") to start generation…")
+                await self.confirm_skill(conv, section, last_index, "yes")
+            else:
+                self._log(f"conversation_id={conv}; agent generating directly (no confirm needed)…")
+            self._log(f"{len(seen_before)} existing vid(s) ignored; waiting for new video...")
+            vid, msg = await self.wait_for_video(conv, timeout=timeout, exclude=seen_before)
+            self._log(f"vid={vid}")
+            return await self._fetch_and_save(vid, msg, out_path)
+
         self._log(f"submit: {prompt[:50]}...")
         # Land the generation in a fresh conversation so we never pick up an old video…
         seen_before = set()
@@ -893,6 +1074,11 @@ class DolaSession:
         self._log(f"conversation_id={conv}; {len(seen_before)} existing vid(s) ignored; waiting for new video...")
         vid, msg = await self.wait_for_video(conv, timeout=timeout, exclude=seen_before)
         self._log(f"vid={vid}")
+        return await self._fetch_and_save(vid, msg, out_path)
+
+    async def _fetch_and_save(self, vid: str, msg: str, out_path: str) -> str:
+        """Resolve a finished vid to an mp4 URL, download it, validate it's a real
+        video, and return out_path. Shared by both the ability and skill routes."""
         try:
             url = await self.get_play_info(vid)
         except DolaError:

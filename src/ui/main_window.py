@@ -3621,6 +3621,7 @@ class MainWindow(QMainWindow):
             self._dola_dur_combos = []
             self._dola_autodelete_checks = []
             self._dola_watermark_checks = []
+            self._dola_skillflow_checks = []
         try:
             cur_model = str(get_setting("dola_model", "seedance_v2.0") or "seedance_v2.0")
             cur_ratio = str(get_setting("dola_ratio", "9:16") or "9:16")
@@ -3677,10 +3678,22 @@ class MainWindow(QMainWindow):
             self._dola_watermark_checks.append(chk_wm)
             chk_wm.toggled.connect(lambda checked=False: self._on_dola_watermark_toggled(checked))
 
+            chk_sk = QCheckBox("Skill mode")
+            chk_sk.setToolTip(
+                "Route video generation through dola's newer 'creative-video' skill "
+                "(/creative-video). The agent rewrites your short prompt into a detailed "
+                "cinematic one and is auto-confirmed ('yes'), often giving better videos "
+                "on the same free model. Slightly slower (extra confirm step). OFF = the "
+                "proven direct one-shot route. Works on free/burn accounts."
+            )
+            chk_sk.setChecked(str(get_setting("dola_use_skill_flow", "0") or "0").strip() in ("1", "true", "on", "yes"))
+            self._dola_skillflow_checks.append(chk_sk)
+            chk_sk.toggled.connect(lambda checked=False: self._on_dola_skillflow_toggled(checked))
+
             lbl = self._make_setting_label("Dola:")
             field = self._make_inline_row(
                 m, self._make_setting_label("Ratio:"), r,
-                self._make_setting_label("Dur:"), d, chk, chk_wm,
+                self._make_setting_label("Dur:"), d, chk, chk_wm, chk_sk,
             )
             form.addRow(lbl, field)
             lbl.setVisible(False)
@@ -3709,6 +3722,18 @@ class MainWindow(QMainWindow):
         try:
             set_setting("dola_remove_watermark", "1" if checked else "0")
             for c in getattr(self, "_dola_watermark_checks", []):
+                if c.isChecked() != bool(checked):
+                    c.blockSignals(True)
+                    c.setChecked(bool(checked))
+                    c.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_dola_skillflow_toggled(self, checked):
+        """Persist the dola creative-video skill-flow opt-in and mirror across tabs."""
+        try:
+            set_setting("dola_use_skill_flow", "1" if checked else "0")
+            for c in getattr(self, "_dola_skillflow_checks", []):
                 if c.isChecked() != bool(checked):
                     c.blockSignals(True)
                     c.setChecked(bool(checked))

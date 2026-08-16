@@ -334,6 +334,10 @@ class PlaywrightDolaModeManager:
         self._headless = (cdisp == "headless") if self._cloak else (bmode == "headless")
         self._auto_delete = self._bool_setting("dola_auto_delete", "1")
         self._remove_wm = self._bool_setting("dola_remove_watermark", "1")
+        # Toggle: route video gen through the newer creative-video SKILL (agent rewrites
+        # the prompt cinematically, auto-confirmed) instead of the direct ability route.
+        # OFF by default — the ability route is the proven fast one-shot path.
+        self._use_skill = self._bool_setting("dola_use_skill_flow", "0")
         # If cloak is requested but the CloakBrowser binary isn't available, fall
         # back to real Chrome (off-screen when headless) so the mode still runs.
         if self._cloak:
@@ -352,7 +356,8 @@ class PlaywrightDolaModeManager:
         self._n_accounts = len(accounts)
         self._log(f"[DolaPW] accounts={[a['name'] for a in accounts]} | cloak={self._cloak} "
                   f"headless={self._headless} | tabs/account={self._slots} | model={self._model} "
-                  f"ratio={self._ratio} duration={self._duration}s | auto_delete={self._auto_delete}")
+                  f"ratio={self._ratio} duration={self._duration}s | auto_delete={self._auto_delete} "
+                  f"| skill_flow={self._use_skill}")
 
         tasks = [asyncio.create_task(self._feeder()),
                  asyncio.create_task(self._monitor())]
@@ -549,7 +554,8 @@ class PlaywrightDolaModeManager:
                 state["busy"] += 1
                 try:
                     await session.generate_one(prompt, out_path, model=model, ratio=ratio,
-                                               duration=self._duration, timeout=GEN_TIMEOUT)
+                                               duration=self._duration, timeout=GEN_TIMEOUT,
+                                               use_skill=self._use_skill)
                     state["busy"] -= 1
                     # auto-remove the "Dola AI" watermark (in-place, async, ~<1s)
                     if self._remove_wm:
