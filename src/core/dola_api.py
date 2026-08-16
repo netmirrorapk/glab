@@ -28,7 +28,7 @@ DEFAULT_MODELS = {
     "ic_mini": "Seedance 1.0 Fast",
 }
 DEFAULT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9", "21:9"]
-DEFAULT_DURATIONS = ["5", "10"]
+DEFAULT_DURATIONS = ["5", "10", "15"]   # 15s = creative-video skill route only
 
 
 class DolaError(Exception):

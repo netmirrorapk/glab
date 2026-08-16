@@ -28,7 +28,9 @@ from src.db.db_manager import (
 
 # ─── Settings resolution helpers ───
 _ALLOWED_RATIO = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
-_ALLOWED_DURATION = {5, 10}
+# 15s works on the creative-video SKILL route (verified live on a free account); the
+# direct ability route caps at ~10s, so dola will clamp 15 there.
+_ALLOWED_DURATION = {5, 10, 15}
 _ALLOWED_MODELS = {"seedance_v2.5", "seedance_v2.0", "ic_mini"}
 
 
@@ -55,8 +57,8 @@ def _resolve_dola_duration(length: Any) -> int:
         n = int(str(length).lower().replace("s", "").strip())
         if n in _ALLOWED_DURATION:
             return n
-        # snap anything else to the nearest allowed value
-        return 5 if n <= 7 else 10
+        # snap anything else to the nearest allowed value (5 / 10 / 15)
+        return min(_ALLOWED_DURATION, key=lambda a: abs(a - n))
     except Exception:
         return 10
 
@@ -542,7 +544,7 @@ class DolaModeManager:
         raw_ratio = str(job.get("video_ratio") or "")
         job_ratio = raw_ratio if raw_ratio in _ALLOWED_RATIO else self._ratio
         raw_dur = str(job.get("video_length") or "").strip()
-        job_duration = _resolve_dola_duration(raw_dur) if raw_dur in {"5", "10", "6"} else self._duration
+        job_duration = _resolve_dola_duration(raw_dur) if raw_dur in {"5", "6", "10", "15"} else self._duration
 
         if not prompt:
             update_job_status(job_id, "failed", account=worker.account_email, error="empty_prompt")
