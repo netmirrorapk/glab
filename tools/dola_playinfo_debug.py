@@ -37,21 +37,49 @@ async def run(args):
         except Exception:
             pass
 
-        for path, body in [("/samantha/media/get_play_info", {"key": args.vid}),
-                           ("/samantha/video/get_play_info", {"vid": args.vid})]:
+        # The extension's exact query params for media/get_play_info
+        ext_params = ("version_code=20800&language=en&device_platform=web&aid=497858"
+                      "&real_aid=497858&pkg_type=release_version&samantha_web=1"
+                      "&use-olympus-account=1")
+
+        async def raw_post(full_url, body, origin):
+            js = """async ({url, body, origin}) => {
+                try {
+                    const r = await fetch(url, {method:'POST', credentials:'include',
+                        headers:{'content-type':'application/json','origin':origin},
+                        body: JSON.stringify(body)});
+                    const t = await r.text();
+                    return {status:r.status, body:t};
+                } catch(e){ return {status:-1, body:'ERR:'+e}; }
+            }"""
+            return await s.page.evaluate(js, {"url": full_url, "body": body, "origin": origin})
+
+        tests = [
+            ("dola media (tool _qs)", "pf", "/samantha/media/get_play_info", {"key": args.vid}),
+            ("dola video (tool _qs)", "pf", "/samantha/video/get_play_info", {"vid": args.vid}),
+            ("dola media (ext params)", "raw",
+             f"https://www.dola.com/samantha/media/get_play_info?{ext_params}",
+             {"key": args.vid}),
+            ("DOUBAO media (ext params)", "raw",
+             f"https://www.doubao.com/samantha/media/get_play_info?{ext_params}",
+             {"key": args.vid}),
+        ]
+        for name, kind, path, body in tests:
             print("\n" + "=" * 78)
-            print("POST", path, "  body:", json.dumps(body))
+            print(name, "->", path[:70], "  body:", json.dumps(body))
             try:
-                r = await s.pf(path, body)
+                if kind == "pf":
+                    r = await s.pf(path, body)
+                else:
+                    r = await raw_post(path, body, path.split("/samantha")[0])
                 print("status:", r.get("status"))
                 b = r.get("body") or ""
                 print("len:", len(b))
-                # pretty print if JSON
                 try:
                     j = json.loads(b)
-                    print(json.dumps(j, ensure_ascii=False, indent=1)[:3000])
+                    print(json.dumps(j, ensure_ascii=False, indent=1)[:2500])
                 except Exception:
-                    print(b[:2000])
+                    print(b[:1500])
             except Exception as e:
                 print("call error:", str(e)[:160])
     finally:
