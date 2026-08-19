@@ -128,12 +128,24 @@ async def run(args):
         out = os.path.join(OUT_DIR, f"skilltest_{acct}_{int(time.time())}.mp4")
         t0 = time.time()
         log(f"▶ generating (use_skill={use_skill or bool(ref)}, ref={'yes' if ref else 'no'})…")
-        await session.generate_one(args.prompt, out, ratio=args.ratio,
+        await session.generate_one(args.prompt, out, model=args.model, ratio=args.ratio,
                                    duration=args.duration, timeout=args.timeout,
                                    use_skill=use_skill, ref_image=ref)
         dt = int(time.time() - t0)
         n = os.path.getsize(out) if os.path.exists(out) else 0
-        log(f"✅ VIDEO SAVED in {dt}s — {n} bytes -> {out}")
+        hd = getattr(session, "last_was_hd", False)
+        mb = n / 1024 / 1024
+        log(f"✅ VIDEO SAVED in {dt}s — {mb:.1f} MB ({n} bytes) -> {out}")
+        log(f"   HD unwatermarked master: {'YES ✅' if hd else 'no (fell back to watermarked stream)'}")
+        try:
+            import subprocess
+            from src.core.ffmpeg_path import ffprobe_exe
+            dur = subprocess.run([ffprobe_exe(), "-v", "error", "-show_entries",
+                                  "format=duration", "-of", "csv=p=0", out],
+                                 capture_output=True, text=True, timeout=20).stdout.strip()
+            log(f"   actual duration: {dur}s (requested {args.duration}s, model {args.model})")
+        except Exception:
+            pass
 
         if not args.no_watermark:
             try:
@@ -181,6 +193,7 @@ def main():
     ap.add_argument("--account", default=None, help="profile name (default: first in registry)")
     ap.add_argument("--ratio", default="9:16")
     ap.add_argument("--duration", type=int, default=10)
+    ap.add_argument("--model", default="seedance_v2.0", help="seedance_v2.5 / seedance_v2.0 / ic_mini (direct route only)")
     ap.add_argument("--timeout", type=int, default=720)
     ap.add_argument("--no-skill", action="store_true", help="use the OLD direct ability route instead")
     ap.add_argument("--cloak", action="store_true", help="use anti-detect CloakBrowser (true headless)")
