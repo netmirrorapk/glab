@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import re
@@ -1331,23 +1333,71 @@ class DolaSession:
         self._log(f"vid={vid}")
         return await self._fetch_and_save(vid, msg, out_path)
 
+    async def get_unwatermarked_master(self, msg: str):
+        """The BEST unwatermarked HD source: the chain message carries a vod `fallback_api`
+        (fplay, logo_type=unwatermarked). Fetch it (ctx.request → no CORS/geo-block),
+        pick the highest-bitrate entry, and decrypt its `main_url` qAAB token with the
+        key derived from the URL's `key_seed`. Returns (plain_mp4_url, definition) or
+        ('',''). This is the same clean 1080p master the zDola extension downloads."""
+        api = _extract_fallback_api(msg)
+        if not api or "logo_type=unwatermarked" not in api:
+            return "", ""
+        # the extension requests codec_type=8 (the chain's fallback_api carries =3); match it
+        api = re.sub(r'codec_type=\d+', 'codec_type=8', api)
+        from urllib.parse import urlsplit, parse_qs
+        key_seed = parse_qs(urlsplit(api).query).get("key_seed", [""])[0]
+        if not key_seed:
+            return "", ""
+        try:
+            resp = await self.ctx.request.get(api)
+            body = await resp.text()
+            vl = ((json.loads(body) or {}).get("video_info", {})
+                  .get("data", {}).get("video_list", {})) or {}
+        except Exception:
+            return "", ""
+        best = None
+        for v in vl.values():
+            if isinstance(v, dict) and (best is None
+                                        or int(v.get("bitrate") or 0) > int(best.get("bitrate") or 0)):
+                best = v
+        if not best:
+            return "", ""
+        try:
+            url = _decode_qaab_url(str(best.get("main_url") or ""), key_seed)
+        except Exception:
+            url = ""
+        return url, str(best.get("definition") or "")
+
     async def _fetch_and_save(self, vid: str, msg: str, out_path: str) -> str:
         """Resolve a finished vid to an mp4 URL, download it, validate it's a real
         video, and return out_path. Shared by both the ability and skill routes.
-        PREFERS the raw UNWATERMARKED 1080p master (media/get_play_info -> main_url);
-        falls back to the older watermarked stream. Sets self.last_was_hd so the runner
-        can SKIP the ffmpeg watermark-removal when the master (already clean) was used."""
+        PREFERENCE ORDER: (1) the decrypted UNWATERMARKED HD master from the chain's vod
+        fallback_api, (2) dola's media/get_play_info master (usually geo-blocked),
+        (3) the watermarked video stream. Sets self.last_was_hd so the runner can SKIP
+        the ffmpeg watermark-removal when a clean master was used."""
         self.last_was_hd = False
         url = None
         definition = ""
+        # 1) BEST — decrypted unwatermarked master from the chain fallback_api
         try:
-            url, definition = await self.get_play_info_hd(vid)
-            self.last_was_hd = True
-        except DolaError:
+            murl, mdef = await self.get_unwatermarked_master(msg)
+            if murl:
+                url, definition, self.last_was_hd = murl, mdef, True
+        except Exception:
+            pass
+        # 2) dola media HD endpoint (often region-restricted → fails fast)
+        if not url:
+            try:
+                url, definition = await self.get_play_info_hd(vid)
+                self.last_was_hd = True
+            except DolaError:
+                pass
+        # 3) watermarked video stream / url embedded in the message
+        if not url:
             try:
                 url = await self.get_play_info(vid)
             except DolaError:
-                cand = _extract_mp4(msg)                # last resort: url embedded in message
+                cand = _extract_mp4(msg)
                 if not cand:
                     raise
                 url = cand[0]
@@ -1397,6 +1447,89 @@ def _best_master_url(body: str):
         if area >= best_area:
             best_url, best_def, best_area = u, str(pi.get("definition") or ""), area
     return best_url, best_def
+
+
+# ---- unwatermarked HD master via the vod `fallback_api` (fplay, logo_type=unwatermarked)
+# The message chain carries a `fallback_api` URL to vod-urls-*.byteintlapi.com whose
+# response holds a `main_url` that is a base64 'qAAB' token AES-128-CBC-encrypted with a
+# key derived from the URL's `key_seed`. This is NOT geo-restricted like dola's own
+# media/get_play_info, so it yields the clean 1080p master on any region. Algorithm
+# (key derivation + attempt list + salt) reverse-engineered from the zDola extension.
+_QAAB_SALT = bytes.fromhex(
+    "4dd4c2e6b83162090e52b3c7a6733ba4" "1cb2462b829ab58a196b39db57177524"
+    "f49baf7f08e8d68d26a72e37c1a95a2f" "1f05a51892aef2949732b62a38aadd58")
+
+
+def _b64_loose(s: str) -> bytes:
+    s = str(s or "").strip()
+    for cand in (s, s.replace("$", "_").replace("@", "/").replace("#", "."),
+                 s.replace("$", "+").replace("@", "/").replace("#", "=")):
+        c2 = (cand + "=" * ((4 - len(cand) % 4) % 4)).replace("-", "+").replace("_", "/")
+        try:
+            return base64.b64decode(c2)
+        except Exception:
+            continue
+    return b""
+
+
+def _aes_cbc_dec(payload: bytes, key: bytes, iv: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    return d.update(payload) + d.finalize()
+
+
+def _strip_pkcs7(b: bytes) -> bytes:
+    if not b:
+        return b
+    p = b[-1]
+    if 1 <= p <= 16 and p <= len(b) and all(x == p for x in b[-p:]):
+        return b[:-p]
+    return b
+
+
+def _decode_qaab_url(token: str, key_seed: str) -> str:
+    """Decrypt a vod `main_url` qAAB token → plain http mp4 url ('' on failure)."""
+    if token.startswith("http://") or token.startswith("https://"):
+        return token
+    data, seed = _b64_loose(token), _b64_loose(key_seed)
+    if not data or not seed:
+        return ""
+    d1 = hashlib.sha512(seed[:32]).digest()
+    d2 = hashlib.sha512(d1 + _QAAB_SALT).digest()
+    key, iv = d2[:16], d2[16:32]
+    attempts = []
+    if len(data) >= 4 and data[:4] == b"\xa8\x00\x01\x00":
+        attempts = [(data[4:], key, iv), (data[4:], iv, key)]
+        if len(data) > 36:
+            attempts += [(data[36:], key, data[20:36]), (data[36:], key, iv)]
+    else:
+        attempts = [(data, key, iv)]
+    for payload, k, i in attempts:
+        if not payload or len(payload) % 16 or len(k) != 16 or len(i) != 16:
+            continue
+        try:
+            plain = _aes_cbc_dec(payload, k, i)
+        except Exception:
+            continue
+        for cand in (plain, _strip_pkcs7(plain)):
+            try:
+                t = cand.decode("latin1")
+            except Exception:
+                continue
+            m = re.match(r'(https?://[\x20-\x7e]+)', t)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def _extract_fallback_api(msg: str) -> str:
+    """The vod fplay `fallback_api` url embedded in the (possibly escaped) chain message."""
+    if not msg:
+        return ""
+    m = re.search(r'https?:\\?/\\?/vod-urls[^"\\ ]+', msg)
+    if not m:
+        return ""
+    return m.group(0).replace("\\u0026", "&").replace("\\/", "/").replace("\\", "")
 
 
 def _extract_vid(text: str):
