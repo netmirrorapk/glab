@@ -122,6 +122,17 @@ async def run(args):
         except Exception:
             pass
 
+        # Verify a REAL login (not just cookies) — the page must NOT be the guest state.
+        # Otherwise we'd waste a submit on a guest conversation.
+        try:
+            if not await session.logged_in_for_real():
+                log("❌ account is GUEST/logged-out (cookies present but page shows guest) — "
+                    f"re-login: python tools/dola_profiles.py login --as {acct}")
+                return
+            log("real login verified ✅ (not guest)")
+        except Exception:
+            pass
+
         # rate-limit visibility (so we know if the account is send-throttled first)
         try:
             rl = await session.check_rate_limit()

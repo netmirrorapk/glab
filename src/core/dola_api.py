@@ -478,6 +478,11 @@ class DolaSession:
                      ratio: str = "9:16", duration: int = 10) -> str:
         """Submit a text->video generation. Returns conversation_id.
         Raises DailyLimitReached / GenerationRefused from the submit SSE itself."""
+        # Verify a REAL login (cookies present AND the page isn't the guest state)
+        # BEFORE spending a submit — a stale cookie can pass is_logged_in() while the
+        # session is actually guest, which would create a wasted guest conversation.
+        if not await self.logged_in_for_real():
+            raise NotLoggedIn("account is guest/logged-out — not submitting (needs re-login)")
         prompt_text = self._build_prompt_text(prompt, ratio)
         local_conv = f"local_{int(time.time() * 1000)}"
         body = {
@@ -684,6 +689,8 @@ class DolaSession:
         separate attachment message and the task is threaded off THAT message id
         (reference-image → video). `prompt_duration` makes the length come from the
         prompt itself (see _build_skill_text)."""
+        if not await self.logged_in_for_real():
+            raise NotLoggedIn("account is guest/logged-out — not submitting (needs re-login)")
         base = prompt if str(prompt or "").strip() else ("animate the reference image" if attachment else prompt)
         text = self._build_skill_text(base, ratio, duration, prompt_duration=prompt_duration)
         text_msg, text_local = self._text_message(text)
