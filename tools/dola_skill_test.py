@@ -109,6 +109,19 @@ async def run(args):
         await session._ensure_base()
         log("logged in ✅")
 
+        # Make sure the page is ON dola.com before we submit — right after a Google
+        # re-auth it can be left on an accounts.google.com/redirect page, and the
+        # in-page fetch to dola.com from there fails cross-origin ("Failed to fetch").
+        try:
+            cur = str(session.page.url or "")
+            if "dola.com" not in cur:
+                await session.page.goto("https://www.dola.com/chat/create-video",
+                                        wait_until="domcontentloaded")
+                import asyncio as _a
+                await _a.sleep(1.5)
+        except Exception:
+            pass
+
         # rate-limit visibility (so we know if the account is send-throttled first)
         try:
             rl = await session.check_rate_limit()
