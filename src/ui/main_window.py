@@ -3623,6 +3623,7 @@ class MainWindow(QMainWindow):
             self._dola_watermark_checks = []
             self._dola_skillflow_checks = []
             self._dola_promptdur_checks = []
+            self._dola_stagger_combos = []
         try:
             cur_model = str(get_setting("dola_model", "seedance_v2.0") or "seedance_v2.0")
             cur_ratio = str(get_setting("dola_ratio", "9:16") or "9:16")
@@ -3645,9 +3646,18 @@ class MainWindow(QMainWindow):
                 [("5s", 5), ("10s", 10), ("15s (skill)", 15), ("30s (2.5 direct)", 30)],
                 current_data=cur_dur, trigger_sync=False,
             )
+            try:
+                cur_stag = int(float(str(get_setting("dola_tab_stagger", "2") or "2")))
+            except Exception:
+                cur_stag = 2
+            sg = self._create_setting_combo(
+                [("0s", 0), ("2s", 2), ("3s", 3), ("5s", 5), ("8s", 8)],
+                current_data=cur_stag, trigger_sync=False,
+            )
             self._dola_model_combos.append(m)
             self._dola_ratio_combos.append(r)
             self._dola_dur_combos.append(d)
+            self._dola_stagger_combos.append(sg)
 
             m.currentIndexChanged.connect(
                 lambda _=None, c=m: self._on_dola_setting_changed("dola_model", c, self._dola_model_combos)
@@ -3657,6 +3667,12 @@ class MainWindow(QMainWindow):
             )
             d.currentIndexChanged.connect(
                 lambda _=None, c=d: self._on_dola_setting_changed("dola_duration", c, self._dola_dur_combos)
+            )
+            sg.setToolTip("Seconds between each tab's first submit — spreads N parallel tabs so they "
+                          "don't burst all at once and trip dola's 'high demand'. 2–3s is safe; raise "
+                          "it if you see high-demand backoffs.")
+            sg.currentIndexChanged.connect(
+                lambda _=None, c=sg: self._on_dola_setting_changed("dola_tab_stagger", c, self._dola_stagger_combos)
             )
 
             chk = QCheckBox("Auto-delete on daily limit")
@@ -3706,7 +3722,8 @@ class MainWindow(QMainWindow):
             lbl = self._make_setting_label("Dola:")
             field = self._make_inline_row(
                 m, self._make_setting_label("Ratio:"), r,
-                self._make_setting_label("Dur:"), d, chk, chk_wm, chk_sk, chk_pd,
+                self._make_setting_label("Dur:"), d,
+                self._make_setting_label("Stagger:"), sg, chk, chk_wm, chk_sk, chk_pd,
             )
             form.addRow(lbl, field)
             lbl.setVisible(False)
