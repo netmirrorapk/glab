@@ -103,6 +103,11 @@ _CANTGEN_MARKERS = (
 _CONTENT_REFUSAL_MARKERS = (
     "generate the requested content", "create the requested content",
     "try something else", "against our content policy",
+    # dola sometimes GENERATES the video (credits spent) but then blocks it for
+    # copyright — usually a copyrighted AUDIO track it added. It won't serve the video,
+    # so treat as a refusal (fail this job) instead of polling until timeout.
+    "for copyright protection", "can't show you the generated video",
+    "cannot show you the generated video", "because of its audio",
 )
 _REFUSAL_MARKERS = (
     "temporarily unable to generate", "unable to generate a video",
