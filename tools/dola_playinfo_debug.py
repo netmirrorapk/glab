@@ -42,36 +42,52 @@ async def run(args):
                       "&real_aid=497858&pkg_type=release_version&samantha_web=1"
                       "&use-olympus-account=1")
 
-        async def raw_post(full_url, body, origin):
+        # Build a Cookie header from ALL the context's cookies (dola/ByteDance passport)
+        # — this is what the extension injects onto the doubao request via
+        # declarativeNetRequest to get past "permission denied".
+        try:
+            allck = await s.ctx.cookies()
+            cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in allck if c.get('name'))
+            print(f"[cookies] {len(allck)} cookies, header len {len(cookie_header)}")
+        except Exception as e:
+            cookie_header = ""
+            print("[cookies] export failed:", str(e)[:80])
+
+        async def raw_post(full_url, body, origin, inject_cookie=False):
             # ctx.request runs OUTSIDE the page → bypasses CORS (like the extension's
-            # host_permissions), so we see the REAL server response, not a CORS error.
+            # host_permissions). inject_cookie replicates the extension's Cookie-header
+            # injection so a doubao request carries the dola/ByteDance passport session.
+            hdr = {"content-type": "application/json", "origin": origin,
+                   "referer": origin + "/"}
+            if inject_cookie and cookie_header:
+                hdr["cookie"] = cookie_header
             try:
-                resp = await s.ctx.request.post(
-                    full_url,
-                    headers={"content-type": "application/json", "origin": origin},
-                    data=json.dumps(body))
+                resp = await s.ctx.request.post(full_url, headers=hdr, data=json.dumps(body))
                 return {"status": resp.status, "body": await resp.text()}
             except Exception as e:
                 return {"status": -1, "body": "ERR:" + str(e)[:150]}
 
         tests = [
-            ("dola media (in-page/pf)", "pf", "/samantha/media/get_play_info", {"key": args.vid}),
-            ("dola video (in-page/pf)", "pf", "/samantha/video/get_play_info", {"vid": args.vid}),
-            ("dola media (ctx.request, no-CORS)", "raw",
-             f"https://www.dola.com/samantha/media/get_play_info?{ext_params}",
-             {"key": args.vid}),
-            ("DOUBAO media (ctx.request, no-CORS)", "raw",
+            ("dola media (in-page/pf)", "pf", "/samantha/media/get_play_info", {"key": args.vid}, False),
+            ("dola video (in-page/pf)", "pf", "/samantha/video/get_play_info", {"vid": args.vid}, False),
+            ("DOUBAO media (no cookie)", "raw",
              f"https://www.doubao.com/samantha/media/get_play_info?{ext_params}",
-             {"key": args.vid}),
+             {"key": args.vid}, False),
+            ("DOUBAO media (+ dola cookies)", "raw",
+             f"https://www.doubao.com/samantha/media/get_play_info?{ext_params}",
+             {"key": args.vid}, True),
+            ("dola media (+ cookies, ctx)", "raw",
+             f"https://www.dola.com/samantha/media/get_play_info?{ext_params}",
+             {"key": args.vid}, True),
         ]
-        for name, kind, path, body in tests:
+        for name, kind, path, body, inject in tests:
             print("\n" + "=" * 78)
             print(name, "->", path[:70], "  body:", json.dumps(body))
             try:
                 if kind == "pf":
                     r = await s.pf(path, body)
                 else:
-                    r = await raw_post(path, body, path.split("/samantha")[0])
+                    r = await raw_post(path, body, path.split("/samantha")[0], inject_cookie=inject)
                 print("status:", r.get("status"))
                 b = r.get("body") or ""
                 print("len:", len(b))
