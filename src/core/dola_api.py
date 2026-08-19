@@ -1199,7 +1199,13 @@ class DolaSession:
         saving the JSON body as if it were a video)."""
         for i in range(tries):
             r = await self.pf("/samantha/video/get_play_info", {"vid": vid})
-            urls = _extract_mp4(r["body"] or "")
+            body = r["body"] or ""
+            # prefer the structured play_infos[].main (highest-res) — the CDN url has no
+            # .mp4 path so _extract_mp4 alone can miss it — then fall back to a plain url.
+            url, _def = _best_master_url(body)
+            if url:
+                return url
+            urls = _extract_mp4(body)
             if urls:
                 return urls[0]
             if i < tries - 1:
@@ -1207,27 +1213,23 @@ class DolaSession:
         raise DolaError("get_play_info returned no plain mp4 url after retries")
 
     async def get_play_info_hd(self, vid: str, tries: int = 8, delay: float = 2.0):
-        """Resolve a vid to the RAW UNWATERMARKED 1080p MASTER mp4 (main_url) via the
-        MEDIA play-info endpoint — the high-quality (20–30 MB) source with NO burned-in
-        watermark. dola's /samantha/media/get_play_info takes {"key": vid} (NOT "vid")
-        and returns data.original_media_info.main_url. Returns (url, definition) or
-        raises. This is the same source the zDola extension pulls; the older
-        /samantha/video/get_play_info only hands back a low-res watermarked stream."""
+        """Resolve a vid to the highest-quality UNWATERMARKED master mp4 via the MEDIA
+        play-info endpoint — the source with NO burned-in watermark (the same one the
+        zDola extension pulls; 1080p, ~20–30 MB), vs the low-res stream from
+        /samantha/video/get_play_info. dola's /samantha/media/get_play_info takes
+        {"key": vid} (NOT "vid"). The response shape varies, so parse BOTH known layouts:
+          - data.original_media_info.main_url   (+ meta.definition)   ← the raw master
+          - data.play_infos[].main              (+ definition)        ← per-resolution
+        and return the URL with the largest frame (highest quality). Returns
+        (url, definition) or raises."""
         for i in range(tries):
             r = await self.pf("/samantha/media/get_play_info", {"key": vid})
-            try:
-                data = json.loads(r.get("body") or "{}").get("data", {}) or {}
-                omi = data.get("original_media_info") or {}
-                url = str(omi.get("main_url") or "")
-                meta = omi.get("meta") or {}
-                definition = str(meta.get("definition") or data.get("definition") or "")
-                if url.startswith("http"):
-                    return url, definition
-            except Exception:
-                pass
+            url, definition = _best_master_url(r.get("body") or "")
+            if url:
+                return url, definition
             if i < tries - 1:
                 await asyncio.sleep(delay)
-        raise DolaError("media/get_play_info returned no main_url (HD master) after retries")
+        raise DolaError("media/get_play_info returned no master url (HD) after retries")
 
     async def download(self, url: str, out_path: str, tries: int = 3) -> int:
         """Download via the browser network stack (shares auth/cookies). Returns bytes
@@ -1339,6 +1341,37 @@ class DolaSession:
 
 
 # ---- parsing helpers (tolerant of escaped JSON in the message stream) ----------
+def _best_master_url(body: str):
+    """Pick the highest-quality master mp4 URL + its definition from a get_play_info
+    body. Handles both dola layouts: data.original_media_info.main_url and
+    data.play_infos[].main (choose the entry with the largest width*height). Returns
+    (url, definition) or ('', '')."""
+    if not body:
+        return "", ""
+    try:
+        data = (json.loads(body) or {}).get("data", {}) or {}
+    except Exception:
+        return "", ""
+    best_url, best_def, best_area = "", "", -1
+    # 1) the raw master (media endpoint)
+    omi = data.get("original_media_info") or {}
+    u = str(omi.get("main_url") or "")
+    if u.startswith("http"):
+        meta = omi.get("meta") or {}
+        w = int(omi.get("width") or meta.get("width") or 0)
+        h = int(omi.get("height") or meta.get("height") or 0)
+        best_url, best_def, best_area = u, str(meta.get("definition") or ""), (w * h or 1)
+    # 2) per-resolution play_infos[].main — keep the biggest frame
+    for pi in (data.get("play_infos") or []):
+        u = str(pi.get("main") or pi.get("main_url") or "")
+        if not u.startswith("http"):
+            continue
+        area = int(pi.get("width") or 0) * int(pi.get("height") or 0)
+        if area >= best_area:
+            best_url, best_def, best_area = u, str(pi.get("definition") or ""), area
+    return best_url, best_def
+
+
 def _extract_vid(text: str):
     vids = _extract_all_vids(text)
     return vids[0] if vids else None
