@@ -627,8 +627,11 @@ class PlaywrightDolaModeManager:
                                                use_skill=self._use_skill, ref_image=(ref_path or None),
                                                prompt_duration=self._prompt_duration)
                     state["busy"] -= 1
-                    # auto-remove the "Dola AI" watermark (in-place, async, ~<1s)
-                    if self._remove_wm:
+                    # auto-remove the "Dola AI" watermark (in-place, async, ~<1s) — but
+                    # SKIP it when we already downloaded the raw UNWATERMARKED HD master
+                    # (media/get_play_info main_url): it's clean AND high-quality, so
+                    # running delogo would only waste time / soften a clean video.
+                    if self._remove_wm and not getattr(session, "last_was_hd", False):
                         ok_wm = await _dewatermark(out_path)
                         if not ok_wm and not self._wm_warned:
                             self._wm_warned = True

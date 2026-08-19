@@ -3642,7 +3642,7 @@ class MainWindow(QMainWindow):
                 current_data=cur_ratio, trigger_sync=False,
             )
             d = self._create_setting_combo(
-                [("5s", 5), ("10s", 10), ("15s (skill only)", 15)],
+                [("5s", 5), ("10s", 10), ("15s (skill)", 15), ("30s (2.5 direct)", 30)],
                 current_data=cur_dur, trigger_sync=False,
             )
             self._dola_model_combos.append(m)

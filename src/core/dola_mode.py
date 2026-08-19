@@ -28,9 +28,10 @@ from src.db.db_manager import (
 
 # ─── Settings resolution helpers ───
 _ALLOWED_RATIO = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
-# 15s works on the creative-video SKILL route (verified live on a free account); the
-# direct ability route caps at ~10s, so dola will clamp 15 there.
-_ALLOWED_DURATION = {5, 10, 15}
+# 15s works on the creative-video SKILL route (verified live on a free account); 30s
+# works on the DIRECT ability route with Seedance 2.5 (ability_param duration=30 — the
+# same override the zDola extension uses). dola clamps unsupported values per model.
+_ALLOWED_DURATION = {5, 10, 15, 30}
 _ALLOWED_MODELS = {"seedance_v2.5", "seedance_v2.0", "ic_mini"}
 
 

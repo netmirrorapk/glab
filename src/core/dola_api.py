@@ -226,6 +226,7 @@ class DolaSession:
         self._log = logger or (lambda *a: None)
         self._base = {}                    # common query params (aid, device_id, ...)
         self.last_points_left = None       # backend remaining video points (0 ⇒ retire after this gen)
+        self.last_was_hd = False           # True if the last save used the unwatermarked HD master
         self.page.on("request", self._on_request)
 
     # ---- signing / base params -------------------------------------------------
@@ -1205,6 +1206,29 @@ class DolaSession:
                 await asyncio.sleep(delay)
         raise DolaError("get_play_info returned no plain mp4 url after retries")
 
+    async def get_play_info_hd(self, vid: str, tries: int = 8, delay: float = 2.0):
+        """Resolve a vid to the RAW UNWATERMARKED 1080p MASTER mp4 (main_url) via the
+        MEDIA play-info endpoint — the high-quality (20–30 MB) source with NO burned-in
+        watermark. dola's /samantha/media/get_play_info takes {"key": vid} (NOT "vid")
+        and returns data.original_media_info.main_url. Returns (url, definition) or
+        raises. This is the same source the zDola extension pulls; the older
+        /samantha/video/get_play_info only hands back a low-res watermarked stream."""
+        for i in range(tries):
+            r = await self.pf("/samantha/media/get_play_info", {"key": vid})
+            try:
+                data = json.loads(r.get("body") or "{}").get("data", {}) or {}
+                omi = data.get("original_media_info") or {}
+                url = str(omi.get("main_url") or "")
+                meta = omi.get("meta") or {}
+                definition = str(meta.get("definition") or data.get("definition") or "")
+                if url.startswith("http"):
+                    return url, definition
+            except Exception:
+                pass
+            if i < tries - 1:
+                await asyncio.sleep(delay)
+        raise DolaError("media/get_play_info returned no main_url (HD master) after retries")
+
     async def download(self, url: str, out_path: str, tries: int = 3) -> int:
         """Download via the browser network stack (shares auth/cookies). Returns bytes
         written. Retries transient network blips (e.g. 'socket hang up' from the dola CDN)
@@ -1280,14 +1304,24 @@ class DolaSession:
 
     async def _fetch_and_save(self, vid: str, msg: str, out_path: str) -> str:
         """Resolve a finished vid to an mp4 URL, download it, validate it's a real
-        video, and return out_path. Shared by both the ability and skill routes."""
+        video, and return out_path. Shared by both the ability and skill routes.
+        PREFERS the raw UNWATERMARKED 1080p master (media/get_play_info -> main_url);
+        falls back to the older watermarked stream. Sets self.last_was_hd so the runner
+        can SKIP the ffmpeg watermark-removal when the master (already clean) was used."""
+        self.last_was_hd = False
+        url = None
+        definition = ""
         try:
-            url = await self.get_play_info(vid)
+            url, definition = await self.get_play_info_hd(vid)
+            self.last_was_hd = True
         except DolaError:
-            cand = _extract_mp4(msg)                    # fallback: url embedded in message
-            if not cand:
-                raise
-            url = cand[0]
+            try:
+                url = await self.get_play_info(vid)
+            except DolaError:
+                cand = _extract_mp4(msg)                # last resort: url embedded in message
+                if not cand:
+                    raise
+                url = cand[0]
         n = await self.download(url, out_path)
         # Validate: a real dola mp4 is megabytes and starts with an ISO-BMFF box.
         # Guard against saving an error/JSON body (e.g. an expired or not-ready play
@@ -1299,7 +1333,8 @@ class DolaSession:
                 pass
             raise DolaError(f"downloaded content is not a valid video ({n} bytes) — "
                             f"play URL expired/not ready")
-        self._log(f"downloaded {n} bytes -> {out_path}")
+        tag = f" [HD master {definition or '1080p'}, unwatermarked]" if self.last_was_hd else ""
+        self._log(f"downloaded {n} bytes -> {out_path}{tag}")
         return out_path
 
 
