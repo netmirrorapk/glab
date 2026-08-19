@@ -43,24 +43,24 @@ async def run(args):
                       "&use-olympus-account=1")
 
         async def raw_post(full_url, body, origin):
-            js = """async ({url, body, origin}) => {
-                try {
-                    const r = await fetch(url, {method:'POST', credentials:'include',
-                        headers:{'content-type':'application/json','origin':origin},
-                        body: JSON.stringify(body)});
-                    const t = await r.text();
-                    return {status:r.status, body:t};
-                } catch(e){ return {status:-1, body:'ERR:'+e}; }
-            }"""
-            return await s.page.evaluate(js, {"url": full_url, "body": body, "origin": origin})
+            # ctx.request runs OUTSIDE the page → bypasses CORS (like the extension's
+            # host_permissions), so we see the REAL server response, not a CORS error.
+            try:
+                resp = await s.ctx.request.post(
+                    full_url,
+                    headers={"content-type": "application/json", "origin": origin},
+                    data=json.dumps(body))
+                return {"status": resp.status, "body": await resp.text()}
+            except Exception as e:
+                return {"status": -1, "body": "ERR:" + str(e)[:150]}
 
         tests = [
-            ("dola media (tool _qs)", "pf", "/samantha/media/get_play_info", {"key": args.vid}),
-            ("dola video (tool _qs)", "pf", "/samantha/video/get_play_info", {"vid": args.vid}),
-            ("dola media (ext params)", "raw",
+            ("dola media (in-page/pf)", "pf", "/samantha/media/get_play_info", {"key": args.vid}),
+            ("dola video (in-page/pf)", "pf", "/samantha/video/get_play_info", {"vid": args.vid}),
+            ("dola media (ctx.request, no-CORS)", "raw",
              f"https://www.dola.com/samantha/media/get_play_info?{ext_params}",
              {"key": args.vid}),
-            ("DOUBAO media (ext params)", "raw",
+            ("DOUBAO media (ctx.request, no-CORS)", "raw",
              f"https://www.doubao.com/samantha/media/get_play_info?{ext_params}",
              {"key": args.vid}),
         ]
