@@ -527,7 +527,10 @@ class PlaywrightDolaModeManager:
 
             state = {"healthy": asyncio.Event(), "busy": 0, "recreated": 0,
                      "lock": asyncio.Lock(), "alive": True, "cloak": self._cloak,
-                     "ctx": ctx, "acct": name, "session_path": session_path}
+                     "ctx": ctx, "acct": name, "session_path": session_path,
+                     # shared across this account's tabs — hard duplicate guard so no two
+                     # prompts ever save the same vid.
+                     "claimed_vids": set()}
             state["healthy"].set()
             self._states.append(state)
             # Report send-throttle status up front so the user sees which accounts
@@ -625,7 +628,8 @@ class PlaywrightDolaModeManager:
                     await session.generate_one(prompt, out_path, model=model, ratio=ratio,
                                                duration=self._duration, timeout=GEN_TIMEOUT,
                                                use_skill=self._use_skill, ref_image=(ref_path or None),
-                                               prompt_duration=self._prompt_duration)
+                                               prompt_duration=self._prompt_duration,
+                                               claimed_vids=state["claimed_vids"])
                     state["busy"] -= 1
                     # auto-remove the "Dola AI" watermark (in-place, async, ~<1s) — but
                     # SKIP it when we already downloaded the raw UNWATERMARKED HD master

@@ -303,7 +303,8 @@ async def _tab_loop(acct, tab_i, session, main_session, queue, ratio, stats, sta
         state["busy"] += 1
         try:
             await session.generate_one(prompt, out, ratio=ratio, duration=duration,
-                                       timeout=720, use_skill=use_skill)
+                                       timeout=720, use_skill=use_skill,
+                                       claimed_vids=state.get("claimed_vids"))
             state["busy"] -= 1
             n = os.path.getsize(out) if os.path.exists(out) else 0
             log(tag, f"✅ #{idx} saved ({n} bytes)")
@@ -430,7 +431,8 @@ async def worker(acct, proxy, queue: asyncio.Queue, ratio, headless, stats,
             sessions.append(DolaSession(ctx, pg, logger=lambda *a: log(acct, *a)))
         state = {"healthy": asyncio.Event(), "busy": 0, "recreated": 0,
                  "lock": asyncio.Lock(), "alive": True,
-                 "cloak": cloak, "ctx": ctx, "acct": acct}
+                 "cloak": cloak, "ctx": ctx, "acct": acct,
+                 "claimed_vids": set()}   # hard duplicate guard (shared across tabs)
         state["healthy"].set()
         log(acct, f"{len(sessions)} tab(s) ready — generating")
         await asyncio.gather(*[

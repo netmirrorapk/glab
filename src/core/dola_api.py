@@ -827,9 +827,14 @@ class DolaSession:
             return set()
 
     async def wait_for_video(self, conv_id: str, timeout: int = 240,
-                             poll_every: float = 3.0, exclude: set | None = None):
+                             poll_every: float = 3.0, exclude: set | None = None,
+                             claim_set: set | None = None):
         """Poll until a NEW finished video appears (a vid not in `exclude`).
-        Returns (vid, raw_message_text)."""
+        Returns (vid, raw_message_text). `claim_set` (optional, shared across an account's
+        tabs) is a hard DUPLICATE GUARD: a vid is atomically claimed the instant it's
+        found (no await between check and add, so two parallel tabs can never take the
+        same vid — the second one keeps waiting for its own). This prevents the same
+        video being saved onto two different prompts."""
         exclude = exclude or set()
         deadline = time.time() + timeout
         start = time.time()
@@ -842,10 +847,14 @@ class DolaSession:
             last = await self._pull_single(conv_id)
             cyc += 1
             low0 = last.lower()
-            # 1) A NEW finished vid wins immediately.
+            # 1) A NEW finished vid wins immediately. Skip any vid already excluded OR
+            #    already claimed by another tab, then atomically claim this one.
             for vid in _extract_all_vids(last):
-                if vid not in exclude:
-                    return vid, last
+                if vid in exclude or (claim_set is not None and vid in claim_set):
+                    continue
+                if claim_set is not None:
+                    claim_set.add(vid)          # atomic claim — no await before returning
+                return vid, last
             # 2) Logged-out / guest mid-generation (extension dola.js:551) — the fix
             #    is RE-LOGIN, not burn. Distinct error so the runner re-logs in.
             if any(m in low0 for m in _NOTLOGGEDIN_MARKERS):
@@ -1254,12 +1263,15 @@ class DolaSession:
     # ---- high-level convenience ------------------------------------------------
     async def generate_one(self, prompt: str, out_path: str, *, model="seedance_v2.0",
                            ratio="9:16", duration=10, timeout=720, use_skill=False,
-                           ref_image: str | None = None, prompt_duration: bool = False) -> str:
+                           ref_image: str | None = None, prompt_duration: bool = False,
+                           claimed_vids: set | None = None) -> str:
         """Full pipeline for a single prompt -> saved mp4. Returns out_path.
         use_skill=True routes through the creative-video SKILL (agent rewrites the prompt
         cinematically, then we auto-confirm) instead of the direct ability route.
         ref_image (a LOCAL path) turns this into reference-image → video: the image is
-        uploaded via dola's page uploader and attached — this REQUIRES the skill route."""
+        uploaded via dola's page uploader and attached — this REQUIRES the skill route.
+        claimed_vids: a set shared across this account's tabs — a hard DUPLICATE GUARD so
+        two prompts can never save the same video (each tab claims its vid atomically)."""
         if use_skill or ref_image:
             attachment = None
             if ref_image:
@@ -1282,7 +1294,8 @@ class DolaSession:
             else:
                 self._log(f"conversation_id={conv}; agent generating directly (no confirm needed)…")
             self._log(f"{len(seen_before)} existing vid(s) ignored; waiting for new video...")
-            vid, msg = await self.wait_for_video(conv, timeout=timeout, exclude=seen_before)
+            vid, msg = await self.wait_for_video(conv, timeout=timeout, exclude=seen_before,
+                                                 claim_set=claimed_vids)
             self._log(f"vid={vid}")
             return await self._fetch_and_save(vid, msg, out_path)
 
@@ -1300,7 +1313,8 @@ class DolaSession:
         # …and as a belt-and-braces guard, ignore any vids already in that conversation.
         seen_before = await self.snapshot_vids(conv)
         self._log(f"conversation_id={conv}; {len(seen_before)} existing vid(s) ignored; waiting for new video...")
-        vid, msg = await self.wait_for_video(conv, timeout=timeout, exclude=seen_before)
+        vid, msg = await self.wait_for_video(conv, timeout=timeout, exclude=seen_before,
+                                             claim_set=claimed_vids)
         self._log(f"vid={vid}")
         return await self._fetch_and_save(vid, msg, out_path)
 
