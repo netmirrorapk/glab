@@ -171,7 +171,9 @@ async def run(args):
         except Exception:
             pass
 
-        if not args.no_watermark:
+        if getattr(session, "last_was_hd", False):
+            log("watermark removal: SKIPPED (already the clean unwatermarked HD master)")
+        elif not args.no_watermark:
             try:
                 from src.core.dola_playwright_mode import _dewatermark
                 ok = await _dewatermark(out)
