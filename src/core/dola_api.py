@@ -227,6 +227,7 @@ class DolaSession:
         self._base = {}                    # common query params (aid, device_id, ...)
         self.last_points_left = None       # backend remaining video points (0 ⇒ retire after this gen)
         self.last_was_hd = False           # True if the last save used the unwatermarked HD master
+        self._hd_master_unavailable = False  # latched when dola returns 'country restricted' for the HD endpoint
         self.page.on("request", self._on_request)
 
     # ---- signing / base params -------------------------------------------------
@@ -1230,10 +1231,22 @@ class DolaSession:
           - data.original_media_info.main_url   (+ meta.definition)   ← the raw master
           - data.play_infos[].main              (+ definition)        ← per-resolution
         and return the URL with the largest frame (highest quality). Returns
-        (url, definition) or raises."""
+        (url, definition) or raises.
+        NOTE: on dola.com (Cici international) this endpoint is platform-restricted
+        (code 710022003 'Cici is not available in your country/region' — it's a
+        doubao.com/China feature); the check below fails FAST and latches
+        `_hd_master_unavailable` so we don't waste retries/seconds on every video."""
+        if getattr(self, "_hd_master_unavailable", False):
+            raise DolaError("HD master endpoint not available on this platform (cached)")
         for i in range(tries):
             r = await self.pf("/samantha/media/get_play_info", {"key": vid})
-            url, definition = _best_master_url(r.get("body") or "")
+            body = r.get("body") or ""
+            low = body.lower()
+            if "710022003" in body or "country restricted" in low or "not available in your country" in low:
+                self._hd_master_unavailable = True   # doubao-only; stop trying on this session
+                raise DolaError("HD master endpoint is region/platform-restricted on dola.com "
+                                "(the 1080p master is a doubao.com feature)")
+            url, definition = _best_master_url(body)
             if url:
                 return url, definition
             if i < tries - 1:
