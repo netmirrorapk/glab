@@ -68,6 +68,35 @@ async def run(args):
         log("is_logged_in(cookies):", await s.is_logged_in(),
             "| page_is_guest:", await s._page_is_guest())
 
+        # 1) Is the cloak session ACTUALLY signed into Google? (silent OAuth needs this)
+        log("--- checking cloak's Google session (myaccount.google.com) ---")
+        try:
+            await page.goto("https://myaccount.google.com/", wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            gu = str(page.url or "")
+            gtxt = await page.evaluate("() => (document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,160)")
+            signed_in = ("myaccount.google.com" in gu and "signin" not in gu and "accountchooser" not in gu)
+            log("google url:", gu[:80])
+            log("GOOGLE signed-in in cloak:", signed_in, "| text:", gtxt[:120])
+        except Exception as e:
+            log("google check error:", str(e)[:80])
+
+        # 2) Try the DIRECT / SILENT login (dola auto_open OAuth, prompt=none, NO click)
+        log("--- trying DIRECT silent login (ensure_logged_in, 25s, no UI click) ---")
+        try:
+            sok = await s.ensure_logged_in(timeout=25)
+            ck3 = await ctx.cookies(DOLA_ORIGIN)
+            log("ensure_logged_in (silent) returned:", sok,
+                "| dola passport cookies now:", sorted({c['name'] for c in ck3} & LOGIN_COOKIES) or "(still NONE)")
+        except Exception as e:
+            log("ensure_logged_in error:", str(e)[:80])
+        # back to the create page for the click tests
+        try:
+            await page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+
         # --- directly test clicking "Continue with Google" with several methods ---
         log("--- locating 'Continue with Google' button ---")
         rect = await page.evaluate(r"""() => {
