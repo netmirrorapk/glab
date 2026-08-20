@@ -68,8 +68,58 @@ async def run(args):
         log("is_logged_in(cookies):", await s.is_logged_in(),
             "| page_is_guest:", await s._page_is_guest())
 
-        log("--- driving login_via_google (watch the window) ---")
-        ok = await s.login_via_google(timeout=90)
+        # --- directly test clicking "Continue with Google" with several methods ---
+        log("--- locating 'Continue with Google' button ---")
+        rect = await page.evaluate(r"""() => {
+            const els = Array.from(document.querySelectorAll("button,[role='button'],div,span,a"));
+            for (const e of els) {
+                const t = (e.textContent||'').replace(/\s+/g,' ').trim().toLowerCase();
+                if (t === 'continue with google' || t === 'sign in with google' || t === 'log in with google') {
+                    const r = e.getBoundingClientRect();
+                    if (r.width>4 && r.height>4) return {x:r.x+r.width/2, y:r.y+r.height/2, w:r.width, h:r.height, t};
+                }
+            }
+            return null;
+        }""")
+        log("button rect:", rect)
+
+        async def try_click(method):
+            try:
+                async with ctx.expect_page(timeout=8000) as pi:
+                    if method == "mouse" and rect:
+                        await page.mouse.click(rect["x"], rect["y"])
+                    elif method == "locator":
+                        await page.get_by_text("Continue with Google", exact=False).first.click(timeout=5000)
+                    elif method == "eval":
+                        await page.evaluate("""() => {
+                            const els=[...document.querySelectorAll("button,[role='button'],div,span,a")];
+                            const b=els.find(e=>(e.textContent||'').trim().toLowerCase()==='continue with google');
+                            if(b) b.click();
+                        }""")
+                pop = await pi.value
+                log(f"  [{method}] → POPUP OPENED ✅  url={str(pop.url)[:70]}")
+                return pop
+            except Exception as e:
+                log(f"  [{method}] → no popup ({str(e)[:50]})")
+                return None
+
+        log("--- testing click methods (watch which one opens the Google popup) ---")
+        pop = await try_click("mouse")
+        if not pop:
+            pop = await try_click("locator")
+        if not pop:
+            pop = await try_click("eval")
+        if pop:
+            try:
+                await pop.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(2)
+                txt = await pop.evaluate("() => (document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,200)")
+                log("  popup text:", txt)
+            except Exception:
+                pass
+
+        log("--- now driving the full login_via_google for comparison ---")
+        ok = await s.login_via_google(timeout=60)
         log("login_via_google returned:", ok)
         await asyncio.sleep(2)
         log("AFTER: is_logged_in:", await s.is_logged_in(),
