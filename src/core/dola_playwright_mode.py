@@ -511,7 +511,24 @@ class PlaywrightDolaModeManager:
                     alog("login failed — retiring account (re-login it in Account Manager → "
                          "'Login for dola (Google)')")
                     return
-            await main_session._ensure_base()
+            # login_via_google only checks cookies, so a stale-cookie GUEST passes it —
+            # but then dola fires no signed requests and _ensure_base can't capture the
+            # base params (it would crash the worker). Verify a REAL login first and
+            # retire cleanly with a clear message if the Google session is actually dead.
+            try:
+                if not await main_session.logged_in_for_real():
+                    alog("account is GUEST / Google session dead (cookies present but page "
+                         "shows guest) — retiring; re-login it in Account Manager → "
+                         "'Login for dola (Google)'")
+                    return
+            except Exception:
+                pass
+            try:
+                await main_session._ensure_base()
+            except Exception as e:
+                alog(f"could not initialise dola session ({str(e)[:70]}) — likely a "
+                     "guest/logged-out account; retiring (re-login it)")
+                return
             if self._cloak:
                 await _save_cookies(session_path, ctx)
 
