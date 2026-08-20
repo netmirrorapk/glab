@@ -90,6 +90,19 @@ async def run(args):
                 "| dola passport cookies now:", sorted({c['name'] for c in ck3} & LOGIN_COOKIES) or "(still NONE)")
         except Exception as e:
             log("ensure_logged_in error:", str(e)[:80])
+        # 2b) The NEW direct login (navigate to Google OAuth authorize URL, no UI click)
+        log("--- trying login_direct (Google OAuth redirect → dola callback, NO click) ---")
+        try:
+            dok = await s.login_direct(timeout=30)
+            ck4 = await ctx.cookies(DOLA_ORIGIN)
+            log("login_direct returned:", dok,
+                "| logged_in_for_real:", await s.logged_in_for_real(),
+                "| dola passport cookies:", sorted({c['name'] for c in ck4} & LOGIN_COOKIES) or "(NONE)")
+        except Exception as e:
+            import traceback
+            log("login_direct error:", str(e)[:100]); traceback.print_exc()
+        if await s.logged_in_for_real():
+            log("✅✅ DIRECT LOGIN WORKED — dola session established without any UI click!")
         # back to the create page for the click tests
         try:
             await page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
