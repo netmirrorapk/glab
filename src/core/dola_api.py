@@ -383,47 +383,39 @@ class DolaSession:
             "&redirect_uri=" + urllib.parse.quote("https://www.dola.com/auth/callback", safe="") +
             "&response_type=token&scope=" + urllib.parse.quote("email profile") +
             "&state=" + state)
+        # Navigate to Google's authorize URL. With an active Google session Google
+        # bounces to dola.com/auth/callback#access_token=… and dola's OWN callback page-JS
+        # then runs the CLIENT-SIGNED login flow (login_only → age_gate → login/, with the
+        # msToken/X-Bogus/_signature params only its JSSDK can produce). We must NOT POST
+        # it ourselves — those params can't be forged; we just drive the page + age gate.
         try:
             await self.page.goto(auth_url, wait_until="domcontentloaded")
         except Exception:
             pass
-        # Google bounces to dola/auth/callback#access_token=… ; grab the token and POST it.
         deadline = time.time() + timeout
-        token = ""
         while time.time() < deadline:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.5)
             try:
-                cur = str(self.page.url or "")
+                cur = str(self.page.url or "").lower()
             except Exception:
                 cur = ""
-            if "access_token=" in cur and "dola.com" in cur:
-                m = re.search(r"access_token=([^&#]+)", cur)
-                if m:
-                    token = urllib.parse.unquote(m.group(1))
-                    break
-            if "dola.com/auth/callback" in cur or "dola.com/chat" in cur:
-                # the callback page may already be exchanging it — give it a moment
-                if await self.is_logged_in():
-                    break
-            if "accounts.google.com" in cur and "signin" in cur:
-                return False  # Google needs interactive sign-in — can't do silently
-        # Exchange the token ourselves (belt-and-braces; the callback JS also tries).
-        if token and not await self.is_logged_in():
-            js = """async ({tok}) => {
-                const body = 'platform_app_id=2085&access_token=' + encodeURIComponent(tok)
-                    + '&mix_mode=1&extra_info=%7B%7D';
-                try {
-                    const r = await fetch('https://www.dola.com/passport/web/auth/login/?aid=489823', {
-                        method:'POST', credentials:'include',
-                        headers:{'content-type':'application/x-www-form-urlencoded'}, body});
-                    return {status:r.status, body:(await r.text()).slice(0,200)};
-                } catch(e){ return {status:-1, body:''+e}; }
-            }"""
+            # Google needs an interactive sign-in / account chooser → can't do silently.
+            if "accounts.google.com" in cur and ("signin" in cur or "accountchooser" in cur):
+                return False
+            # the callback JS may raise an age-gate modal — confirm it (in-page click).
             try:
-                await self.page.evaluate(js, {"tok": token})
+                await self._trusted_click(["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"])
             except Exception:
                 pass
-        # settle on a dola page and confirm
+            if await self.logged_in_for_real():
+                return True
+            # if we've been parked on the bare callback with no progress, nudge to chat
+            if "dola.com/auth/callback" in cur:
+                try:
+                    await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+                except Exception:
+                    pass
+        # final settle + confirm
         try:
             await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
             await asyncio.sleep(2)
