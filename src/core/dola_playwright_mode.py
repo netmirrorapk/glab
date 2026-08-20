@@ -34,7 +34,7 @@ from src.db.db_manager import (
 )
 from src.core.dola_api import (
     DolaSession, DailyLimitReached, GenerationRefused,
-    NotLoggedIn, GotImagesNotVideo, HighDemand, DolaError,
+    NotLoggedIn, GotImagesNotVideo, HighDemand, DolaError, DOLA_ORIGIN,
 )
 # Reuse the exact same resolvers / filename helpers / allowed-value sets as the
 # extension dola mode so both modes behave identically and share the UI settings.
@@ -526,9 +526,20 @@ class PlaywrightDolaModeManager:
             try:
                 await main_session._ensure_base()
             except Exception as e:
-                alog(f"could not initialise dola session ({str(e)[:70]}) — likely a "
-                     "guest/logged-out account; retiring (re-login it)")
-                return
+                # one more try — cloak sessions sometimes need a beat before dola fires
+                # its signed XHRs (esp. with a partial cookie export, low google=N).
+                alog(f"session init slow ({str(e)[:50]}) — retrying after a nudge…")
+                try:
+                    await main_session.page.goto(f"{DOLA_ORIGIN}/chat/create-video",
+                                                 wait_until="domcontentloaded")
+                    await asyncio.sleep(3)
+                    await main_session._ensure_base()
+                except Exception as e2:
+                    alog(f"could not initialise dola session ({str(e2)[:60]}). The account IS "
+                         "logged in but the CloakBrowser cookie export looks incomplete "
+                         "(low google cookie count) — re-login it via 'Login for dola (Google)', "
+                         "or switch Browser Mode to real Chrome for this run. Retiring.")
+                    return
             if self._cloak:
                 await _save_cookies(session_path, ctx)
 
