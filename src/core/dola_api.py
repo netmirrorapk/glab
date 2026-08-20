@@ -80,6 +80,17 @@ _RECT_JS = r"""(wants) => {
           label:(el.textContent||'').replace(/\s+/g,' ').trim().slice(0,30)};
 }"""
 
+# Pick the right Google account row inside the GSI popup (by email, else the first).
+_GOOGLE_PICK_JS = r"""(email) => {
+  const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
+    .filter(e => { const t=(e.innerText||'').toLowerCase();
+      return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<120; });
+  let el = email ? rows.find(e => (e.innerText||'').toLowerCase().indexOf(email)!==-1) : null;
+  if(!el) el = rows[0];
+  if(el){ el.click(); return true; }
+  return false;
+}"""
+
 # ── FULL verdict markers, ported from the extension (dola.js + dola_mode.py) ──
 # Definitive daily-limit / out-of-quota (account can't generate now).
 _LIMIT_MARKERS = (
@@ -399,15 +410,14 @@ class DolaSession:
                 cur = str(self.page.url or "").lower()
             except Exception:
                 cur = ""
-            # Google needs an interactive sign-in / account chooser → can't do silently.
+            # Google needs an interactive sign-in / account chooser → silent path is
+            # out; break to the UI fallback (which drives the login modal) below.
             if "accounts.google.com" in cur and ("signin" in cur or "accountchooser" in cur):
-                return False
-            # the callback JS may raise an age-gate modal — confirm it (in-page click).
-            try:
-                await self._trusted_click(["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"])
-            except Exception:
-                pass
+                break
+            # the callback JS may raise an age-gate modal — confirm it (robust click).
+            await self._robust_click(["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"])
             if await self.logged_in_for_real():
+                self._log("login_direct: logged in via silent OAuth redirect")
                 return True
             # if we've been parked on the bare callback with no progress, nudge to chat
             if "dola.com/auth/callback" in cur:
@@ -415,13 +425,18 @@ class DolaSession:
                     await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
                 except Exception:
                     pass
-        # final settle + confirm
+        # Silent redirect didn't establish the session (or Google wanted an account
+        # chooser) → fall back to the robust UI login. This is the 'kabhi pehle Log In
+        # button pe click karna padta hai' path — same deterministic entry point.
         try:
             await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
         except Exception:
             pass
-        return await self.logged_in_for_real()
+        if await self.logged_in_for_real():
+            return True
+        self._log("login_direct: silent path didn't land → UI fallback (login_via_google)")
+        return await self.login_via_google(timeout=max(45, timeout))
 
     async def ensure_logged_in(self, timeout: int = 25) -> bool:
         """Ensure the dola.com session is live. dola's login is auto_open: with an
@@ -460,51 +475,109 @@ class DolaSession:
         except Exception:
             return None
 
+    async def _robust_click(self, wants) -> bool:
+        """Click a visible element matching any label in `wants`, trying THREE methods
+        in order — because in CloakBrowser a single page.mouse.click is frequently
+        dropped (that's the 'kabhi click hi nahi karta' flakiness). Returns True if a
+        click was dispatched by any method:
+          1) Playwright locator.click  — a real trusted gesture, auto-waits + retries
+          2) page.mouse.click at the element centre
+          3) JS el.click() on the element under that point
+        """
+        # 1) Playwright locator — proper trusted gesture, most reliable
+        for t in wants:
+            try:
+                loc = self.page.get_by_text(t, exact=False).first
+                if await loc.count() and await loc.is_visible():
+                    try:
+                        await loc.scroll_into_view_if_needed(timeout=1200)
+                    except Exception:
+                        pass
+                    await loc.click(timeout=2500)
+                    return True
+            except Exception:
+                pass
+        # 2) + 3) compute the centre, real mouse click, then JS click fallback
+        try:
+            rect = await self.page.evaluate(_RECT_JS, wants)
+        except Exception:
+            rect = None
+        if rect:
+            try:
+                await self.page.mouse.click(rect["x"], rect["y"])
+                return True
+            except Exception:
+                pass
+            try:
+                await self.page.evaluate(
+                    "(r)=>{const e=document.elementFromPoint(r.x,r.y); if(e){e.click(); return true;} return false;}",
+                    rect)
+                return True
+            except Exception:
+                pass
+        return False
+
     async def login_via_google(self, gmail: str = None, timeout: int = 90) -> bool:
-        """Drive dola's own 'Continue with Google' login (extension-style) against
-        the profile's active Google session. Establishes the dola session even when
-        dola's silent auto-login doesn't fire. Used for first login AND for the
-        re-login after a burn-recreate (delete)."""
+        """Drive dola's own Google login against the profile's active Google session.
+        Handles BOTH paths dola actually uses — confirmed with the user:
+          (A) the silent auto-login that sometimes fires on its own, and
+          (B) the one that only appears AFTER you click 'Log In' to open the modal
+              ('kabhi pehle login button pe click karna padta hai phir aata hai').
+        Uses `_robust_click` (locator + mouse + JS) because CloakBrowser drops bare
+        mouse clicks, and RETRIES the whole sequence until it logs in or `timeout`
+        — so it's deterministic, not a one-shot 'tukka'. Used for first login AND
+        for the re-login after a burn-recreate (delete)."""
         await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
         await asyncio.sleep(2.5)
         # REAL check (page state, not just stale cookies) — a deleted account keeps
         # its dola cookies but shows the guest page, so we must actually log in.
         if await self.logged_in_for_real():
             return True
-        await self._trusted_click(["log in", "login", "sign in", "log in / sign up", "sign up / log in"])
-        await asyncio.sleep(1.8)
-        popup = None
-        try:
-            async with self.ctx.expect_page(timeout=12000) as pi:
-                await self._trusted_click(["continue with google", "sign in with google", "log in with google"])
-            popup = await pi.value
-        except Exception:
-            popup = None
-        if popup:
-            try:
-                await popup.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(2)
-                await popup.evaluate(
-                    r"""(email) => {
-                        const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
-                          .filter(e => { const t=(e.innerText||'').toLowerCase();
-                            return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<120; });
-                        let el = email ? rows.find(e => (e.innerText||'').toLowerCase().indexOf(email)!==-1) : null;
-                        if(!el) el = rows[0];
-                        if(el){ el.click(); return true; }
-                        return false;
-                    }""", (gmail or "").lower())
-            except Exception:
-                pass
+
         deadline = time.time() + timeout
+        email = (gmail or "").lower()
+        age_gate = ["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"]
+        rounds = 0
         while time.time() < deadline:
-            await asyncio.sleep(2)
+            rounds += 1
+            # (A) open the login modal. Clicking 'Log In' also kicks dola's OAuth JS;
+            #     on many runs the dola session appears right after this with no
+            #     further click (Google already signed in → silent token exchange).
+            await self._robust_click(["log in", "login", "sign in", "log in / sign up",
+                                      "sign up / log in", "get started"])
+            for _ in range(3):
+                await asyncio.sleep(1.5)
+                await self._robust_click(age_gate)          # age modal if it pops
+                if await self.logged_in_for_real():
+                    self._log(f"login_via_google: logged in after 'Log In' (round {rounds})")
+                    return True
+
+            # (B) still guest → click 'Continue with Google'. It may open a popup
+            #     (pick the account) OR redirect silently (Google already signed in).
+            popup = None
             try:
-                await self._trusted_click(["i am 18", "confirm", "i'm 18", "yes", "continue"])  # age modal
+                async with self.ctx.expect_page(timeout=6000) as pi:
+                    await self._robust_click(["continue with google", "sign in with google",
+                                              "log in with google"])
+                popup = await pi.value
             except Exception:
-                pass
-            if await self.logged_in_for_real():
-                return True
+                popup = None
+            if popup:
+                try:
+                    await popup.wait_for_load_state("domcontentloaded")
+                    await asyncio.sleep(1.8)
+                    await popup.evaluate(_GOOGLE_PICK_JS, email)
+                except Exception:
+                    pass
+
+            # settle: OAuth redirect / age gate / session-cookie write
+            for _ in range(6):
+                await asyncio.sleep(2)
+                await self._robust_click(age_gate)
+                if await self.logged_in_for_real():
+                    self._log(f"login_via_google: logged in via Google (round {rounds})")
+                    return True
+            # otherwise loop back and retry the whole sequence until the deadline
         return await self.logged_in_for_real()
 
     async def fetch_capabilities(self) -> dict:
