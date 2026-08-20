@@ -137,18 +137,28 @@ def _cookie_cache(session_path):
 
 
 async def _cookies_for(session_path):
+    """Cookies to seed CloakBrowser with. Prefer a FRESH export from the dedicated
+    profile (it holds the CURRENT Google login) rather than a possibly-stale cache — a
+    stale file can be missing session cookies (low google=N) and leave the cloak session
+    only half-authenticated, so dola never fires its signed XHRs and _ensure_base fails.
+    The cache is used only if a fresh export fails."""
     cf = _cookie_cache(session_path)
+    try:
+        ck = await _export_cookies(session_path)
+        if ck:
+            try:
+                json.dump(ck, open(cf, "w", encoding="utf-8"))
+            except Exception:
+                pass
+            return ck
+    except Exception:
+        pass
     if os.path.isfile(cf):
         try:
             return json.load(open(cf, encoding="utf-8"))
         except Exception:
             pass
-    ck = await _export_cookies(session_path)
-    try:
-        json.dump(ck, open(cf, "w", encoding="utf-8"))
-    except Exception:
-        pass
-    return ck
+    return []
 
 
 def _save_cookies_file(session_path, cookies):
