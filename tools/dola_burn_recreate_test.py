@@ -108,12 +108,17 @@ async def run(args):
             log("❌ re-login after delete failed"); return
         await session._ensure_base()
         info2 = await session.account_info()
-        rl = await session.check_rate_limit()
-        log(f"✅ RECREATED — user_id={info2['user_id']} (old={old_uid}) "
-            f"| new-account={info2['user_id'] != old_uid} | send-throttled={rl.get('is_limit')}")
+        new_uid = info2["user_id"]
+        fresh_ok = new_uid != 0 and new_uid != old_uid
+        rl = await session.check_rate_limit() if fresh_ok else {}
+        log(f"RECREATED check — user_id={new_uid} (old={old_uid}) | valid-new-account={fresh_ok}"
+            + (f" | send-throttled={rl.get('is_limit')}" if fresh_ok else ""))
         print("\n" + "=" * 78)
-        print(f"[burn-test] SUCCESS — burn→recreate complete. "
-              f"old_uid={old_uid} new_uid={info2['user_id']}")
+        if fresh_ok:
+            print(f"[burn-test] ✅ SUCCESS — burn→recreate complete. old_uid={old_uid} new_uid={new_uid}")
+        else:
+            print(f"[burn-test] ❌ RECREATE FAILED — new session not valid (user_id={new_uid}). "
+                  "The re-login did not create a live account.")
         print("=" * 78)
 
     except DolaError as e:

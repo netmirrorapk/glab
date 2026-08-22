@@ -439,6 +439,29 @@ class DolaSession:
                 return False
             await asyncio.sleep(interval)
 
+    async def clear_dola_cookies(self):
+        """Remove dola's passport/session cookies from the context. Used before a post-delete
+        RECREATE: after a burn the profile keeps the OLD account's dola cookies, which pass
+        the cookie gate but are a DEAD session — clearing them forces a genuine fresh login
+        (a brand-new account on the same Google). Google cookies are left untouched."""
+        cleared = False
+        for kw in ({"domain": "www.dola.com"}, {"domain": ".dola.com"}, {"domain": "dola.com"}):
+            try:
+                await self.ctx.clear_cookies(**kw)
+                cleared = True
+            except Exception:
+                pass
+        if not cleared:
+            # older Playwright without filtered clear_cookies → keep only non-dola cookies
+            try:
+                allck = await self.ctx.cookies()
+                keep = [c for c in allck if "dola.com" not in str(c.get("domain", ""))]
+                await self.ctx.clear_cookies()
+                if keep:
+                    await self.ctx.add_cookies(keep)
+            except Exception:
+                pass
+
     async def _page_is_guest(self) -> bool:
         """Look at the ACTUAL page, not just cookies. After a delete the dola
         cookies linger (stale) so the cookie check false-positives — but the page
@@ -626,8 +649,20 @@ class DolaSession:
             await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
         except Exception:
             pass
-        if await self._wait_logged_in(1.5):
+        # Decide 'already logged in' SERVER-SIDE, not by cookies alone. After a burn/delete
+        # the profile still holds the OLD dola cookies — they pass the cookie gate but are a
+        # DEAD session (account_info user_id 0). If we see that, CLEAR them so this becomes a
+        # genuine fresh login (recreate) instead of a false 'already logged in'.
+        if await self.confirm_logged_in():
             return True
+        if await self.is_logged_in():
+            self._log("dola login: stale/dead dola cookies present (not a live session) → "
+                      "clearing before re-login")
+            await self.clear_dola_cookies()
+            try:
+                await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+            except Exception:
+                pass
 
         last_state = None
         clicked_google_at = 0.0

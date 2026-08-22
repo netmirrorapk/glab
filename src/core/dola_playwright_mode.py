@@ -150,9 +150,14 @@ async def _export_cookies(profile_dir, log=None):
             try:
                 from src.core.dola_api import DolaSession
                 dsess = DolaSession(ctx, pg, logger=(log or (lambda *a: None)))
-                if await dsess.is_logged_in():
+                # SERVER-SIDE check, not cookie-only: after a burn/delete the profile keeps
+                # the OLD account's dola cookies (they pass the cookie gate but user_id is 0).
+                if await dsess.confirm_logged_in():
                     _l("dola session already present in profile ✅")
                 else:
+                    if await dsess.is_logged_in():
+                        _l("stale/dead dola cookies in profile → clearing before re-login (recreate)")
+                        await dsess.clear_dola_cookies()
                     _l("establishing dola session in real Chrome…")
                     ok = await dsess.login_via_google(timeout=45)
                     _l(f"dola login in real Chrome: {'✅ done' if ok else '❌ failed — cloak will retry'}")
