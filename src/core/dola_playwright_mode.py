@@ -221,7 +221,9 @@ async def _fresh_relogin(session, session_path, log=None, timeout=90) -> bool:
         _l(f"re-seeded FRESH Google cookies from real Chrome (google={g}) → logging into dola…")
     except Exception as e:
         _l("fresh cookie re-seed failed:", str(e)[:80])
-    return await session.login_via_google(timeout=timeout)
+    # login_direct = silent OAuth redirect first (NO UI clicks — Google is signed in so it
+    # auto-returns), and it internally falls back to the state-driven login_via_google.
+    return await session.login_direct(timeout=timeout)
 
 
 async def _add_cookies_robust(ctx, cookies, log=None):

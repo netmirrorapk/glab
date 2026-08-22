@@ -81,6 +81,14 @@ async def run(args):
         except Exception as e:
             log("google check error:", str(e)[:80])
 
+        # 1b) DETERMINISTIC screen detection — what login screen is dola showing NOW?
+        try:
+            scr = await s._dola_login_screen()
+            log("dola login screen RIGHT NOW:", scr.get("state"),
+                "| flags:", {k: scr.get(k) for k in ("googleBtn", "loginBtn", "ageGate", "googleSignin")})
+        except Exception as e:
+            log("screen detect error:", str(e)[:80])
+
         # 2) Try the DIRECT / SILENT login (dola auto_open OAuth, prompt=none, NO click)
         log("--- trying DIRECT silent login (ensure_logged_in, 25s, no UI click) ---")
         try:
