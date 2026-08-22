@@ -130,15 +130,29 @@ _DOLA_LOGIN_SCREEN_JS = r"""() => {
   };
 }"""
 
-# Pick the right Google account row inside the GSI popup (by email, else the first).
+# Pick the right Google account tile in the OAuth account chooser (by email, else first).
+# Prefers data-identifier (the canonical account attribute), then a visible row whose text
+# contains the email. Clicks the nearest clickable ancestor so the tile actually navigates.
 _GOOGLE_PICK_JS = r"""(email) => {
-  const rows = Array.from(document.querySelectorAll("div[data-identifier], li, div[role='link'], div"))
-    .filter(e => { const t=(e.innerText||'').toLowerCase();
-      return t.indexOf('@')!==-1 && e.getBoundingClientRect().height>20 && e.getBoundingClientRect().height<120; });
-  let el = email ? rows.find(e => (e.innerText||'').toLowerCase().indexOf(email)!==-1) : null;
-  if(!el) el = rows[0];
-  if(el){ el.click(); return true; }
-  return false;
+  const vis = e => { const r=e.getBoundingClientRect(); return r.width>40 && r.height>20; };
+  const clickable = e => e.closest("[data-identifier],[role='link'],[role='button'],a,button,li") || e;
+  email = (email||'').toLowerCase();
+  // 1) exact data-identifier match
+  if (email) {
+    const di = document.querySelector(`[data-identifier="${email}"]`);
+    if (di && vis(di)) { clickable(di).click(); return 'data-identifier'; }
+  }
+  // 2) a visible element whose text contains the email
+  const all = Array.from(document.querySelectorAll("div,li,a,button,span")).filter(vis);
+  if (email) {
+    const hit = all.find(e => (e.innerText||'').toLowerCase().includes(email));
+    if (hit) { clickable(hit).click(); return 'email-text'; }
+  }
+  // 3) any account row (contains '@'), first one
+  const row = all.find(e => { const t=(e.innerText||'').toLowerCase();
+    const r=e.getBoundingClientRect(); return t.indexOf('@')!==-1 && r.height>20 && r.height<130; });
+  if (row) { clickable(row).click(); return 'first-row'; }
+  return '';
 }"""
 
 # ── FULL verdict markers, ported from the extension (dola.js + dola_mode.py) ──
@@ -681,6 +695,7 @@ class DolaSession:
 
         last_state = None
         clicked_google_at = 0.0
+        chooser_tries = 0
         while time.time() < deadline:
             if await self.is_logged_in():
                 self._log("dola login: session landed")
@@ -691,23 +706,37 @@ class DolaSession:
                 last_state = st
 
             if st == "google_chooser":
-                # Google IS signed in but wants the account PICKED (very common right after a
-                # burn/logout — dola invalidated the old grant). This is NOT a dead session;
-                # pick the account tile (by email), then confirm any consent screen.
-                self._log("dola login: Google account chooser → picking the account")
-                picked = False
-                if email:
-                    picked = await self._robust_click([email])
-                if not picked:
-                    try:
-                        picked = bool(await self.page.evaluate(_GOOGLE_PICK_JS, email))
-                    except Exception:
-                        picked = False
-                await asyncio.sleep(1.2)
-                await self._robust_click(["continue", "allow", "confirm", "next", "agree"])
+                # Google IS signed in but wants the account PICKED (common after a burn/logout
+                # — dola invalidated the old grant). Pick the tile, then confirm any consent.
+                chooser_tries += 1
+                try:
+                    cur = str(self.page.url or "")
+                    snippet = await self.page.evaluate(
+                        "() => (document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,140)")
+                except Exception:
+                    cur, snippet = "", ""
+                self._log(f"dola login: Google account chooser (try {chooser_tries}) "
+                          f"url={cur[:55]} | {snippet[:90]}")
+                # pick via JS (clicks data-identifier / email tile), then a real gesture too
+                picked = ""
+                try:
+                    picked = await self.page.evaluate(_GOOGLE_PICK_JS, email)
+                except Exception:
+                    picked = ""
+                if not picked and email:
+                    if await self._robust_click([email]):
+                        picked = "robust-email"
+                self._log(f"  chooser pick: {picked or 'NOTHING MATCHED'}")
+                await asyncio.sleep(1.5)
+                # a consent / 'continue to dola' screen may follow the pick
+                await self._robust_click(["continue", "allow", "confirm", "next", "agree", email])
                 if await self._wait_logged_in(8):
                     self._log("dola login: session landed after account-chooser pick")
                     return True
+                if chooser_tries >= 4:
+                    self._log("dola login: chooser didn't advance after 4 tries → bail "
+                              "(re-login this account's Google via the button)")
+                    return False
                 continue
 
             if st == "google_signin":
