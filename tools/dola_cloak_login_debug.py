@@ -39,8 +39,8 @@ async def run(args):
     print(f"proxy   : {acc['proxy'] or '(none)'}")
     print("=" * 74)
 
-    log("exporting FRESH cookies from the dedicated profile…")
-    cookies = await _export_cookies(acc["session_path"])
+    log("exporting FRESH cookies from the dedicated profile (verifies Google session first)…")
+    cookies = await _export_cookies(acc["session_path"], log=log)
     g = sum(1 for c in cookies if "google.com" in str(c.get("domain", "")))
     log(f"exported {len(cookies)} cookies (google={g})")
 

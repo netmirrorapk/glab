@@ -107,8 +107,20 @@ async def _launch(profile_dir, proxy, headless):
     return p, ctx
 
 
-async def _export_cookies(profile_dir):
-    """Grab a dedicated profile's cookies (Google + dola) to seed CloakBrowser."""
+async def _export_cookies(profile_dir, log=None):
+    """Grab a dedicated profile's cookies (Google + dola) to seed CloakBrowser.
+
+    The profile is the one the user logged into via 'Login for dola (Google)' in real
+    Chrome; everything then runs in CloakBrowser off these cookies. A bare ctx.cookies()
+    RIGHT after launch can miss late-written Google session cookies (Chrome's network
+    service is still hydrating), which is exactly why cloak sometimes showed 'Google not
+    signed in' and google=N came out low/varying. So: open the profile, NAVIGATE to
+    accounts.google.com so Chrome fully materialises + rotates the Google session, verify
+    the session is actually LIVE, THEN read the full cookie jar. A dead profile session is
+    reported (so the account can be re-logged) instead of silently exporting nothing."""
+    def _l(*a):
+        if log:
+            log(*a)
     chrome = _find_chrome()
     p = await async_playwright().start()
     try:
@@ -118,7 +130,22 @@ async def _export_cookies(profile_dir):
             args=["--no-first-run", "--no-default-browser-check",
                   "--window-position=-32000,-32000", "--window-size=1200,800"])
         try:
-            return await asyncio.wait_for(ctx.cookies(), timeout=30)
+            # hydrate the Google session before reading cookies
+            try:
+                pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await pg.goto("https://accounts.google.com/", wait_until="domcontentloaded")
+                await asyncio.sleep(2.5)
+                url = str(pg.url or "").lower()
+                live = ("myaccount.google.com" in url or
+                        ("accounts.google.com" in url and "signin" not in url
+                         and "servicelogin" not in url and "chooser" not in url))
+                _l(f"profile Google session: {'LIVE ✅' if live else 'LOGGED OUT ❌ — re-login this account via Login for dola (Google)'}")
+            except Exception as e:
+                _l("google hydrate skipped:", str(e)[:60])
+            ck = await asyncio.wait_for(ctx.cookies(), timeout=30)
+            g = sum(1 for c in ck if "google.com" in str(c.get("domain", "")))
+            _l(f"exported {len(ck)} cookies (google={g})")
+            return ck
         finally:
             try:
                 await asyncio.wait_for(ctx.close(), timeout=15)
@@ -136,7 +163,7 @@ def _cookie_cache(session_path):
     return os.path.join(session_path, "_dola_cloak_cookies.json")
 
 
-async def _cookies_for(session_path):
+async def _cookies_for(session_path, log=None):
     """Cookies to seed CloakBrowser with. Prefer a FRESH export from the dedicated
     profile (it holds the CURRENT Google login) rather than a possibly-stale cache — a
     stale file can be missing session cookies (low google=N) and leave the cloak session
@@ -144,7 +171,7 @@ async def _cookies_for(session_path):
     The cache is used only if a fresh export fails."""
     cf = _cookie_cache(session_path)
     try:
-        ck = await _export_cookies(session_path)
+        ck = await _export_cookies(session_path, log=log)
         if ck:
             try:
                 json.dump(ck, open(cf, "w", encoding="utf-8"))
@@ -187,7 +214,7 @@ async def _fresh_relogin(session, session_path, log=None, timeout=90) -> bool:
         if log:
             log(*a)
     try:
-        fresh = await _export_cookies(session_path)
+        fresh = await _export_cookies(session_path, log=log)
         g = sum(1 for c in fresh if "google.com" in str(c.get("domain", "")))
         await _add_cookies_robust(session.ctx, fresh, log=log)
         _save_cookies_file(session_path, fresh)
@@ -522,7 +549,7 @@ class PlaywrightDolaModeManager:
         try:
             alog(f"opening account ({'CloakBrowser' if self._cloak else 'Chrome'})…")
             if self._cloak:
-                cookies = await _cookies_for(session_path)
+                cookies = await _cookies_for(session_path, log=alog)
                 p, ctx = await _launch_cloak(cookies, _proxy_dict(proxy), self._headless, log=alog)
             else:
                 p, ctx = await _launch(session_path, proxy, self._headless)
@@ -863,7 +890,7 @@ class PlaywrightDolaModeManager:
             # delete (this is exactly what made the delete succeed in dola_delete_test).
             if state.get("cloak") and state.get("ctx") and state.get("session_path"):
                 try:
-                    fresh = await _export_cookies(state["session_path"])
+                    fresh = await _export_cookies(state["session_path"], log=alog)
                     await _add_cookies_robust(state["ctx"], fresh, log=alog)
                     _save_cookies_file(state["session_path"], fresh)
                 except Exception as e:
