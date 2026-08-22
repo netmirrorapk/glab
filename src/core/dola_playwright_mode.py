@@ -175,6 +175,28 @@ async def _save_cookies(session_path, ctx):
         pass
 
 
+async def _fresh_relogin(session, session_path, log=None, timeout=90) -> bool:
+    """Re-seed FRESH Google cookies from the account's REAL-Chrome profile into the
+    live CloakBrowser context, THEN drive the dola login. The Google session inside
+    the cloak context goes stale (dola logs the account out) far sooner than it does
+    in the dedicated real-Chrome profile, so EVERY (re)login pulls the current cookies
+    from the source of truth first — the user's rule: 'google cookies hamesha fresh
+    utha karo real chrome se, phir login karwao dola me'. Returns login_via_google's
+    result (login is still driven on the page; only the cookie seed is refreshed)."""
+    def _l(*a):
+        if log:
+            log(*a)
+    try:
+        fresh = await _export_cookies(session_path)
+        g = sum(1 for c in fresh if "google.com" in str(c.get("domain", "")))
+        await _add_cookies_robust(session.ctx, fresh, log=log)
+        _save_cookies_file(session_path, fresh)
+        _l(f"re-seeded FRESH Google cookies from real Chrome (google={g}) → logging into dola…")
+    except Exception as e:
+        _l("fresh cookie re-seed failed:", str(e)[:80])
+    return await session.login_via_google(timeout=timeout)
+
+
 async def _add_cookies_robust(ctx, cookies, log=None):
     """Inject cookies into a context ONE-BY-ONE with sanitisation, so a single malformed
     cookie (bad sameSite, a __Host-/__Secure- prefix with a domain, a partitionKey field,
@@ -509,15 +531,10 @@ class PlaywrightDolaModeManager:
 
             alog("checking dola login…")
             if not await main_session.login_via_google(timeout=90):
-                if self._cloak:
-                    alog("login failed — re-exporting FRESH cookies from the dedicated profile & retrying…")
-                    try:
-                        fresh = await _export_cookies(session_path)
-                        await _add_cookies_robust(ctx, fresh, log=alog)
-                        _save_cookies_file(session_path, fresh)
-                    except Exception as e:
-                        alog("cookie refresh failed:", str(e)[:80])
-                if not await main_session.login_via_google(timeout=90):
+                # retry with a FRESH cookie re-seed from real Chrome (cloak only)
+                ok = (await _fresh_relogin(main_session, session_path, log=alog, timeout=90)
+                      if self._cloak else await main_session.login_via_google(timeout=90))
+                if not ok:
                     alog("login failed — retiring account (re-login it in Account Manager → "
                          "'Login for dola (Google)')")
                     return
@@ -653,7 +670,9 @@ class PlaywrightDolaModeManager:
                     if not await session.logged_in_for_real():
                         alog = lambda *a: self._log(f"[DolaPW][{tag}] " + " ".join(str(x) for x in a))
                         alog("not logged in/guest → login…")
-                        if await session.login_via_google(timeout=90):
+                        ok = (await _fresh_relogin(session, acct["session_path"], log=alog, timeout=90)
+                              if self._cloak else await session.login_via_google(timeout=90))
+                        if ok:
                             await session._ensure_base()
                 except Exception:
                     pass
@@ -743,7 +762,9 @@ class PlaywrightDolaModeManager:
                               f"+ retry same account (no burn)")
                     try:
                         if not await session.logged_in_for_real():
-                            if await session.login_via_google(timeout=90):
+                            ok = (await _fresh_relogin(session, acct["session_path"], log=self._log, timeout=90)
+                                  if self._cloak else await session.login_via_google(timeout=90))
+                            if ok:
                                 await session._ensure_base()
                     except Exception:
                         pass
@@ -758,9 +779,13 @@ class PlaywrightDolaModeManager:
                         self.qm.signals.job_updated.emit(job_id, "failed", acct, "not_logged_in")
                         self._settle(job_id)
                     else:
-                        self._log(f"[DolaPW][{tag}] session dropped (guest) → re-login + requeue")
+                        self._log(f"[DolaPW][{tag}] session dropped (guest) → re-seed fresh cookies + re-login + requeue")
                         try:
-                            if await session.login_via_google(timeout=90):
+                            ok = (await _fresh_relogin(session, acct["session_path"],
+                                                       log=lambda *a: self._log(f"[DolaPW][{tag}] " + " ".join(str(x) for x in a)),
+                                                       timeout=90)
+                                  if self._cloak else await session.login_via_google(timeout=90))
+                            if ok:
                                 await session._ensure_base()
                         except Exception:
                             pass
@@ -859,7 +884,11 @@ class PlaywrightDolaModeManager:
             try:
                 await asyncio.sleep(3)
                 main_session._base = {}
-                if not await main_session.login_via_google(timeout=90):
+                relogin_ok = (
+                    await _fresh_relogin(main_session, state["session_path"], log=alog, timeout=90)
+                    if state.get("cloak") and state.get("session_path")
+                    else await main_session.login_via_google(timeout=90))
+                if not relogin_ok:
                     alog("re-login failed → retiring")
                     state["alive"] = False
                     state["healthy"].set()
