@@ -111,10 +111,20 @@ _DOLA_LOGIN_SCREEN_JS = r"""() => {
       || body.indexOf('login failed') !== -1
       || body.indexOf('redirecting to') !== -1
       || body.indexOf('something went wrong') !== -1;
+  // On accounts.google.com, distinguish an ACCOUNT CHOOSER (Google still signed in, just
+  // pick the account) from a real SIGN-IN FORM (needs the password → truly logged out).
+  const hasPwd = !!document.querySelector("input[type=password]");
+  const acctTiles = els.filter(e => { const t=norm(e.textContent);
+    return t.indexOf('@')!==-1 && t.indexOf('.')!==-1 && t.length < 80; });
+  const googleChooser = onGoogle && !hasPwd &&
+      (acctTiles.length > 0 || url.indexOf('accountchooser')!==-1 || url.indexOf('/chooser')!==-1
+       || body.indexOf('choose an account')!==-1);
+  const googleForm = onGoogle && (hasPwd || url.indexOf('signin/v2/identifier')!==-1
+       || url.indexOf('servicelogin')!==-1);
   return {
     url,
     googleBtn, loginBtn, ageGate, callbackError,
-    onGoogle,
+    onGoogle, googleChooser, googleForm,
     googleSignin: onGoogle && (url.indexOf('signin')!==-1 || url.indexOf('servicelogin')!==-1
                                || url.indexOf('accountchooser')!==-1 || url.indexOf('/chooser')!==-1),
   };
@@ -588,7 +598,11 @@ class DolaSession:
             f = await self.page.evaluate(_DOLA_LOGIN_SCREEN_JS)
         except Exception:
             return {"state": "loading"}
-        if f.get("googleSignin"):
+        if f.get("googleChooser"):
+            state = "google_chooser"      # Google still signed in — just PICK the account
+        elif f.get("googleForm"):
+            state = "google_signin"       # real sign-in form (password) — truly logged out
+        elif f.get("googleSignin"):
             state = "google_signin"
         elif f.get("callbackError"):
             state = "callback_error"
@@ -667,23 +681,32 @@ class DolaSession:
                 self._log(f"dola login screen: {st}")
                 last_state = st
 
-            if st == "google_signin":
-                # We're on accounts.google.com. Right after clicking 'Continue with Google'
-                # this is just the redirect passing through (Google auto-consents since it's
-                # signed in) — give it time. Only a PERSISTENT chooser means it needs a real
-                # interaction (dead session) → then bail.
-                if clicked_google_at and (time.time() - clicked_google_at) < 12:
-                    if await self._wait_logged_in(1.5):
-                        return True
-                    # try auto-picking the account if a chooser is actually shown
+            if st == "google_chooser":
+                # Google IS signed in but wants the account PICKED (very common right after a
+                # burn/logout — dola invalidated the old grant). This is NOT a dead session;
+                # pick the account tile (by email), then confirm any consent screen.
+                self._log("dola login: Google account chooser → picking the account")
+                picked = False
+                if email:
+                    picked = await self._robust_click([email])
+                if not picked:
                     try:
-                        await self.page.evaluate(_GOOGLE_PICK_JS, email)
+                        picked = bool(await self.page.evaluate(_GOOGLE_PICK_JS, email))
                     except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
-                    continue
-                self._log("dola login: Google parked on an interactive sign-in/chooser → "
-                          "session dead here → bail (re-seed FRESH cookies / re-login account)")
+                        picked = False
+                await asyncio.sleep(1.2)
+                await self._robust_click(["continue", "allow", "confirm", "next", "agree"])
+                if await self._wait_logged_in(8):
+                    self._log("dola login: session landed after account-chooser pick")
+                    return True
+                continue
+
+            if st == "google_signin":
+                # A real sign-in FORM (password/identifier) — Google is genuinely logged out
+                # in this profile. Can't proceed without credentials → bail so the caller
+                # re-logs the account's Google via the 'Login for dola (Google)' button.
+                self._log("dola login: Google sign-in FORM (password needed) → Google logged "
+                          "out → bail (re-login this account's Google via the button)")
                 return False
 
             if st == "age_gate":
@@ -700,14 +723,21 @@ class DolaSession:
 
             if st == "modal_open":
                 # click 'Continue with Google' → dola's JS stores state + REDIRECTS the tab
-                # (no popup). Then poll the cookie gate while google → callback → signed
-                # login_only completes (~5-12s). This is the reliable, first-attempt path.
+                # (no popup). Then poll, but re-read state so a Google account-chooser gets
+                # handled PROMPTLY (don't blindly wait — that let the chooser sit past the
+                # bail timer and fail the recreate).
                 await self._robust_click(["continue with google", "sign in with google",
                                           "log in with google"])
                 clicked_google_at = time.time()
-                if await self._wait_logged_in(15):
-                    self._log("dola login: session landed after Continue-with-Google")
-                    return True
+                end = time.time() + 9
+                while time.time() < end:
+                    if await self.is_logged_in():
+                        self._log("dola login: session landed after Continue-with-Google")
+                        return True
+                    s2 = (await self._dola_login_screen()).get("state")
+                    if s2 in ("google_chooser", "google_signin", "age_gate", "callback_error"):
+                        break     # let the outer loop handle it immediately
+                    await asyncio.sleep(0.4)
                 continue
 
             if st == "callback_error":
