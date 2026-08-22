@@ -155,6 +155,30 @@ _GOOGLE_PICK_JS = r"""(email) => {
   return '';
 }"""
 
+# Return the CENTRE COORDINATES of the right account tile in Google's OAuth chooser, so
+# the caller can click it with a REAL page.mouse gesture — Google IGNORES a scripted
+# el.click() on the chooser (that left the pick stuck on 'first-row'), it needs a trusted click.
+_GOOGLE_TILE_RECT_JS = r"""(email) => {
+  const visr = e => { const r=e.getBoundingClientRect(); return r.width>40 && r.height>20 ? r : null; };
+  email = (email||'').toLowerCase();
+  let el = null, how = '';
+  if (email) { el = document.querySelector(`[data-identifier="${email}"]`); if (el) how = 'data-identifier'; }
+  if (!el && email) {
+    el = Array.from(document.querySelectorAll("li,div[role='link'],div,a"))
+      .find(e => visr(e) && (e.innerText||'').toLowerCase().includes(email));
+    if (el) how = 'email';
+  }
+  if (!el) {
+    el = Array.from(document.querySelectorAll("[data-identifier],li,div[role='link']"))
+      .find(e => visr(e) && (e.innerText||'').toLowerCase().indexOf('@')!==-1);
+    if (el) how = 'row';
+  }
+  if (!el) return null;
+  const c = el.closest("[data-identifier],[role='link'],[role='button'],li,a,button") || el;
+  const r = c.getBoundingClientRect();
+  return { x: r.left + r.width/2, y: r.top + r.height/2, how };
+}"""
+
 # ── FULL verdict markers, ported from the extension (dola.js + dola_mode.py) ──
 # Definitive daily-limit / out-of-quota (account can't generate now).
 _LIMIT_MARKERS = (
@@ -717,18 +741,26 @@ class DolaSession:
                     cur, snippet = "", ""
                 self._log(f"dola login: Google account chooser (try {chooser_tries}) "
                           f"url={cur[:55]} | {snippet[:90]}")
-                # pick via JS (clicks data-identifier / email tile), then a real gesture too
+                # Click the account tile with a REAL mouse gesture — Google ignores a scripted
+                # click here (that left it stuck on 'first-row'). Get the tile centre, then
+                # page.mouse.click.
                 picked = ""
                 try:
-                    picked = await self.page.evaluate(_GOOGLE_PICK_JS, email)
+                    rect = await self.page.evaluate(_GOOGLE_TILE_RECT_JS, email)
                 except Exception:
-                    picked = ""
-                if not picked and email:
+                    rect = None
+                if rect:
+                    try:
+                        await self.page.mouse.click(rect["x"], rect["y"])
+                        picked = f"mouse:{rect.get('how')}"
+                    except Exception:
+                        picked = ""
+                if not picked and email:            # locator fallback (also a real gesture)
                     if await self._robust_click([email]):
                         picked = "robust-email"
                 self._log(f"  chooser pick: {picked or 'NOTHING MATCHED'}")
                 await asyncio.sleep(1.5)
-                # a consent / 'continue to dola' screen may follow the pick
+                # a consent / 'continue to dola' screen may follow the pick (real gesture)
                 await self._robust_click(["continue", "allow", "confirm", "next", "agree", email])
                 if await self._wait_logged_in(8):
                     self._log("dola login: session landed after account-chooser pick")
