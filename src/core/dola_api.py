@@ -444,21 +444,13 @@ class DolaSession:
         RECREATE: after a burn the profile keeps the OLD account's dola cookies, which pass
         the cookie gate but are a DEAD session — clearing them forces a genuine fresh login
         (a brand-new account on the same Google). Google cookies are left untouched."""
-        cleared = False
+        # ONLY the domain-filtered clear — NEVER a blanket clear_cookies() on this context,
+        # because it's often the real-Chrome PERSISTENT profile and a clear-all would wipe
+        # the Google session from disk. If the filtered form isn't available we simply skip;
+        # the fresh login overwrites dola's cookies (sessionid/…) by name anyway.
         for kw in ({"domain": "www.dola.com"}, {"domain": ".dola.com"}, {"domain": "dola.com"}):
             try:
                 await self.ctx.clear_cookies(**kw)
-                cleared = True
-            except Exception:
-                pass
-        if not cleared:
-            # older Playwright without filtered clear_cookies → keep only non-dola cookies
-            try:
-                allck = await self.ctx.cookies()
-                keep = [c for c in allck if "dola.com" not in str(c.get("domain", ""))]
-                await self.ctx.clear_cookies()
-                if keep:
-                    await self.ctx.add_cookies(keep)
             except Exception:
                 pass
 
