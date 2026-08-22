@@ -583,7 +583,12 @@ class PlaywrightDolaModeManager:
             main_session = DolaSession(ctx, page, logger=alog)
 
             alog("checking dola login…")
-            if not await main_session.login_via_google(timeout=90):
+            # In cloak use the cloak-SAFE login_direct (inherited dola cookies, NEVER touches
+            # Google — cloak visiting Google rotates the shared __Secure-1PSIDTS and logs the
+            # profile's Gmail out). Only real-Chrome mode may drive the Google UI login.
+            first_ok = (await main_session.login_direct(timeout=30)
+                        if self._cloak else await main_session.login_via_google(timeout=90))
+            if not first_ok:
                 # retry with a FRESH cookie re-seed from real Chrome (cloak only)
                 ok = (await _fresh_relogin(main_session, session_path, log=alog, timeout=90)
                       if self._cloak else await main_session.login_via_google(timeout=90))
