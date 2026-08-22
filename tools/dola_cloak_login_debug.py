@@ -68,109 +68,30 @@ async def run(args):
         log("is_logged_in(cookies):", await s.is_logged_in(),
             "| page_is_guest:", await s._page_is_guest())
 
-        # 1) Is the cloak session ACTUALLY signed into Google? (silent OAuth needs this)
-        log("--- checking cloak's Google session (myaccount.google.com) ---")
-        try:
-            await page.goto("https://myaccount.google.com/", wait_until="domcontentloaded")
-            await asyncio.sleep(3)
-            gu = str(page.url or "")
-            gtxt = await page.evaluate("() => (document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,160)")
-            signed_in = ("myaccount.google.com" in gu and "signin" not in gu and "accountchooser" not in gu)
-            log("google url:", gu[:80])
-            log("GOOGLE signed-in in cloak:", signed_in, "| text:", gtxt[:120])
-        except Exception as e:
-            log("google check error:", str(e)[:80])
+        # NOTE: this tool NEVER navigates Google in cloak. Visiting accounts.google.com in
+        # the cloak context rotates the shared Google __Secure-1PSIDTS and logs the profile's
+        # Google out — that was the 'mail logout' bug. Cloak only ever touches dola.
 
-        # 1b) DETERMINISTIC screen detection — what login screen is dola showing NOW?
+        # 1) DETERMINISTIC dola screen detection (dola DOM only)
         try:
             scr = await s._dola_login_screen()
-            log("dola login screen RIGHT NOW:", scr.get("state"),
-                "| flags:", {k: scr.get(k) for k in ("googleBtn", "loginBtn", "ageGate", "googleSignin")})
+            log("dola login screen RIGHT NOW:", scr.get("state"))
         except Exception as e:
             log("screen detect error:", str(e)[:80])
 
-        # 2) Try the DIRECT / SILENT login (dola auto_open OAuth, prompt=none, NO click)
-        log("--- trying DIRECT silent login (ensure_logged_in, 25s, no UI click) ---")
-        try:
-            sok = await s.ensure_logged_in(timeout=3)
-            ck3 = await ctx.cookies(DOLA_ORIGIN)
-            log("ensure_logged_in (silent) returned:", sok,
-                "| dola passport cookies now:", sorted({c['name'] for c in ck3} & LOGIN_COOKIES) or "(still NONE)")
-        except Exception as e:
-            log("ensure_logged_in error:", str(e)[:80])
-        # 2b) The NEW direct login (navigate to Google OAuth authorize URL, no UI click)
-        log("--- trying login_direct (Google OAuth redirect → dola callback, NO click) ---")
+        # 2) Cloak-safe login_direct — confirms the dola session INHERITED from the
+        #    real-Chrome export; it never OAuths Google.
+        log("--- login_direct (cloak-safe: inherited dola cookies, NO Google touch) ---")
         try:
             import time as _tt
             _t0 = _tt.perf_counter()
-            dok = await s.login_direct(timeout=30)
-            _elapsed = _tt.perf_counter() - _t0
-            log(f"⏱ login_direct took {_elapsed:.1f}s")
+            dok = await s.login_direct(timeout=15)
+            log(f"login_direct took {_tt.perf_counter()-_t0:.1f}s → {dok}")
             ck4 = await ctx.cookies(DOLA_ORIGIN)
-            log("login_direct returned:", dok,
-                "| logged_in_for_real:", await s.logged_in_for_real(),
-                "| dola passport cookies:", sorted({c['name'] for c in ck4} & LOGIN_COOKIES) or "(NONE)")
+            log("dola passport cookies:", sorted({c['name'] for c in ck4} & LOGIN_COOKIES) or "(NONE)")
         except Exception as e:
             import traceback
             log("login_direct error:", str(e)[:100]); traceback.print_exc()
-        if await s.logged_in_for_real():
-            log("✅✅ DIRECT LOGIN WORKED — dola session established without any UI click!")
-        # back to the create page for the click tests
-        try:
-            await page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-        except Exception:
-            pass
-
-        # --- directly test clicking "Continue with Google" with several methods ---
-        log("--- locating 'Continue with Google' button ---")
-        rect = await page.evaluate(r"""() => {
-            const els = Array.from(document.querySelectorAll("button,[role='button'],div,span,a"));
-            for (const e of els) {
-                const t = (e.textContent||'').replace(/\s+/g,' ').trim().toLowerCase();
-                if (t === 'continue with google' || t === 'sign in with google' || t === 'log in with google') {
-                    const r = e.getBoundingClientRect();
-                    if (r.width>4 && r.height>4) return {x:r.x+r.width/2, y:r.y+r.height/2, w:r.width, h:r.height, t};
-                }
-            }
-            return null;
-        }""")
-        log("button rect:", rect)
-
-        async def try_click(method):
-            try:
-                async with ctx.expect_page(timeout=8000) as pi:
-                    if method == "mouse" and rect:
-                        await page.mouse.click(rect["x"], rect["y"])
-                    elif method == "locator":
-                        await page.get_by_text("Continue with Google", exact=False).first.click(timeout=5000)
-                    elif method == "eval":
-                        await page.evaluate("""() => {
-                            const els=[...document.querySelectorAll("button,[role='button'],div,span,a")];
-                            const b=els.find(e=>(e.textContent||'').trim().toLowerCase()==='continue with google');
-                            if(b) b.click();
-                        }""")
-                pop = await pi.value
-                log(f"  [{method}] → POPUP OPENED ✅  url={str(pop.url)[:70]}")
-                return pop
-            except Exception as e:
-                log(f"  [{method}] → no popup ({str(e)[:50]})")
-                return None
-
-        log("--- testing click methods (watch which one opens the Google popup) ---")
-        pop = await try_click("mouse")
-        if not pop:
-            pop = await try_click("locator")
-        if not pop:
-            pop = await try_click("eval")
-        if pop:
-            try:
-                await pop.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(2)
-                txt = await pop.evaluate("() => (document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,200)")
-                log("  popup text:", txt)
-            except Exception:
-                pass
 
         # --- FAST + ACCURATE login confirmation (the deterministic 'am I logged in?') ---
         import time as _t
@@ -187,25 +108,11 @@ async def run(args):
             f"email={info['email']!r}  [{(t2-t1)*1000:.0f} ms]")
         log(f"confirm_logged_in (gate+server): {deep}  [{(t3-t2)*1000:.0f} ms total]")
 
-        log("--- now driving the full login_via_google for comparison ---")
-        ok = await s.login_via_google(timeout=60)
-        log("login_via_google returned:", ok)
-        await asyncio.sleep(2)
-        log("AFTER: is_logged_in:", await s.is_logged_in(),
-            "| guest:", await s._page_is_guest(),
-            "| logged_in_for_real:", await s.logged_in_for_real())
-        log("URL now:", str(page.url)[:90])
-        ck2 = await ctx.cookies(DOLA_ORIGIN)
-        log("dola passport cookies now:", sorted({c["name"] for c in ck2} & LOGIN_COOKIES) or "(still NONE)")
-        try:
-            txt = await page.evaluate("() => (document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,220)")
-            log("page text:", txt)
-        except Exception:
-            pass
-
-        print("\n>>> Window khula hai — dekho dola kya dikha raha hai (login modal / guest / logged-in).")
-        print(">>> 180s baad apne aap band ho jayega (ya Ctrl+C).")
-        await asyncio.sleep(180)
+        log("AFTER: logged_in_for_real:", await s.logged_in_for_real(),
+            "| URL:", str(page.url)[:70])
+        print("\n>>> Done. (This tool never touches Google in cloak, so it won't log your")
+        print(">>> Gmail out.) Window 20s me band ho jayega (ya Ctrl+C).")
+        await asyncio.sleep(20)
     finally:
         try:
             await ctx.close()

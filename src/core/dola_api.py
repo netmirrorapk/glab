@@ -491,16 +491,25 @@ class DolaSession:
         return (await self.is_logged_in()) and not (await self._page_is_guest())
 
     async def login_direct(self, timeout: int = 30) -> bool:
-        """DIRECT dola login. Kept as the public entry point, but it now delegates to the
-        RELOAD-DRIVEN login_via_google, which IS dola's real 'direct' login: loading
-        dola.com with an active Google session makes dola run its own OAuth and set the
-        session (no UI click). We deliberately DON'T navigate to Google's authorize URL
-        anymore — that route triggered dola's 'could not log in, redirecting to homepage'
-        callback-error page on the first try (the exact slowness the user hit). The
-        reload-retry inside login_via_google handles dola's flaky first attempt cleanly."""
-        if await self.is_logged_in():
+        """CLOAK-SAFE dola login — uses ONLY the dola cookies inherited from the real-Chrome
+        export; it NEVER navigates Google. This is deliberate: CloakBrowser and the real
+        profile share ONE Google session, and if cloak visits Google (OAuth / account page)
+        it rotates Google's __Secure-1PSIDTS, desyncing the profile's copy → Google logs the
+        account out. So in cloak we only confirm the inherited dola session (server-side);
+        the actual Google login happens once in real Chrome during _export_cookies.
+
+        Returns True if the inherited session is live. If not, we do NOT OAuth here (that
+        would touch Google) — we return False so the caller re-exports from real Chrome."""
+        if await self.confirm_logged_in():
             return True
-        return await self.login_via_google(timeout=max(30, timeout))
+        # a dola-only nudge (reload the create page) — NEVER Google
+        try:
+            await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+        except Exception:
+            pass
+        if await self._wait_logged_in(3):
+            return await self.confirm_logged_in()
+        return False
 
     async def ensure_logged_in(self, timeout: int = 25) -> bool:
         """Ensure the dola.com session is live. dola's login is auto_open: with an
