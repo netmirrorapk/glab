@@ -614,87 +614,45 @@ class DolaSession:
         the session lands. Confirmed by the user: once the login modal appears it needs a
         ~1-2s beat before it completes — so on `modal_open` we wait, then click as backup.
         Bails immediately if Google itself wants an interactive sign-in (session dead)."""
-        email = (gmail or "").lower()
         age_gate = ["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"]
         auth_url = self._google_auth_url()
         deadline = time.time() + timeout
         attempt = 0
         while time.time() < deadline:
             attempt += 1
-            # STEP 1 — TRIGGER: authorize navigation primes dola's auth (sets the token /
-            # passport_csrf_token). Poll briefly: it may land right here, or bounce to a
-            # Google chooser (dead session), or show dola's 'could not log in' page.
+            t0 = time.time()
+            # Navigate to Google's authorize URL → auto-redirect to dola.com/auth/callback,
+            # where dola runs its signed login POSTs (login_only → age_gate → login/, ~5-10s).
             try:
                 await self.page.goto(auth_url, wait_until="domcontentloaded")
             except Exception:
                 pass
-            self._log(f"dola login attempt {attempt}: OAuth authorize → dola callback…")
-            end1 = min(time.time() + 4, deadline)
+            self._log(f"dola login attempt {attempt}: authorize → callback, completing login…")
+
+            # STAY on the callback and TIGHT-POLL until the session lands. IMPORTANT: the
+            # 'Couldn't load. Redirecting to the homepage…' text is NOT a failure — it's the
+            # callback FINISHING; the sessionid/sid_tt cookies get set right as it shows
+            # that and redirects. So we must NOT navigate away or 'retry' on it (that was
+            # aborting the login mid-POST and forcing 3 attempts). Only bail if Google
+            # itself wants an interactive sign-in (dead session). One authorize should be
+            # enough — this loop lands on attempt 1.
+            end1 = min(time.time() + 18, deadline)
             while time.time() < end1:
                 if await self.is_logged_in():
-                    self._log(f"dola login: session landed on callback (attempt {attempt})")
+                    self._log(f"dola login: session landed (attempt {attempt}, {time.time()-t0:.1f}s)")
                     return True
                 st = (await self._dola_login_screen()).get("state")
                 if st == "google_signin":
                     self._log("dola login: Google wants interactive sign-in → session dead "
                               "here → bail (caller re-seeds FRESH cookies / re-login account)")
                     return False
-                if st in ("callback_error", "modal_open", "guest_closed", "age_gate"):
-                    break
-                await asyncio.sleep(0.3)
-
-            # STEP 2 — the login modal appears on /chat/create-video after the authorize
-            # prime; load it and drive it to completion.
-            try:
-                await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video",
-                                     wait_until="domcontentloaded")
-            except Exception:
-                pass
-            end2 = min(time.time() + 8, deadline)
-            modal_waited = False
-            while time.time() < end2:
-                if await self.is_logged_in():
-                    self._log(f"dola login: session landed (attempt {attempt})")
-                    return True
-                st = (await self._dola_login_screen()).get("state")
-                if st == "google_signin":
-                    return False
-                if st == "callback_error":
-                    self._log("dola login: 'could not log in' page → re-authorizing")
-                    break
                 if st == "age_gate":
                     await self._robust_click(age_gate)
-                elif st == "modal_open":
-                    # user-confirmed: the modal needs a ~1-2s beat before it takes; wait
-                    # once, re-check, then click 'Continue with Google' as a backup.
-                    if not modal_waited:
-                        await asyncio.sleep(1.5)
-                        modal_waited = True
-                        if await self.is_logged_in():
-                            return True
-                    popup = None
-                    try:
-                        async with self.ctx.expect_page(timeout=2500) as pi:
-                            await self._robust_click(["continue with google",
-                                                      "sign in with google", "log in with google"])
-                        popup = await pi.value
-                    except Exception:
-                        popup = None
-                    if popup:
-                        try:
-                            await popup.wait_for_load_state("domcontentloaded")
-                            await asyncio.sleep(0.8)
-                            await popup.evaluate(_GOOGLE_PICK_JS, email)
-                        except Exception:
-                            pass
-                elif st == "guest_closed":
-                    await self._robust_click(["log in", "login", "sign in",
-                                              "log in / sign up", "sign up / log in"])
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.3)
 
             if await self.is_logged_in():
                 return True
-            self._log(f"dola login: attempt {attempt} didn't land → re-authorize & retry")
+            self._log(f"dola login: attempt {attempt} callback didn't complete in 18s → re-authorize")
         return await self.is_logged_in()
 
     async def fetch_capabilities(self) -> dict:
