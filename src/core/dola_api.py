@@ -21,6 +21,10 @@ CREATIVE_VIDEO_SKILL_ID = "294222337297"
 CREATIVE_VIDEO_SKILL = "creative-video"
 LOGIN_COOKIES = {"sessionid", "sid_tt", "sid_guard", "uid_tt", "sessionid_ss",
                  "passport_csrf_token", "sid_ucp_v1"}
+# The cookies that ONLY exist after a real /passport/web/auth/login/ — a signed-in
+# account. NOTE: passport_csrf_token is deliberately EXCLUDED, dola sets it for guests
+# too (a half-auth shows only passport_csrf_token), so it must never count as logged-in.
+AUTH_COOKIES = {"sessionid", "sid_tt", "uid_tt"}
 SIGN_PARAMS = {"msToken", "a_bogus", "X-Bogus", "_signature", "x-signature"}
 
 # Options exposed by /samantha/skill/pack (skill_type 17). Kept as sane fallbacks; the
@@ -372,8 +376,47 @@ class DolaSession:
         await self._ensure_base()
 
     async def is_logged_in(self) -> bool:
-        cks = await self.ctx.cookies(DOLA_ORIGIN)
-        return bool({c["name"] for c in cks} & LOGIN_COOKIES)
+        """INSTANT (microseconds, no network) login gate — the REAL auth session
+        cookies (sessionid + sid_tt) must be present. passport_csrf_token alone is a
+        GUEST, so it is not accepted (that was the old false-positive)."""
+        cks = {c["name"] for c in await self.ctx.cookies(DOLA_ORIGIN)}
+        return {"sessionid", "sid_tt"} <= cks
+
+    async def account_info(self) -> dict:
+        """One lightweight AUTHENTICATED GET — dola's passport account endpoint. This is
+        the DEFINITIVE server-side identity: {'logged_in', 'user_id', 'email'}; the
+        account is truly signed in IFF user_id != 0 (a guest/expired session returns
+        user_id 0, error_code 13 'session expired'). Uses ctx.request (fast, cookie-
+        authed, no page/CORS dependency) so it's ~one round-trip, not a page load."""
+        url = f"{DOLA_ORIGIN}/passport/account/info/v2/"
+        qs = self._qs()
+        if qs:
+            url += "?" + qs
+        try:
+            r = await self.ctx.request.get(url, timeout=8000)
+            d = json.loads((await r.text()) or "{}").get("data", {}) or {}
+        except Exception:
+            return {"logged_in": False, "user_id": 0, "email": ""}
+        try:
+            uid = int(d.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        return {"logged_in": uid != 0, "user_id": uid,
+                "email": d.get("email") or d.get("screen_name") or ""}
+
+    async def confirm_logged_in(self, deep: bool = True) -> bool:
+        """FAST + ACCURATE login confirmation — the answer to 'am I really signed in?':
+          1) instant gate (microseconds, NO network): the real auth cookies
+             (sessionid + sid_tt) must be present. If not → guest, return at once
+             (so no network time is wasted on an obvious guest).
+          2) deep (default): ONE tiny authenticated GET confirms the session is valid
+             SERVER-SIDE (user_id != 0), so an expired/rotated cookie can't fool us.
+        Returns True only when the account is genuinely, currently signed in."""
+        if not await self.is_logged_in():
+            return False
+        if not deep:
+            return True
+        return (await self.account_info()).get("logged_in", False)
 
     async def _page_is_guest(self) -> bool:
         """Look at the ACTUAL page, not just cookies. After a delete the dola
@@ -702,10 +745,11 @@ class DolaSession:
                      ratio: str = "9:16", duration: int = 10) -> str:
         """Submit a text->video generation. Returns conversation_id.
         Raises DailyLimitReached / GenerationRefused from the submit SSE itself."""
-        # Verify a REAL login (cookies present AND the page isn't the guest state)
-        # BEFORE spending a submit — a stale cookie can pass is_logged_in() while the
-        # session is actually guest, which would create a wasted guest conversation.
-        if not await self.logged_in_for_real():
+        # Verify a REAL login server-side BEFORE spending a submit — a stale/rotated
+        # cookie can pass a cookie-only check while the session is actually guest, which
+        # would create a wasted guest conversation. confirm_logged_in does the instant
+        # cookie gate + one definitive authenticated GET (user_id != 0).
+        if not await self.confirm_logged_in():
             raise NotLoggedIn("account is guest/logged-out — not submitting (needs re-login)")
         prompt_text = self._build_prompt_text(prompt, ratio)
         local_conv = f"local_{int(time.time() * 1000)}"
@@ -913,7 +957,7 @@ class DolaSession:
         separate attachment message and the task is threaded off THAT message id
         (reference-image → video). `prompt_duration` makes the length come from the
         prompt itself (see _build_skill_text)."""
-        if not await self.logged_in_for_real():
+        if not await self.confirm_logged_in():
             raise NotLoggedIn("account is guest/logged-out — not submitting (needs re-login)")
         base = prompt if str(prompt or "").strip() else ("animate the reference image" if attachment else prompt)
         text = self._build_skill_text(base, ratio, duration, prompt_duration=prompt_duration)

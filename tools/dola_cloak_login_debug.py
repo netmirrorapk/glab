@@ -168,6 +168,21 @@ async def run(args):
             except Exception:
                 pass
 
+        # --- FAST + ACCURATE login confirmation (the deterministic 'am I logged in?') ---
+        import time as _t
+        log("--- confirming login: instant cookie gate + one authenticated GET ---")
+        t0 = _t.perf_counter()
+        fast = await s.is_logged_in()
+        t1 = _t.perf_counter()
+        info = await s.account_info()
+        t2 = _t.perf_counter()
+        deep = await s.confirm_logged_in()
+        t3 = _t.perf_counter()
+        log(f"is_logged_in (cookie gate): {fast}  [{(t1-t0)*1e6:.0f} µs]")
+        log(f"account_info (server truth): logged_in={info['logged_in']} user_id={info['user_id']} "
+            f"email={info['email']!r}  [{(t2-t1)*1000:.0f} ms]")
+        log(f"confirm_logged_in (gate+server): {deep}  [{(t3-t2)*1000:.0f} ms total]")
+
         log("--- now driving the full login_via_google for comparison ---")
         ok = await s.login_via_google(timeout=60)
         log("login_via_google returned:", ok)
