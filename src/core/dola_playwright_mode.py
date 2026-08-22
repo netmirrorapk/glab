@@ -140,7 +140,7 @@ async def _export_cookies(profile_dir, log=None):
                 google_live = ("myaccount.google.com" in url or
                                ("accounts.google.com" in url and "signin" not in url
                                 and "servicelogin" not in url and "chooser" not in url))
-                _l(f"profile Google session: {'LIVE ✅' if google_live else 'LOGGED OUT ❌ — re-login this account via Login for dola (Google)'}")
+                _l(f"profile Google session: {'LIVE' if google_live else 'LOGGED OUT — re-login this account via Login for dola (Google)'}")
             except Exception as e:
                 _l("google hydrate skipped:", str(e)[:60])
             # Establish the dola session IN REAL CHROME (reliable — real fingerprint/GSI),
@@ -163,14 +163,14 @@ async def _export_cookies(profile_dir, log=None):
                     # SERVER-SIDE check, not cookie-only: after a burn/delete the profile keeps
                     # the OLD account's dola cookies (they pass the cookie gate but user_id is 0).
                     if await dsess.confirm_logged_in():
-                        _l("dola session already present in profile ✅")
+                        _l("dola session already present in profile")
                     else:
                         if await dsess.is_logged_in():
                             _l("stale/dead dola cookies in profile → clearing before re-login (recreate)")
                             await dsess.clear_dola_cookies()
                         _l("establishing dola session in real Chrome…")
                         ok = await dsess.login_via_google(timeout=45)
-                        _l(f"dola login in real Chrome: {'✅ done' if ok else '❌ failed — cloak will retry'}")
+                        _l(f"dola login in real Chrome: {'done' if ok else 'failed — cloak will retry'}")
                 except Exception as e:
                     _l("dola login (real chrome) skipped:", str(e)[:80])
             ck = await asyncio.wait_for(ctx.cookies(), timeout=30)

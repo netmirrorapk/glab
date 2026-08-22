@@ -660,7 +660,7 @@ class DolaSession:
         clicked_google_at = 0.0
         while time.time() < deadline:
             if await self.is_logged_in():
-                self._log("dola login: session landed ✅")
+                self._log("dola login: session landed")
                 return True
             st = (await self._dola_login_screen()).get("state")
             if st != last_state:
@@ -706,7 +706,7 @@ class DolaSession:
                                           "log in with google"])
                 clicked_google_at = time.time()
                 if await self._wait_logged_in(15):
-                    self._log("dola login: session landed after Continue-with-Google ✅")
+                    self._log("dola login: session landed after Continue-with-Google")
                     return True
                 continue
 
