@@ -92,7 +92,7 @@ async def run(args):
         # 2) Try the DIRECT / SILENT login (dola auto_open OAuth, prompt=none, NO click)
         log("--- trying DIRECT silent login (ensure_logged_in, 25s, no UI click) ---")
         try:
-            sok = await s.ensure_logged_in(timeout=25)
+            sok = await s.ensure_logged_in(timeout=3)
             ck3 = await ctx.cookies(DOLA_ORIGIN)
             log("ensure_logged_in (silent) returned:", sok,
                 "| dola passport cookies now:", sorted({c['name'] for c in ck3} & LOGIN_COOKIES) or "(still NONE)")
@@ -101,7 +101,11 @@ async def run(args):
         # 2b) The NEW direct login (navigate to Google OAuth authorize URL, no UI click)
         log("--- trying login_direct (Google OAuth redirect → dola callback, NO click) ---")
         try:
+            import time as _tt
+            _t0 = _tt.perf_counter()
             dok = await s.login_direct(timeout=30)
+            _elapsed = _tt.perf_counter() - _t0
+            log(f"⏱ login_direct took {_elapsed:.1f}s")
             ck4 = await ctx.cookies(DOLA_ORIGIN)
             log("login_direct returned:", dok,
                 "| logged_in_for_real:", await s.logged_in_for_real(),

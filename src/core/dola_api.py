@@ -418,6 +418,18 @@ class DolaSession:
             return True
         return (await self.account_info()).get("logged_in", False)
 
+    async def _wait_logged_in(self, seconds: float, interval: float = 0.25) -> bool:
+        """Tight-poll the INSTANT cookie gate until the real dola session lands (or the
+        budget runs out). Returns True the moment sessionid+sid_tt appear — this is how
+        login stays fast: no fixed 1.5–2s sleeps, we return the instant it's done."""
+        end = time.time() + seconds
+        while True:
+            if await self.is_logged_in():
+                return True
+            if time.time() >= end:
+                return False
+            await asyncio.sleep(interval)
+
     async def _page_is_guest(self) -> bool:
         """Look at the ACTUAL page, not just cookies. After a delete the dola
         cookies linger (stale) so the cookie check false-positives — but the page
@@ -473,40 +485,34 @@ class DolaSession:
             await self.page.goto(auth_url, wait_until="domcontentloaded")
         except Exception:
             pass
-        deadline = time.time() + timeout
+        # SHORT silent budget with tight polling — the redirect either lands within a
+        # few seconds or it won't at all, so don't sit here; fall to the fast UI login.
+        silent_budget = min(timeout, 6)
+        deadline = time.time() + silent_budget
         while time.time() < deadline:
-            await asyncio.sleep(1.5)
             try:
                 cur = str(self.page.url or "").lower()
             except Exception:
                 cur = ""
-            # Google needs an interactive sign-in / account chooser → silent path is
-            # out; break to the UI fallback (which drives the login modal) below.
+            # Google wants an interactive sign-in / account chooser → silent path is out.
             if "accounts.google.com" in cur and ("signin" in cur or "accountchooser" in cur):
                 break
-            # the callback JS may raise an age-gate modal — confirm it (robust click).
             await self._robust_click(["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"])
-            if await self.logged_in_for_real():
+            if await self.is_logged_in():
                 self._log("login_direct: logged in via silent OAuth redirect")
                 return True
-            # if we've been parked on the bare callback with no progress, nudge to chat
-            if "dola.com/auth/callback" in cur:
+            if "dola.com/auth/callback" in cur:   # parked on bare callback → nudge to chat
                 try:
                     await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
                 except Exception:
                     pass
-        # Silent redirect didn't establish the session (or Google wanted an account
-        # chooser) → fall back to the robust UI login. This is the 'kabhi pehle Log In
-        # button pe click karna padta hai' path — same deterministic entry point.
-        try:
-            await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-            await asyncio.sleep(1.5)
-        except Exception:
-            pass
-        if await self.logged_in_for_real():
+            await asyncio.sleep(0.4)
+        # Silent redirect didn't land → the fast state-driven UI login (same deterministic
+        # entry point: 'kabhi pehle Log In button pe click karna padta hai').
+        if await self.is_logged_in():
             return True
-        self._log("login_direct: silent path didn't land → UI fallback (login_via_google)")
-        return await self.login_via_google(timeout=max(45, timeout))
+        self._log("login_direct: silent path didn't land → fast UI login")
+        return await self.login_via_google(timeout=max(30, timeout))
 
     async def ensure_logged_in(self, timeout: int = 25) -> bool:
         """Ensure the dola.com session is live. dola's login is auto_open: with an
@@ -627,9 +633,12 @@ class DolaSession:
           • logged_in    → done
         Every state CHANGE is logged, so you can see precisely which screen appeared and
         when (no blind clicking). Uses `_robust_click` (locator+mouse+JS) because cloak
-        drops bare mouse clicks. Loops until logged in or `timeout`."""
+        drops bare mouse clicks. FAST: after each action it TIGHT-POLLS the instant cookie
+        gate (returns the microsecond the session lands) instead of fixed sleeps."""
         await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-        await asyncio.sleep(2.0)
+        # a session already primed by the redirect can land in the first few hundred ms
+        if await self._wait_logged_in(1.5):
+            return True
 
         deadline = time.time() + timeout
         email = (gmail or "").lower()
@@ -637,6 +646,8 @@ class DolaSession:
         last_state = None
         stuck_loading = 0
         while time.time() < deadline:
+            if await self.is_logged_in():        # instant gate first (cheapest)
+                return True
             scr = await self._dola_login_screen()
             state = scr.get("state")
             if state != last_state:
@@ -657,15 +668,18 @@ class DolaSession:
 
             if state == "age_gate":
                 await self._robust_click(age_gate)
-                await asyncio.sleep(1.5)
+                if await self._wait_logged_in(2.5):
+                    return True
                 continue
 
             if state == "guest_closed":
-                # the login screen is NOT on-screen yet → open it (the 'manually click
-                # Log In' case, now automatic + confirmed by re-reading the state next loop)
+                # the login screen is NOT on-screen yet → open it. Clicking 'Log In' also
+                # kicks dola's OAuth JS, so with Google signed in the session often lands
+                # right here with no further click → tight-poll for it.
                 await self._robust_click(["log in", "login", "sign in", "log in / sign up",
                                           "sign up / log in", "get started"])
-                await asyncio.sleep(1.8)
+                if await self._wait_logged_in(3.0):
+                    return True
                 continue
 
             if state == "modal_open":
@@ -674,7 +688,7 @@ class DolaSession:
                 # already signed in → the ideal no-interaction path).
                 popup = None
                 try:
-                    async with self.ctx.expect_page(timeout=5000) as pi:
+                    async with self.ctx.expect_page(timeout=3500) as pi:
                         await self._robust_click(["continue with google", "sign in with google",
                                                   "log in with google"])
                     popup = await pi.value
@@ -683,31 +697,33 @@ class DolaSession:
                 if popup:
                     try:
                         await popup.wait_for_load_state("domcontentloaded")
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.0)
                         await popup.evaluate(_GOOGLE_PICK_JS, email)
                     except Exception:
                         pass
-                # let the OAuth redirect / session write settle, then re-read state
-                for _ in range(5):
-                    await asyncio.sleep(1.5)
-                    if await self.logged_in_for_real():
+                # tight-poll while the OAuth redirect / session write completes; also clear
+                # an age gate if one appears mid-way (checked cheaply every ~0.6s)
+                end = time.time() + 6
+                while time.time() < end:
+                    if await self.is_logged_in():
                         return True
+                    await asyncio.sleep(0.5)
                     s2 = await self._dola_login_screen()
                     if s2.get("state") == "age_gate":
                         await self._robust_click(age_gate)
                 continue
 
-            # loading / unknown — give it a beat; if it stays blank, nudge a reload once
+            # loading / unknown — short wait; if it stays blank, nudge a reload once
             stuck_loading += 1
-            await asyncio.sleep(1.5)
+            if await self._wait_logged_in(1.0):
+                return True
             if stuck_loading in (4, 8):
                 try:
                     await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video",
                                          wait_until="domcontentloaded")
-                    await asyncio.sleep(1.5)
                 except Exception:
                     pass
-        return await self.logged_in_for_real()
+        return await self.is_logged_in()
 
     async def fetch_capabilities(self) -> dict:
         """Live model / ratio / duration options from /samantha/skill/pack."""
