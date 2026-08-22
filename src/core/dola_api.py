@@ -102,9 +102,18 @@ _DOLA_LOGIN_SCREEN_JS = r"""() => {
   const ageGate   = someText(['how old are you',"what's your birthday",'date of birth',
                               'enter your birthday','i am 18',"i'm 18",'your age']);
   const onGoogle  = url.indexOf('accounts.google.com')!==-1;
+  const body = norm(document.body ? document.body.innerText : '');
+  // dola's OAuth-callback failure page ('could not log in, redirecting to homepage') —
+  // dola's first login attempt often fails and needs a reload; detect it to reload NOW.
+  const callbackError = body.indexOf('could not log') !== -1
+      || body.indexOf("couldn't log") !== -1
+      || body.indexOf('failed to log') !== -1
+      || body.indexOf('login failed') !== -1
+      || body.indexOf('redirecting to') !== -1
+      || body.indexOf('something went wrong') !== -1;
   return {
     url,
-    googleBtn, loginBtn, ageGate,
+    googleBtn, loginBtn, ageGate, callbackError,
     onGoogle,
     googleSignin: onGoogle && (url.indexOf('signin')!==-1 || url.indexOf('servicelogin')!==-1
                                || url.indexOf('accountchooser')!==-1 || url.indexOf('/chooser')!==-1),
@@ -457,61 +466,15 @@ class DolaSession:
         return (await self.is_logged_in()) and not (await self._page_is_guest())
 
     async def login_direct(self, timeout: int = 30) -> bool:
-        """DIRECT dola login — NO UI clicking, no popup. Navigate straight to Google's
-        OAuth implicit-flow authorize URL (dola's client_id, redirect → /auth/callback).
-        With an active Google session Google auto-redirects to
-        dola.com/auth/callback#access_token=…, and we exchange that token via
-        POST /passport/web/auth/login/ (platform_app_id=2085) to establish the dola
-        session. This is exactly what dola's 'Continue with Google' does, minus the UI —
-        so it works in CloakBrowser where the button click / popup path doesn't.
-        Reverse-engineered from the login HAR."""
-        if await self.logged_in_for_real():
-            return True
-        state = base64.urlsafe_b64encode(
-            json.dumps({"entry": "", "trackMeta": {"login_entrance": "sign_in"}}).encode()
-        ).decode().rstrip("=")
-        auth_url = (
-            "https://accounts.google.com/o/oauth2/v2/auth"
-            "?client_id=742187162285-a21b1bgtsfa0srr9jhhb5ksc5ctb6p25.apps.googleusercontent.com"
-            "&redirect_uri=" + urllib.parse.quote("https://www.dola.com/auth/callback", safe="") +
-            "&response_type=token&scope=" + urllib.parse.quote("email profile") +
-            "&state=" + state)
-        # Navigate to Google's authorize URL. With an active Google session Google
-        # bounces to dola.com/auth/callback#access_token=… and dola's OWN callback page-JS
-        # then runs the CLIENT-SIGNED login flow (login_only → age_gate → login/, with the
-        # msToken/X-Bogus/_signature params only its JSSDK can produce). We must NOT POST
-        # it ourselves — those params can't be forged; we just drive the page + age gate.
-        try:
-            await self.page.goto(auth_url, wait_until="domcontentloaded")
-        except Exception:
-            pass
-        # SHORT silent budget with tight polling — the redirect either lands within a
-        # few seconds or it won't at all, so don't sit here; fall to the fast UI login.
-        silent_budget = min(timeout, 6)
-        deadline = time.time() + silent_budget
-        while time.time() < deadline:
-            try:
-                cur = str(self.page.url or "").lower()
-            except Exception:
-                cur = ""
-            # Google wants an interactive sign-in / account chooser → silent path is out.
-            if "accounts.google.com" in cur and ("signin" in cur or "accountchooser" in cur):
-                break
-            await self._robust_click(["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"])
-            if await self.is_logged_in():
-                self._log("login_direct: logged in via silent OAuth redirect")
-                return True
-            if "dola.com/auth/callback" in cur:   # parked on bare callback → nudge to chat
-                try:
-                    await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-                except Exception:
-                    pass
-            await asyncio.sleep(0.4)
-        # Silent redirect didn't land → the fast state-driven UI login (same deterministic
-        # entry point: 'kabhi pehle Log In button pe click karna padta hai').
+        """DIRECT dola login. Kept as the public entry point, but it now delegates to the
+        RELOAD-DRIVEN login_via_google, which IS dola's real 'direct' login: loading
+        dola.com with an active Google session makes dola run its own OAuth and set the
+        session (no UI click). We deliberately DON'T navigate to Google's authorize URL
+        anymore — that route triggered dola's 'could not log in, redirecting to homepage'
+        callback-error page on the first try (the exact slowness the user hit). The
+        reload-retry inside login_via_google handles dola's flaky first attempt cleanly."""
         if await self.is_logged_in():
             return True
-        self._log("login_direct: silent path didn't land → fast UI login")
         return await self.login_via_google(timeout=max(30, timeout))
 
     async def ensure_logged_in(self, timeout: int = 25) -> bool:
@@ -612,6 +575,8 @@ class DolaSession:
             return {"state": "loading"}
         if f.get("googleSignin"):
             state = "google_signin"
+        elif f.get("callbackError"):
+            state = "callback_error"
         elif f.get("ageGate"):
             state = "age_gate"
         elif f.get("googleBtn"):
@@ -624,105 +589,79 @@ class DolaSession:
         return f
 
     async def login_via_google(self, gmail: str = None, timeout: int = 90) -> bool:
-        """STATE-DRIVEN dola Google login — reads the real DOM state each step and takes
-        the exact right action, so it's deterministic, not 'click-and-hope' (tukka):
-          • guest_closed → click 'Log In' to OPEN the login screen
-          • modal_open   → click 'Continue with Google' (or pick the account in the popup)
-          • age_gate     → confirm the birthday/age modal
-          • google_signin→ Google session is dead → bail (caller re-seeds fresh cookies)
-          • logged_in    → done
-        Every state CHANGE is logged, so you can see precisely which screen appeared and
-        when (no blind clicking). Uses `_robust_click` (locator+mouse+JS) because cloak
-        drops bare mouse clicks. FAST: after each action it TIGHT-POLLS the instant cookie
-        gate (returns the microsecond the session lands) instead of fixed sleeps."""
-        await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-        # a session already primed by the redirect can land in the first few hundred ms
-        if await self._wait_logged_in(1.5):
-            return True
+        """RELOAD-DRIVEN dola login — the fast, deterministic path that matches how dola
+        actually logs in with an active Google session:
 
-        deadline = time.time() + timeout
+          dola's login is auto_open: just LOADING dola.com/chat/create-video with Google
+          signed in makes dola run its OWN Google OAuth and set the session — no button
+          click needed (in CloakBrowser the 'Continue with Google' click is unreliable
+          anyway). BUT dola's first attempt often fails with a 'could not log in,
+          redirecting…' page and needs a RELOAD (the user's 'refresh phir ho jata hai').
+
+        So each attempt = load dola → tight-poll for the session (nudging age-gate / a
+        one-time 'Log In' click) → if it doesn't land (or shows the callback-error page)
+        RELOAD and retry. That turns the 25-30s hang + manual refresh into a couple of
+        fast automatic reloads. Bails immediately if Google itself is signed out."""
         email = (gmail or "").lower()
         age_gate = ["i am 18", "i'm 18", "confirm", "yes", "continue", "agree"]
-        last_state = None
-        stuck_loading = 0
+        deadline = time.time() + timeout
+        attempt = 0
         while time.time() < deadline:
-            if await self.is_logged_in():        # instant gate first (cheapest)
-                return True
-            scr = await self._dola_login_screen()
-            state = scr.get("state")
-            if state != last_state:
-                self._log(f"dola login screen: {state}"
-                          + (f" (url={str(scr.get('url',''))[:45]})" if scr.get("url") else ""))
-                last_state = state
+            attempt += 1
+            try:
+                await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video",
+                                     wait_until="domcontentloaded")
+            except Exception:
+                pass
+            self._log(f"dola login attempt {attempt}: loaded — waiting for auto-login…")
 
-            if state == "logged_in":
-                return True
-
-            if state == "google_signin":
-                # Google wants an interactive sign-in / account chooser → the profile's
-                # Google session is dead in this context; the caller should re-seed FRESH
-                # cookies from real Chrome and retry (that's the deterministic recovery).
-                self._log("dola login: Google session not active here → cannot complete "
-                          "silently (re-seed fresh Google cookies / re-login the account)")
-                return False
-
-            if state == "age_gate":
-                await self._robust_click(age_gate)
-                if await self._wait_logged_in(2.5):
+            # poll this load for up to ~9s; act on whatever screen appears
+            end = min(time.time() + 9, deadline)
+            nudged = False
+            reload_now = False
+            while time.time() < end:
+                if await self.is_logged_in():           # instant cookie gate
+                    self._log(f"dola login: session landed (attempt {attempt})")
                     return True
-                continue
+                scr = await self._dola_login_screen()
+                st = scr.get("state")
 
-            if state == "guest_closed":
-                # the login screen is NOT on-screen yet → open it. Clicking 'Log In' also
-                # kicks dola's OAuth JS, so with Google signed in the session often lands
-                # right here with no further click → tight-poll for it.
-                await self._robust_click(["log in", "login", "sign in", "log in / sign up",
-                                          "sign up / log in", "get started"])
-                if await self._wait_logged_in(3.0):
-                    return True
-                continue
-
-            if state == "modal_open":
-                # the login screen IS showing → click 'Continue with Google'. It either
-                # opens a chooser popup (pick the account) OR redirects silently (Google
-                # already signed in → the ideal no-interaction path).
-                popup = None
-                try:
-                    async with self.ctx.expect_page(timeout=3500) as pi:
-                        await self._robust_click(["continue with google", "sign in with google",
-                                                  "log in with google"])
-                    popup = await pi.value
-                except Exception:
-                    popup = None
-                if popup:
+                if st == "google_signin":
+                    self._log("dola login: Google session not active here → bail "
+                              "(caller re-seeds FRESH Google cookies / re-login account)")
+                    return False
+                if st == "callback_error":
+                    self._log("dola login: dola's 'could not log in' page → reloading now")
+                    reload_now = True
+                    break
+                if st == "age_gate":
+                    await self._robust_click(age_gate)
+                elif st == "guest_closed" and not nudged:
+                    # open the login modal once — re-kicks dola's OAuth (don't rely on it)
+                    await self._robust_click(["log in", "login", "sign in",
+                                              "log in / sign up", "sign up / log in"])
+                    nudged = True
+                elif st == "modal_open" and not nudged:
+                    # try the button once (may silent-redirect); the reload is the real
+                    # fallback if the click doesn't take (cloak drops GSI clicks)
                     try:
+                        async with self.ctx.expect_page(timeout=2500) as pi:
+                            await self._robust_click(["continue with google",
+                                                      "sign in with google", "log in with google"])
+                        popup = await pi.value
                         await popup.wait_for_load_state("domcontentloaded")
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(0.8)
                         await popup.evaluate(_GOOGLE_PICK_JS, email)
                     except Exception:
                         pass
-                # tight-poll while the OAuth redirect / session write completes; also clear
-                # an age gate if one appears mid-way (checked cheaply every ~0.6s)
-                end = time.time() + 6
-                while time.time() < end:
-                    if await self.is_logged_in():
-                        return True
-                    await asyncio.sleep(0.5)
-                    s2 = await self._dola_login_screen()
-                    if s2.get("state") == "age_gate":
-                        await self._robust_click(age_gate)
-                continue
+                    nudged = True
+                await asyncio.sleep(0.4)
 
-            # loading / unknown — short wait; if it stays blank, nudge a reload once
-            stuck_loading += 1
-            if await self._wait_logged_in(1.0):
+            if await self.is_logged_in():
                 return True
-            if stuck_loading in (4, 8):
-                try:
-                    await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video",
-                                         wait_until="domcontentloaded")
-                except Exception:
-                    pass
+            if not reload_now:
+                self._log(f"dola login: attempt {attempt} didn't land → reload & retry")
+            # loop → reload and try again until the deadline
         return await self.is_logged_in()
 
     async def fetch_capabilities(self) -> dict:
