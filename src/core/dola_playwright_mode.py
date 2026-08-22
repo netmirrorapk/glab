@@ -132,14 +132,15 @@ async def _export_cookies(profile_dir, log=None):
         try:
             # hydrate the Google session before reading cookies
             pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            google_live = False
             try:
                 await pg.goto("https://accounts.google.com/", wait_until="domcontentloaded")
                 await asyncio.sleep(2.5)
                 url = str(pg.url or "").lower()
-                live = ("myaccount.google.com" in url or
-                        ("accounts.google.com" in url and "signin" not in url
-                         and "servicelogin" not in url and "chooser" not in url))
-                _l(f"profile Google session: {'LIVE ✅' if live else 'LOGGED OUT ❌ — re-login this account via Login for dola (Google)'}")
+                google_live = ("myaccount.google.com" in url or
+                               ("accounts.google.com" in url and "signin" not in url
+                                and "servicelogin" not in url and "chooser" not in url))
+                _l(f"profile Google session: {'LIVE ✅' if google_live else 'LOGGED OUT ❌ — re-login this account via Login for dola (Google)'}")
             except Exception as e:
                 _l("google hydrate skipped:", str(e)[:60])
             # Establish the dola session IN REAL CHROME (reliable — real fingerprint/GSI),
@@ -147,22 +148,31 @@ async def _export_cookies(profile_dir, log=None):
             # flaky OAuth in the anti-detect browser. This is the user's model: 'real chrome
             # se pehle login, fir cloak se sab chalta hai'. We carry the dola sessionid/
             # sid_tt cookies over, not just Google's.
-            try:
-                from src.core.dola_api import DolaSession
-                dsess = DolaSession(ctx, pg, logger=(log or (lambda *a: None)))
-                # SERVER-SIDE check, not cookie-only: after a burn/delete the profile keeps
-                # the OLD account's dola cookies (they pass the cookie gate but user_id is 0).
-                if await dsess.confirm_logged_in():
-                    _l("dola session already present in profile ✅")
-                else:
-                    if await dsess.is_logged_in():
-                        _l("stale/dead dola cookies in profile → clearing before re-login (recreate)")
-                        await dsess.clear_dola_cookies()
-                    _l("establishing dola session in real Chrome…")
-                    ok = await dsess.login_via_google(timeout=45)
-                    _l(f"dola login in real Chrome: {'✅ done' if ok else '❌ failed — cloak will retry'}")
-            except Exception as e:
-                _l("dola login (real chrome) skipped:", str(e)[:80])
+            #
+            # CRITICAL: if Google itself is logged OUT, do NOT attempt the dola login — the
+            # OAuth would just bounce to a Google sign-in and fail, and hammering Google with
+            # doomed OAuth attempts is exactly what triggers its security-logout. Skip and
+            # report so the account gets re-logged via the button instead.
+            if not google_live:
+                _l("skipping dola login — Google is logged out; re-login this account via "
+                   "'Login for dola (Google)' (attempting OAuth now would only hammer Google)")
+            else:
+                try:
+                    from src.core.dola_api import DolaSession
+                    dsess = DolaSession(ctx, pg, logger=(log or (lambda *a: None)))
+                    # SERVER-SIDE check, not cookie-only: after a burn/delete the profile keeps
+                    # the OLD account's dola cookies (they pass the cookie gate but user_id is 0).
+                    if await dsess.confirm_logged_in():
+                        _l("dola session already present in profile ✅")
+                    else:
+                        if await dsess.is_logged_in():
+                            _l("stale/dead dola cookies in profile → clearing before re-login (recreate)")
+                            await dsess.clear_dola_cookies()
+                        _l("establishing dola session in real Chrome…")
+                        ok = await dsess.login_via_google(timeout=45)
+                        _l(f"dola login in real Chrome: {'✅ done' if ok else '❌ failed — cloak will retry'}")
+                except Exception as e:
+                    _l("dola login (real chrome) skipped:", str(e)[:80])
             ck = await asyncio.wait_for(ctx.cookies(), timeout=30)
             g = sum(1 for c in ck if "google.com" in str(c.get("domain", "")))
             d = sum(1 for c in ck if "dola.com" in str(c.get("domain", "")))
