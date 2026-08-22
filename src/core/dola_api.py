@@ -1511,16 +1511,21 @@ class DolaSession:
             const cls = (e) => (e.className || "").toString();
             const isBtn = (e) => e.tagName === "BUTTON" || e.getAttribute("role") === "button"
                 || cls(e).includes("clickable") || getComputedStyle(e).cursor === "pointer";
+            // MUST contain a delete phrase — never match a bare 'Next'/'Continue' (that was
+            // clicking the re-auth 'Next' button and stalling the whole delete).
+            const isDelete = (t) => t.includes("delete now") || t.includes("delete account")
+                || t.includes("permanently delete") || t.includes("delete my account")
+                || t.includes("confirm delete") || t === "delete";
             let el =
-                nodes.find((e) => cls(e).includes("confirm-button") && cls(e).includes("type-danger")) ||
-                nodes.find((e) => ["delete now", "delete account"].includes(norm(e.textContent)) && cls(e).includes("clickable")) ||
-                nodes.find((e) => ["delete now", "delete account", "delete", "confirm"].includes(norm(e.textContent)) && getComputedStyle(e).cursor === "pointer") ||
-                // contains-match: a short danger button whose label INCLUDES a delete phrase
+                // exact 'delete now'/'delete account' on a danger/clickable control
+                nodes.find((e) => ["delete now", "delete account"].includes(norm(e.textContent))
+                    && (cls(e).includes("type-danger") || cls(e).includes("clickable") || isBtn(e))) ||
+                // a short button whose label INCLUDES a delete phrase
                 nodes.find((e) => { const t = norm(e.textContent);
-                    return t.length <= 28 && isBtn(e)
-                        && (t.includes("delete now") || t.includes("delete account")
-                            || t.includes("permanently delete") || t.includes("delete my account")
-                            || t.includes("confirm delete")); });
+                    return t.length <= 28 && isBtn(e) && isDelete(t); }) ||
+                // last resort: a danger-styled button that ALSO has delete text
+                nodes.find((e) => cls(e).includes("confirm-button") && cls(e).includes("type-danger")
+                    && isDelete(norm(e.textContent)));
             if (!el) return { ok: false };
             const label = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
             if (!doClick) return { ok: true, label, clicked: false };
