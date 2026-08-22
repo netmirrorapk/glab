@@ -131,8 +131,8 @@ async def _export_cookies(profile_dir, log=None):
                   "--window-position=-32000,-32000", "--window-size=1200,800"])
         try:
             # hydrate the Google session before reading cookies
+            pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
             try:
-                pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 await pg.goto("https://accounts.google.com/", wait_until="domcontentloaded")
                 await asyncio.sleep(2.5)
                 url = str(pg.url or "").lower()
@@ -142,9 +142,26 @@ async def _export_cookies(profile_dir, log=None):
                 _l(f"profile Google session: {'LIVE ✅' if live else 'LOGGED OUT ❌ — re-login this account via Login for dola (Google)'}")
             except Exception as e:
                 _l("google hydrate skipped:", str(e)[:60])
+            # Establish the dola session IN REAL CHROME (reliable — real fingerprint/GSI),
+            # so CloakBrowser inherits it already-logged-in instead of fighting dola's
+            # flaky OAuth in the anti-detect browser. This is the user's model: 'real chrome
+            # se pehle login, fir cloak se sab chalta hai'. We carry the dola sessionid/
+            # sid_tt cookies over, not just Google's.
+            try:
+                from src.core.dola_api import DolaSession
+                dsess = DolaSession(ctx, pg, logger=(log or (lambda *a: None)))
+                if await dsess.is_logged_in():
+                    _l("dola session already present in profile ✅")
+                else:
+                    _l("establishing dola session in real Chrome…")
+                    ok = await dsess.login_via_google(timeout=45)
+                    _l(f"dola login in real Chrome: {'✅ done' if ok else '❌ failed — cloak will retry'}")
+            except Exception as e:
+                _l("dola login (real chrome) skipped:", str(e)[:80])
             ck = await asyncio.wait_for(ctx.cookies(), timeout=30)
             g = sum(1 for c in ck if "google.com" in str(c.get("domain", "")))
-            _l(f"exported {len(ck)} cookies (google={g})")
+            d = sum(1 for c in ck if "dola.com" in str(c.get("domain", "")))
+            _l(f"exported {len(ck)} cookies (google={g}, dola={d})")
             return ck
         finally:
             try:
