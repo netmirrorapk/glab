@@ -29,8 +29,7 @@ except Exception:
 
 from src.db.db_manager import get_accounts
 from src.core.dola_playwright_mode import (
-    _export_cookies, _launch_cloak, _add_cookies_robust, _proxy_dict,
-    _burn_recreate_real_chrome,
+    _export_cookies, _launch_cloak, _add_cookies_robust, _proxy_dict, _save_cookies,
 )
 from src.core.dola_api import DolaSession, DOLA_ORIGIN, LOGIN_COOKIES, DolaError
 
@@ -63,42 +62,50 @@ async def run(args):
 
     p = ctx = None
     try:
-        # ── The WHOLE burn (delete + recreate) runs in REAL CHROME — the profile owner —
-        #    so every Google touch rotates __Secure-1PSIDTS in the owner and never desyncs
-        #    the session (no Gmail logout). CloakBrowser is used ONLY afterwards to prove the
-        #    generation side inherits the fresh dola session. ──
-        log("BURN in REAL CHROME (delete + recreate — Google-safe, cloak not involved)…")
-        ok, detail, new_cookies = await _burn_recreate_real_chrome(session_path, log=log, dry_run=dry)
-        log(f"result: ok={ok} | {detail}")
-        if dry:
-            log("DRY-RUN done — nothing deleted. Re-run with --yes for the real burn+recreate.")
-            return
-        print("\n" + "=" * 78)
-        if not ok:
-            print(f"[burn-test] ❌ FAILED — {detail}")
-            print("=" * 78)
-            return
-        print(f"[burn-test] ✅ SUCCESS (real-chrome) — {detail}")
-        print("=" * 78)
-
-        # ── Verify the CloakBrowser generation side inherits the fresh dola session ──
-        log("verifying CloakBrowser generation side with the fresh cookies…")
-        g = sum(1 for c in new_cookies if "google.com" in str(c.get("domain", "")))
-        d = sum(1 for c in new_cookies if "dola.com" in str(c.get("domain", "")))
-        log(f"fresh cookies: google={g}, dola={d}")
-        p, ctx = await _launch_cloak(new_cookies, proxy, False, log=log)
+        # The WHOLE burn (delete + recreate) runs in the ANTI-DETECT CloakBrowser. Google
+        # BLOCKS an automated sign-in on regular Chrome ('this browser may not be secure' →
+        # rejected); only cloak evades that check, so the recreate's fresh Google consent can
+        # actually complete here. This is the originally-working approach.
+        log("STEP 1: cookies (real-Chrome silent login) + launch CloakBrowser…")
+        cookies = await _export_cookies(session_path, log=log)
+        p, ctx = await _launch_cloak(cookies, proxy, False, log=log)   # visible so you can watch
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         session = DolaSession(ctx, page, logger=log)
         await page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-        cloak_ok = await session.confirm_logged_in()
-        info = await session.account_info()
-        log(f"CloakBrowser generation login: {'OK' if cloak_ok else 'NOT logged in'} "
-            f"| user_id={info['user_id']}")
+        if not await session.confirm_logged_in():
+            log("not logged in from cookies → login in cloak…")
+            if not await session.login_via_google(timeout=90):
+                log("login failed — aborting"); return
+        old_uid = int((await session.account_info()).get("user_id", 0) or 0)
+        log(f"LOGGED IN — user_id={old_uid}")
+        await session._ensure_base()
+
+        log(f"STEP 2: {'DRY-RUN delete (no click)' if dry else 'REAL delete (in cloak)'} …")
+        ok, detail = await session.delete_account(timeout=90, log=log, dry_run=dry)
+        log(f"delete result: ok={ok} detail={detail}")
+        if dry:
+            log("DRY-RUN done — nothing deleted. Re-run with --yes for the real flow.")
+            return
+        if not ok:
+            log("delete failed — not recreating"); return
+
+        log("STEP 3: recreate in cloak (clear dead cookies + fresh Google consent)…")
+        session._base = {}
+        await session.clear_dola_cookies()
+        t0 = time.time()
+        rok = await session.login_via_google(timeout=120)   # cloak evades Google's block
+        log(f"recreate re-login took {time.time()-t0:.1f}s → {rok}")
+        new_uid = int((await session.account_info()).get("user_id", 0) or 0) if rok else 0
+        good = new_uid != 0 and new_uid != old_uid
         print("\n" + "=" * 78)
-        print(f"[burn-test] cloak generation-side: {'READY' if cloak_ok else 'FAILED'} "
-              f"(user_id={info['user_id']})")
-        print("Ab dola_account_status.py se dekho ki Google (1PSIDTS) intact hai.")
+        if good:
+            print(f"[burn-test] ✅ SUCCESS — burn→recreate complete. old_uid={old_uid} new_uid={new_uid}")
+        else:
+            print(f"[burn-test] ❌ RECREATE FAILED — user_id={new_uid} (old={old_uid}).")
+        print("Ab dola_account_status.py se dekho Google (1PSIDTS) ka status.")
         print("=" * 78)
+        if good:
+            await _save_cookies(session_path, ctx)
 
     except DolaError as e:
         log("DolaError:", str(e)[:160])

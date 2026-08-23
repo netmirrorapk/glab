@@ -982,52 +982,31 @@ class PlaywrightDolaModeManager:
                 if state["busy"] <= 0 or not self._running():
                     break
                 await asyncio.sleep(2)
-            alog(f"burn-recreate #{state['recreated'] + 1}…")
+            alog(f"burn-recreate #{state['recreated'] + 1}: delete → recreate (in CloakBrowser)…")
+            # BURN runs in the ANTI-DETECT CloakBrowser. Google BLOCKS an automated sign-in
+            # on regular Chrome ('this browser may not be secure' → rejected); only cloak
+            # evades that check, so the recreate's fresh Google consent can complete here
+            # (this is how it worked originally). Real-Chrome burn was a wrong turn.
             try:
-                if state.get("cloak"):
-                    # BURN (delete + recreate) in REAL CHROME — the profile owner — so every
-                    # Google touch (delete re-auth, recreate account-chooser) rotates
-                    # __Secure-1PSIDTS in the owner and writes it back, never desyncing the
-                    # session → no Gmail logout. CloakBrowser stays for GENERATION only.
-                    ok, detail, new_cookies = await _burn_recreate_real_chrome(
-                        state["session_path"], log=alog)
-                    if not ok:
-                        alog(f"burn-recreate failed → retiring: {detail}")
-                        state["alive"] = False; state["healthy"].set(); return
-                    # re-seed the LIVE cloak context with the fresh dola session for gen
-                    try:
-                        await _add_cookies_robust(state["ctx"], new_cookies, log=alog)
-                        _save_cookies_file(state["session_path"], new_cookies)
-                    except Exception as e:
-                        alog("cloak re-seed after recreate failed:", str(e)[:60])
-                    # confirm the generation side inherited it (dola-only, never Google)
-                    main_session._base = {}
-                    try:
-                        await main_session.page.goto(f"{DOLA_ORIGIN}/chat/create-video",
-                                                     wait_until="domcontentloaded")
-                    except Exception:
-                        pass
-                    if not await main_session.confirm_logged_in():
-                        await main_session.login_direct(timeout=20)   # dola-only nudge
-                    if not await main_session.confirm_logged_in():
-                        alog("generation side not logged in after recreate → retiring")
-                        state["alive"] = False; state["healthy"].set(); return
-                    await main_session._ensure_base()
-                else:
-                    # real-Chrome runner: main_session IS the owner — burn on it directly
-                    ok, detail = await main_session.delete_account(timeout=90, log=alog)
-                    if not ok:
-                        alog("delete failed → retiring:", detail)
-                        state["alive"] = False; state["healthy"].set(); return
-                    await asyncio.sleep(2)
-                    main_session._base = {}
-                    await main_session.clear_dola_cookies()
-                    if not await main_session.login_via_google(timeout=90):
-                        alog("re-login failed → retiring")
-                        state["alive"] = False; state["healthy"].set(); return
-                    await main_session._ensure_base()
+                # delete in cloak (anti-detect re-auth)
+                ok, detail = await main_session.delete_account(timeout=90, log=alog)
+                if not ok:
+                    alog("delete failed → retiring:", detail)
+                    state["alive"] = False; state["healthy"].set(); return
+                # recreate in cloak: clear the dead cookies + fresh Google consent (cloak
+                # evades Google's automation block, so the chooser/consent completes)
+                await asyncio.sleep(2)
+                main_session._base = {}
+                await main_session.clear_dola_cookies()
+                if not await main_session.login_via_google(timeout=120):
+                    alog("recreate re-login failed → retiring")
+                    state["alive"] = False; state["healthy"].set(); return
+                await main_session._ensure_base()
+                # verify a fresh live account, then persist the cloak cookies
+                new_uid = int((await main_session.account_info()).get("user_id", 0) or 0)
+                alog(f"recreate: new user_id={new_uid}")
                 state["recreated"] += 1
-                if state.get("cloak") and state.get("ctx") and state.get("session_path"):
+                if state.get("ctx") and state.get("session_path"):
                     await _save_cookies(state["session_path"], state["ctx"])
                 alog("fresh account ready — resuming all tabs")
                 state["healthy"].set()
