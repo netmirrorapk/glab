@@ -268,13 +268,21 @@ async def _burn_recreate_real_chrome(session_path, log=None, dry_run=False):
     chrome = _find_chrome()
     p = await async_playwright().start()
     try:
+        # VISIBLE window (on-screen), NOT off-screen. Google's OAuth account-chooser only
+        # responds to clicks on a focused/visible window — an off-screen (-32000) window
+        # left the chooser pick dead (→ recreate stalled → 1PSIDTS churn → Gmail logout).
+        # Burn is a rare operation, so a briefly-visible real-Chrome window is fine.
         ctx = await p.chromium.launch_persistent_context(
             user_data_dir=session_path, executable_path=chrome, headless=False,
             ignore_default_args=["--enable-automation"],
             args=["--no-first-run", "--no-default-browser-check",
-                  "--window-position=-32000,-32000", "--window-size=1200,800"])
+                  "--window-position=60,60", "--window-size=1100,820"])
         try:
             pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            try:
+                await pg.bring_to_front()
+            except Exception:
+                pass
             dsess = DolaSession(ctx, pg, logger=(log or (lambda *a: None)))
             await pg.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
             if not await dsess.confirm_logged_in():
