@@ -54,7 +54,7 @@ CHROME_EXES = [
 ]
 MAX_RECREATE = 6          # safety: max burn-recreate cycles per account before retiring it
 LAUNCH_STAGGER = 5.0      # seconds between account launches
-GEN_TIMEOUT = 720         # dola render can take up to ~8 min
+GEN_TIMEOUT = 1200        # dola render is SLOW for 30s Seedance-2.5 (live-measured up to ~13 min)
 
 
 def _find_chrome() -> Optional[str]:
