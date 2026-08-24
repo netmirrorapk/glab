@@ -198,9 +198,17 @@ _LIMIT_MARKERS = (
     "daily limit for video generation",
     "reached the daily limit",
     "try again tomorrow",
-    # cap prompts dola shows instead of generating — they never yield a vid
-    "do you want to continue generating",
     "longer than 10 seconds is not supported",
+)
+# dola sometimes ASKS to confirm before generating (e.g. it offers a shorter duration:
+# "I can generate a 15-second video for you — shall I proceed?"). This is NOT exhaustion —
+# answer 'yes' and keep waiting, do NOT delete the account. Only match when no gen/vid yet.
+_CONFIRM_MARKERS = (
+    "would you like me to", "shall i proceed", "shall i generate", "should i proceed",
+    "should i generate", "do you want me to", "would you like to proceed",
+    "i can generate a", "i can create a", "let me know if you", "confirm to generate",
+    "reply yes", "say yes", "type yes", "ready to generate", "proceed with the generation",
+    "do you want to continue generating", "continue generating",
 )
 # Last-points edge case: dola OPTIMISTICALLY says "generating" then corrects with
 # "I can't generate the video. No points were used." → account is out of quota.
@@ -1235,6 +1243,20 @@ class DolaSession:
             raise DolaError(f"skill confirm failed: HTTP {r['status']}: {r['body'][:200]}")
         return r["body"] or ""
 
+    async def _auto_confirm(self, conv_id: str, raw: str) -> bool:
+        """Answer 'yes' to dola's confirm question (e.g. 'I can generate a 15s video — shall
+        I proceed?') so a follow-up question during a DIRECT (non-skill) generation is never
+        mistaken for exhaustion. Extracts section_id + last message index from the chain and
+        sends a 'yes' turn. Returns True if sent."""
+        try:
+            section = re.search(r'"section_id":"(\d+)"', raw)
+            last_index = _max_conv_index(raw)
+            await self.confirm_skill(conv_id, section.group(1) if section else "", last_index, "yes")
+            return True
+        except Exception as e:
+            self._log(f"auto-confirm failed: {str(e)[:60]}")
+            return False
+
     async def _pull_single(self, conv_id: str) -> str:
         body = {"cmd": 3100, "uplink_body": {"pull_singe_chain_uplink_body": {
             "conversation_id": conv_id, "anchor_index": 9007199254740991, "conversation_type": 3,
@@ -1302,6 +1324,7 @@ class DolaSession:
         last = ""
         self.last_points_left = None
         saw_gen = False
+        confirmed = False           # did we answer a 'shall I proceed?' confirm-question?
         cyc = 0
         while time.time() < deadline:
             await asyncio.sleep(poll_every)
@@ -1345,12 +1368,25 @@ class DolaSession:
                           and "generating video" not in low0)
             if not saw_gen and got_images and cyc >= 3:
                 raise GotImagesNotVideo("dola produced images instead of a video")
+            # 6b) dola is ASKING to confirm/proceed (e.g. it offers a shorter duration:
+            #     "I can generate a 15-second video — shall I proceed?"). This is NOT
+            #     exhaustion — send 'yes' and keep waiting. Do this BEFORE the exhaustion
+            #     fast-fail so a follow-up question never triggers a wrong burn-delete.
+            if (not saw_gen and not confirmed
+                    and any(m in low0 for m in _CONFIRM_MARKERS)):
+                self._log("dola asked to confirm/proceed → sending 'yes', waiting for generation…")
+                await self._auto_confirm(conv_id, last)
+                confirmed = True
+                start = time.time()           # reset the grace period after confirming
+                await asyncio.sleep(poll_every)
+                continue
             # 7) Silent exhaustion: submit accepted (conversation_id) but no gen ever
             #    starts (no gen text/flag, no vid, no explicit error) — almost always
             #    the account is out of points. A REAL gen confirms within ~6s; with 3s
             #    polling that's ~5 checks by 15s, so if nothing has started by then the
             #    account is exhausted → fail fast so the caller burn-recreates now.
-            if not saw_gen and (time.time() - start) > 15:
+            #    (Give a bit longer once we've CONFIRMED, since gen starts after the 'yes'.)
+            if not saw_gen and (time.time() - start) > (30 if confirmed else 15):
                 raise DailyLimitReached("generation never started — account exhausted (no points)")
             # 8) Periodic visibility: every ~15s log what dola is actually showing so
             #    a stuck "generating" or a NEW/unknown error is visible in the log
