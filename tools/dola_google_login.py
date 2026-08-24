@@ -1,19 +1,19 @@
 """
 Open ONE account's real-Chrome profile in a VISIBLE window at Google sign-in so YOU can
-log the Google account in by hand. The Google session it establishes is the ONE-TIME seed
-CloakBrowser reuses.
+log the Google account in by hand. This Google session is the ONE-TIME seed CloakBrowser
+reuses.
 
-IMPORTANT — this launches Chrome the SAME anti-detect way the app does: a plain subprocess
-with --remote-debugging-port + --disable-blink-features=AutomationControlled and NO
---no-sandbox / NO Playwright launch. If Chrome is started BY Playwright (automation flags),
-Google blocks the sign-in with 'this browser or app may not be secure'. We attach over CDP
-only to watch the cookies and save when you're signed in.
+Launches Chrome as a PLAIN subprocess with --disable-blink-features=AutomationControlled
+and NO --no-sandbox / NO Playwright automation — that's what makes Google ACCEPT the
+sign-in (a Playwright-launched Chrome is blocked with 'this browser or app may not be
+secure'). The window stays open; YOU log in and then CLOSE the window yourself. The script
+waits for you to close it, then reads + reports the Google cookies.
 
     python tools/dola_google_login.py --account megagaurienterprises
 
-Log in in the window that opens; it closes itself once you're signed in (or after 5 min).
+Steps: log in → (2FA if any) → then just CLOSE the Chrome window. The script does the rest.
 """
-import argparse, asyncio, json, os, subprocess, sys, time, urllib.request
+import argparse, asyncio, os, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -25,15 +25,27 @@ from playwright.async_api import async_playwright
 from src.db.db_manager import get_accounts
 from src.core.dola_playwright_mode import _find_chrome, _cookie_cache
 
-PORT = 9223
 
-
-def _cdp_live(port):
+async def _read_cookies(session_path):
+    """Read the profile's cookies AFTER Chrome closed (brief, no navigation)."""
+    p = await async_playwright().start()
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
-        return True
-    except Exception:
-        return False
+        ctx = await p.chromium.launch_persistent_context(
+            user_data_dir=session_path, executable_path=_find_chrome(), headless=True,
+            ignore_default_args=["--enable-automation"],
+            args=["--no-first-run", "--no-default-browser-check"])
+        try:
+            return await asyncio.wait_for(ctx.cookies(), timeout=20)
+        finally:
+            try:
+                await asyncio.wait_for(ctx.close(), timeout=15)
+            except Exception:
+                pass
+    finally:
+        try:
+            await p.stop()
+        except Exception:
+            pass
 
 
 async def run(args):
@@ -43,8 +55,9 @@ async def run(args):
     session_path = acc["session_path"]
     print("=" * 74)
     print(f"account : {acc['name']}")
-    print("A real-Chrome window will open at Google sign-in. LOG IN by hand.")
-    print("It closes automatically once you're signed in (or after 5 minutes).")
+    print("Ek Chrome window khulega. Google mein LOGIN karo (password + 2FA).")
+    print(">>> Login ho jaye to Chrome window KHUD BAND kar do. <<<")
+    print("Window band karte hi ye script cookies check + save karega.")
     print("=" * 74)
 
     # drop the stale cloak cache so the next run re-seeds from THIS fresh Google login
@@ -56,12 +69,10 @@ async def run(args):
         pass
 
     chrome = _find_chrome()
-    # Plain subprocess launch (NOT Playwright) with automation hidden — this is what makes
-    # Google accept the sign-in. Visible window (no --headless) so you can log in.
+    # PLAIN subprocess (NOT Playwright) with automation hidden + NO --no-sandbox → Google
+    # accepts the sign-in. A distinct --user-data-dir spawns its own instance (no handoff).
     chrome_args = [
         chrome,
-        f"--remote-debugging-port={PORT}",
-        "--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={session_path}",
         "--no-first-run",
         "--no-default-browser-check",
@@ -70,65 +81,31 @@ async def run(args):
         "--window-size=1150,850",
         "https://accounts.google.com/",
     ]
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    proc = subprocess.Popen(chrome_args, creationflags=creationflags)
-    try:
-        for _ in range(25):
-            if _cdp_live(PORT):
-                break
-            time.sleep(1)
-        if not _cdp_live(PORT):
-            print("[login] Chrome CDP didn't start — is another Chrome using this profile? Close it and retry.")
-            return
+    print("[login] Chrome khol raha hoon…")
+    t0 = time.time()
+    proc = subprocess.Popen(chrome_args)
+    proc.wait()   # blocks until YOU close the Chrome window
+    elapsed = time.time() - t0
+    if elapsed < 8:
+        print(f"[login] ⚠ Chrome {elapsed:.0f}s me band ho gaya — shayad pehle se koi Chrome is "
+              "profile ko use kar raha tha (handoff). SAARE Chrome window band karke dobara chalao.")
+        return
+    print(f"[login] window band hua ({elapsed:.0f}s baad) — cookies padh raha hoon…")
 
-        p = await async_playwright().start()
-        try:
-            browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{PORT}")
-            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-            print("[login] window open — sign in now…")
-            done = False
-            for i in range(150):          # up to ~5 min
-                await asyncio.sleep(2)
-                try:
-                    names = {c["name"] for c in await ctx.cookies()
-                             if "google.com" in str(c.get("domain", ""))}
-                except Exception:
-                    names = set()
-                if {"SID", "__Secure-1PSID"} <= names:
-                    for _ in range(8):    # let the rotating validation cookie settle
-                        await asyncio.sleep(2)
-                        names = {c["name"] for c in await ctx.cookies()
-                                 if "google.com" in str(c.get("domain", ""))}
-                        if "__Secure-1PSIDTS" in names:
-                            break
-                    print(f"[login] Google signed in OK (google cookies={len(names)}, "
-                          f"1PSIDTS={'yes' if '__Secure-1PSIDTS' in names else 'not yet'})")
-                    done = True
-                    break
-                if i and i % 15 == 0:
-                    print(f"[login] …still waiting ({i*2}s)")
-            if not done:
-                print("[login] timed out — sign-in not completed.")
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        finally:
-            try:
-                await p.stop()
-            except Exception:
-                pass
-    finally:
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=6)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    print("[login] done. Ab: python tools/dola_burn_recreate_test.py --account", acc["name"], "--yes")
+    try:
+        ck = await _read_cookies(session_path)
+    except Exception as e:
+        print("[login] cookie read error:", str(e)[:80]); return
+    g = {c["name"] for c in ck if "google.com" in str(c.get("domain", ""))}
+    ok = "SID" in g and "__Secure-1PSID" in g
+    ts = "__Secure-1PSIDTS" in g
+    print(f"[login] google cookies={len(g)} | SID={'yes' if 'SID' in g else 'no'} | "
+          f"1PSIDTS={'yes' if ts else 'MISSING'}")
+    if ok:
+        print("[login] ✅ Google signed in. Ab burn/generation test chala sakte ho:")
+        print(f"        python tools/dola_burn_recreate_test.py --account {acc['name']} --yes")
+    else:
+        print("[login] ❌ Google session nahi bana (SID missing) — login adhoora tha? Dobara try karo.")
 
 
 def main():
