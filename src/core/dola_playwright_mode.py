@@ -108,16 +108,13 @@ async def _launch(profile_dir, proxy, headless):
 
 
 async def _export_cookies(profile_dir, log=None):
-    """Grab a dedicated profile's cookies (Google + dola) to seed CloakBrowser.
-
-    The profile is the one the user logged into via 'Login for dola (Google)' in real
-    Chrome; everything then runs in CloakBrowser off these cookies. A bare ctx.cookies()
-    RIGHT after launch can miss late-written Google session cookies (Chrome's network
-    service is still hydrating), which is exactly why cloak sometimes showed 'Google not
-    signed in' and google=N came out low/varying. So: open the profile, NAVIGATE to
-    accounts.google.com so Chrome fully materialises + rotates the Google session, verify
-    the session is actually LIVE, THEN read the full cookie jar. A dead profile session is
-    reported (so the account can be re-logged) instead of silently exporting nothing."""
+    """READ the Google (+ any dola) cookies from the real-Chrome profile — the ONE-TIME
+    seed for CloakBrowser. It does NOT navigate anywhere (no accounts.google.com, no dola)
+    and does NOT log in: any navigation rotates Google's __Secure-1PSIDTS and, because the
+    session is then used from a second browser (cloak), desyncs it → Gmail logout. After
+    this initial seed, CloakBrowser becomes the single consistent user of the Google
+    session and its own (rotating) cookies are persisted + reused — the profile is never
+    re-exported again (see _cookies_for, which is cache-first)."""
     def _l(*a):
         if log:
             log(*a)
@@ -130,45 +127,10 @@ async def _export_cookies(profile_dir, log=None):
             args=["--no-first-run", "--no-default-browser-check",
                   "--window-position=-32000,-32000", "--window-size=1200,800"])
         try:
-            pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            # DO NOT navigate accounts.google.com here. That visit rotates Google's
-            # __Secure-1PSIDTS (a short-lived session-validation cookie); doing it on every
-            # export — several times per burn — desyncs it and makes Google invalidate the
-            # session (the 'Google logged out after recreate' the user hit). We touch Google
-            # ONLY when a dola login is genuinely required (the OAuth itself), never just to
-            # 'hydrate'. Land on dola (NOT Google) so account_info has base params.
-            try:
-                await pg.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
-                await asyncio.sleep(1.2)
-            except Exception:
-                pass
-            # Establish the dola session in real Chrome so CloakBrowser inherits it logged-in.
-            try:
-                from src.core.dola_api import DolaSession
-                dsess = DolaSession(ctx, pg, logger=(log or (lambda *a: None)))
-                # SERVER-SIDE check (account_info via ctx.request — NO navigation, NO Google
-                # touch). If the dola session is valid we export as-is: zero Google churn.
-                if await dsess.confirm_logged_in():
-                    _l("dola session already present in profile (no Google touch needed)")
-                else:
-                    gnames = {c["name"] for c in await ctx.cookies()
-                              if "google.com" in str(c.get("domain", ""))}
-                    if "SID" not in gnames:
-                        _l("Google logged out (no SID cookie) — re-login this account via "
-                           "'Login for dola (Google)'; skipping OAuth (would only hammer Google)")
-                    else:
-                        if await dsess.is_logged_in():
-                            _l("stale/dead dola cookies in profile → clearing before re-login (recreate)")
-                            await dsess.clear_dola_cookies()
-                        _l("establishing dola session in real Chrome…")
-                        ok = await dsess.login_via_google(timeout=45)
-                        _l(f"dola login in real Chrome: {'done' if ok else 'failed — cloak will retry'}")
-            except Exception as e:
-                _l("dola login (real chrome) skipped:", str(e)[:80])
-            ck = await asyncio.wait_for(ctx.cookies(), timeout=30)
+            ck = await asyncio.wait_for(ctx.cookies(), timeout=30)   # read only — NO navigation
             g = sum(1 for c in ck if "google.com" in str(c.get("domain", "")))
             d = sum(1 for c in ck if "dola.com" in str(c.get("domain", "")))
-            _l(f"exported {len(ck)} cookies (google={g}, dola={d})")
+            _l(f"seed cookies read from real-Chrome profile: {len(ck)} (google={g}, dola={d})")
             return ck
         finally:
             try:
@@ -188,22 +150,38 @@ def _cookie_cache(session_path):
 
 
 async def _cookies_for(session_path, log=None):
-    """Cookies to seed CloakBrowser with. Prefer a FRESH export from the dedicated
-    profile (it holds the CURRENT Google login) rather than a possibly-stale cache — a
-    stale file can be missing session cookies (low google=N) and leave the cloak session
-    only half-authenticated, so dola never fires its signed XHRs and _ensure_base fails.
-    The cache is used only if a fresh export fails."""
+    """Cookies to seed CloakBrowser with — CACHE-FIRST.
+
+    Once CloakBrowser has used the Google session even once, Google rotates
+    __Secure-1PSIDTS and the copy in the real-Chrome profile goes DEAD (anti-theft: a
+    session can't live in two browsers). So after the first seed, cloak's OWN saved
+    cookies (persisted by _save_cookies after every login/burn) are the source of truth
+    and we REUSE them — re-exporting from the now-dead profile would re-inject dead
+    cookies and log the account out (the exact bug the user hit). We only fall back to a
+    real-Chrome export when there's no cache yet (the very first run for this account)."""
+    def _l(*a):
+        if log:
+            log(*a)
     cf = _cookie_cache(session_path)
+    # 1) cache-first: reuse cloak's last-saved cookies if they still carry a Google session
+    if os.path.isfile(cf):
+        try:
+            ck = json.load(open(cf, encoding="utf-8"))
+            g = {c["name"] for c in ck if "google.com" in str(c.get("domain", ""))}
+            if "SID" in g:
+                _l(f"using cached cloak cookies ({len(ck)}, google={len(g)}) — no profile re-export")
+                return ck
+        except Exception:
+            pass
+    # 2) first run (no usable cache): one-time seed read from the real-Chrome profile
     try:
         ck = await _export_cookies(session_path, log=log)
         if ck:
-            try:
-                json.dump(ck, open(cf, "w", encoding="utf-8"))
-            except Exception:
-                pass
+            _save_cookies_file(session_path, ck)
             return ck
     except Exception:
         pass
+    # 3) last resort: whatever cache exists
     if os.path.isfile(cf):
         try:
             return json.load(open(cf, encoding="utf-8"))
@@ -227,27 +205,21 @@ async def _save_cookies(session_path, ctx):
 
 
 async def _fresh_relogin(session, session_path, log=None, timeout=90) -> bool:
-    """Re-seed FRESH Google cookies from the account's REAL-Chrome profile into the
-    live CloakBrowser context, THEN drive the dola login. The Google session inside
-    the cloak context goes stale (dola logs the account out) far sooner than it does
-    in the dedicated real-Chrome profile, so EVERY (re)login pulls the current cookies
-    from the source of truth first — the user's rule: 'google cookies hamesha fresh
-    utha karo real chrome se, phir login karwao dola me'. Returns login_via_google's
-    result (login is still driven on the page; only the cookie seed is refreshed)."""
+    """(Re)login dola IN CLOAK using the cookies cloak already holds — do NOT re-export
+    from the real-Chrome profile. Once cloak has used the Google session, the profile's
+    copy is dead (rotated __Secure-1PSIDTS), so re-injecting it would log the account out.
+    Cloak is the single consistent user: it logs in with its current Google cookies (anti-
+    detect → Google allows the consent), then we PERSIST cloak's evolving cookies so the
+    next run reuses them. Returns whether dola is logged in."""
     def _l(*a):
         if log:
             log(*a)
+    ok = await session.login_via_google(timeout=timeout)   # cloak; Google consent works here
     try:
-        fresh = await _export_cookies(session_path, log=log)
-        g = sum(1 for c in fresh if "google.com" in str(c.get("domain", "")))
-        await _add_cookies_robust(session.ctx, fresh, log=log)
-        _save_cookies_file(session_path, fresh)
-        _l(f"re-seeded FRESH Google cookies from real Chrome (google={g}) → logging into dola…")
+        await _save_cookies(session_path, session.ctx)     # persist cloak's rotated cookies
     except Exception as e:
-        _l("fresh cookie re-seed failed:", str(e)[:80])
-    # login_direct = silent OAuth redirect first (NO UI clicks — Google is signed in so it
-    # auto-returns), and it internally falls back to the state-driven login_via_google.
-    return await session.login_direct(timeout=timeout)
+        _l("save cloak cookies failed:", str(e)[:60])
+    return ok
 
 
 async def _burn_recreate_real_chrome(session_path, log=None, dry_run=False):
@@ -651,19 +623,26 @@ class PlaywrightDolaModeManager:
             main_session = DolaSession(ctx, page, logger=alog)
 
             alog("checking dola login…")
-            # In cloak use the cloak-SAFE login_direct (inherited dola cookies, NEVER touches
-            # Google — cloak visiting Google rotates the shared __Secure-1PSIDTS and logs the
-            # profile's Gmail out). Only real-Chrome mode may drive the Google UI login.
-            first_ok = (await main_session.login_direct(timeout=30)
-                        if self._cloak else await main_session.login_via_google(timeout=90))
+            if self._cloak:
+                # Fast path: cached cloak cookies may already carry a LIVE dola session
+                # (login_direct = confirm only, no Google touch). If not (first run — only
+                # Google cookies seeded), log in via Google IN CLOAK (anti-detect → Google's
+                # consent completes where regular Chrome is blocked), then PERSIST cloak's
+                # cookies so every later run reuses them (never re-export the dead profile).
+                first_ok = await main_session.login_direct(timeout=20)
+                if not first_ok:
+                    first_ok = await _fresh_relogin(main_session, session_path, log=alog, timeout=120)
+            else:
+                first_ok = await main_session.login_via_google(timeout=90)
             if not first_ok:
-                # retry with a FRESH cookie re-seed from real Chrome (cloak only)
-                ok = (await _fresh_relogin(main_session, session_path, log=alog, timeout=90)
-                      if self._cloak else await main_session.login_via_google(timeout=90))
-                if not ok:
-                    alog("login failed — retiring account (re-login it in Account Manager → "
-                         "'Login for dola (Google)')")
-                    return
+                alog("login failed — retiring account (re-login it in Account Manager → "
+                     "'Login for dola (Google)')")
+                return
+            if self._cloak:
+                try:
+                    await _save_cookies(session_path, ctx)   # persist cloak's session
+                except Exception:
+                    pass
             # login_via_google only checks cookies, so a stale-cookie GUEST passes it —
             # but then dola fires no signed requests and _ensure_base can't capture the
             # base params (it would crash the worker). Verify a REAL login first and

@@ -29,7 +29,7 @@ except Exception:
 
 from src.db.db_manager import get_accounts
 from src.core.dola_playwright_mode import (
-    _export_cookies, _launch_cloak, _add_cookies_robust, _proxy_dict, _save_cookies,
+    _cookies_for, _launch_cloak, _add_cookies_robust, _proxy_dict, _save_cookies,
 )
 from src.core.dola_api import DolaSession, DOLA_ORIGIN, LOGIN_COOKIES, DolaError
 
@@ -66,8 +66,8 @@ async def run(args):
         # BLOCKS an automated sign-in on regular Chrome ('this browser may not be secure' →
         # rejected); only cloak evades that check, so the recreate's fresh Google consent can
         # actually complete here. This is the originally-working approach.
-        log("STEP 1: cookies (real-Chrome silent login) + launch CloakBrowser…")
-        cookies = await _export_cookies(session_path, log=log)
+        log("STEP 1: cookies (cache-first: cloak's own, else one-time profile seed) + CloakBrowser…")
+        cookies = await _cookies_for(session_path, log=log)
         p, ctx = await _launch_cloak(cookies, proxy, False, log=log)   # visible so you can watch
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         session = DolaSession(ctx, page, logger=log)
@@ -79,6 +79,7 @@ async def run(args):
         old_uid = int((await session.account_info()).get("user_id", 0) or 0)
         log(f"LOGGED IN — user_id={old_uid}")
         await session._ensure_base()
+        await _save_cookies(session_path, ctx)   # persist cloak's session for reuse
 
         log(f"STEP 2: {'DRY-RUN delete (no click)' if dry else 'REAL delete (in cloak)'} …")
         ok, detail = await session.delete_account(timeout=90, log=log, dry_run=dry)
