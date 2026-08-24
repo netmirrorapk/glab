@@ -130,6 +130,18 @@ _DOLA_LOGIN_SCREEN_JS = r"""() => {
   };
 }"""
 
+# Fill dola's 'When's your birthday?' date input (YYYY-MM-DD) — UI fallback for the age gate,
+# via the native value setter so React registers the change.
+_AGE_BIRTHDAY_FILL_JS = r"""(dob) => {
+  const inp = document.querySelector("input[placeholder*='YYYY'],input[placeholder*='yyyy'],input[type='date'],input[type='text']");
+  if (!inp) return false;
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+  setter.call(inp, dob);
+  inp.dispatchEvent(new Event('input', {bubbles:true}));
+  inp.dispatchEvent(new Event('change', {bubbles:true}));
+  return true;
+}"""
+
 # Pick the right Google account tile in the OAuth account chooser (by email, else first).
 # Prefers data-identifier (the canonical account attribute), then a visible row whose text
 # contains the email. Clicks the nearest clickable ancestor so the tile actually navigates.
@@ -679,6 +691,51 @@ class DolaSession:
             "&response_type=token&scope=" + urllib.parse.quote("email profile") +
             "&state=" + state)
 
+    async def _age_gate_report_api(self) -> bool:
+        """Record an adult age server-side — POST /alice/age_gate/report with an adult
+        birthday + pass:true (clears BOTH the Confirm-button and birthday-picker variants,
+        verified from the HARs). dola's in-page fetch interceptor signs the /alice/ call, so
+        pf() is enough. birthday=900527400 ≈ 1998 (adult). NOTE: this records the pass but
+        does NOT itself fire /passport/web/auth/login/ (only the page's UI flow does), so the
+        caller must reload afterwards to let dola re-run login_only → login/."""
+        body = {"ratio": "9:16", "aspect_ratio": "9:16",
+                "birthday": 900527400, "scene": 1, "pass": True,
+                "allow_free_queue": True, "accept_queue": True, "credits": 1, "cost": 1}
+        try:
+            r = await self.pf("/alice/age_gate/report", body)
+            d = json.loads(r.get("body") or "{}")
+            if d.get("code") == 0 and (d.get("data") or {}).get("pass"):
+                self._log("age gate: recorded adult via API (age_gate/report)")
+                return True
+            self._log(f"age gate API resp: {str(r.get('body'))[:100]}")
+        except Exception as e:
+            self._log(f"age gate API error: {str(e)[:60]}")
+        return False
+
+    async def _pass_age_gate(self) -> bool:
+        """Clear dola's age gate. UI FIRST — fill the 'When's your birthday?' date input (if
+        present) then click Next/Confirm; that triggers dola's OWN age_gate/report + login/
+        so the session lands. Then API backstop (record adult + reload). Returns True if the
+        session landed."""
+        age_words = ["next", "confirm", "i am 18", "i'm 18", "yes", "continue", "agree"]
+        # 1) UI — fill birthday date picker (variant 2) + click the button (both variants)
+        try:
+            await self.page.evaluate(_AGE_BIRTHDAY_FILL_JS, "1998-07-15")
+        except Exception:
+            pass
+        await self._robust_click(age_words)
+        if await self._wait_logged_in(6):
+            return True
+        # 2) API backstop — record the adult age, then RELOAD so dola runs login_only → login/
+        if await self._age_gate_report_api():
+            try:
+                await self.page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
+            except Exception:
+                pass
+            if await self._wait_logged_in(8):
+                return True
+        return await self.is_logged_in()
+
     async def login_via_google(self, gmail: str = None, timeout: int = 90) -> bool:
         """CLICK-DRIVEN dola login — replicates EXACTLY what dola's own UI does (verified
         from the login HAR):
@@ -780,7 +837,9 @@ class DolaSession:
                 return False
 
             if st == "age_gate":
-                await self._robust_click(age_gate)
+                # clears BOTH the Confirm-button and birthday-picker variants (UI + API)
+                if await self._pass_age_gate():
+                    return True
                 await asyncio.sleep(0.6)
                 continue
 
