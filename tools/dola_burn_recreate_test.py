@@ -81,6 +81,17 @@ async def run(args):
         await session._ensure_base()
         await _save_cookies(session_path, ctx)   # persist cloak's session for reuse
 
+        # RE-SEED cloak's Google from the profile (still logged-in) before the burn — the
+        # delete re-auth + recreate consent both need a live Google session in cloak, which
+        # goes stale after a burn. Done ONLY at burn time (rare) so the profile churns slowly.
+        if not dry:
+            try:
+                log("re-seeding cloak Google from the profile for the burn…")
+                fresh = await _export_cookies(session_path, log=log)
+                await _add_cookies_robust(ctx, fresh, log=log)
+            except Exception as e:
+                log("pre-burn Google re-seed failed:", str(e)[:60])
+
         log(f"STEP 2: {'DRY-RUN delete (no click)' if dry else 'REAL delete (in cloak)'} …")
         ok, detail = await session.delete_account(timeout=90, log=log, dry_run=dry)
         log(f"delete result: ok={ok} detail={detail}")

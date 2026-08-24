@@ -967,6 +967,17 @@ class PlaywrightDolaModeManager:
             # evades that check, so the recreate's fresh Google consent can complete here
             # (this is how it worked originally). Real-Chrome burn was a wrong turn.
             try:
+                # RE-SEED cloak's Google from the profile (which stays logged-in) BEFORE the
+                # burn — the delete re-auth AND the recreate consent both need a live Google
+                # session in cloak, and cloak's own Google copy goes stale after a burn. We do
+                # this ONLY at burn time (rare), so the profile churns slowly, not on every gen.
+                if state.get("session_path"):
+                    try:
+                        alog("re-seeding cloak Google from the profile for the burn…")
+                        fresh = await _export_cookies(state["session_path"], log=alog)
+                        await _add_cookies_robust(state["ctx"], fresh, log=alog)
+                    except Exception as e:
+                        alog("pre-burn Google re-seed failed:", str(e)[:60])
                 # delete in cloak (anti-detect re-auth)
                 ok, detail = await main_session.delete_account(timeout=90, log=alog)
                 if not ok:
