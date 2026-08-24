@@ -1629,6 +1629,10 @@ class AccountManager:
             "--disable-sync",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
+            # HIDE the automation flag — without this Google rejects the sign-in with
+            # 'this browser or app may not be secure' (accounts.google.com/v3/signin/rejected).
+            # This is the one flag that makes the manual Google login work.
+            "--disable-blink-features=AutomationControlled",
             "--window-size=1920,1080",
             AccountManager.LOGIN_START_URLS.get(str(login_target or "flow"), "https://accounts.google.com"),
         ]
@@ -1707,6 +1711,18 @@ class AccountManager:
         # Give Chrome time to flush to disk
         await asyncio.sleep(2)
         cleanup_session_locks(session_dir)
+
+        # Drop the stale CloakBrowser cookie cache so the runner re-seeds from THIS fresh
+        # Google login (the dola runner is cache-first: _dola_cloak_cookies.json is reused
+        # and never re-exported, so a fresh Google login must invalidate the old cache).
+        try:
+            _cc = os.path.join(session_dir, "_dola_cloak_cookies.json")
+            if os.path.isfile(_cc):
+                os.remove(_cc)
+                if update_log_callback:
+                    update_log_callback(f"[{label}] cleared stale dola cloak cookie cache")
+        except Exception:
+            pass
 
         # Try to detect account from session files if not detected from live cookies
         if not detected_email:
