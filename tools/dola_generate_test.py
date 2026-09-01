@@ -116,6 +116,9 @@ async def run(args):
 
         # 2) burn-recreate (the credit-0 → delete → relogin flow, SAME browser)
         log(f"BURN-RECREATE: delete → recreate ({engine}) …")
+        if args.real_chrome and not args.visible:
+            from src.core.dola_playwright_mode import _cdp_move_window
+            await _cdp_move_window(session.page, on_screen=True, log=log)  # focus for Google chooser
         ok, detail = await session.delete_account(timeout=90, log=log)
         log(f"delete: ok={ok} {detail}")
         if not ok:

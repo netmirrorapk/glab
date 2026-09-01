@@ -97,6 +97,35 @@ def _free_port(preferred: int = 0) -> int:
     return port
 
 
+async def _cdp_move_window(page, on_screen: bool, log=None):
+    """Move the real-Chrome CDP window on-screen (focused) or off-screen (invisible) via CDP
+    Browser.setWindowBounds. Google's OAuth account-chooser only accepts a click on a
+    FOCUSED/visible window, so the burn must bring the window on-screen; generation runs
+    off-screen. No-op for cloak / non-CDP pages."""
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        win = await cdp.send("Browser.getWindowForTarget")
+        wid = win["windowId"]
+        if on_screen:
+            bounds = {"left": 80, "top": 60, "width": 1200, "height": 860, "windowState": "normal"}
+        else:
+            bounds = {"left": -32000, "top": -32000, "width": 1200, "height": 860}
+        await cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds})
+        if on_screen:
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+        if log:
+            log(f"window moved {'on-screen (for burn)' if on_screen else 'off-screen'}")
+    except Exception:
+        pass
+
+
 def _cdp_live(port: int) -> bool:
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
@@ -1067,6 +1096,11 @@ class PlaywrightDolaModeManager:
                         await _add_cookies_robust(state["ctx"], fresh, log=alog)
                     except Exception as e:
                         alog("pre-burn Google re-seed failed:", str(e)[:60])
+                # real-Chrome CDP: bring the window ON-SCREEN for the burn — Google's OAuth
+                # chooser/consent only accepts a click on a focused window; an off-screen one
+                # leaves the pick dead → the OAuth never completes → __Secure-1PSIDTS is lost.
+                if not state.get("cloak") and self._headless:
+                    await _cdp_move_window(main_session.page, on_screen=True, log=alog)
                 # delete (cloak: anti-detect re-auth; real-Chrome-CDP: native Google session)
                 ok, detail = await main_session.delete_account(timeout=90, log=alog)
                 if not ok:
@@ -1081,6 +1115,9 @@ class PlaywrightDolaModeManager:
                     alog("recreate re-login failed → retiring")
                     state["alive"] = False; state["healthy"].set(); return
                 await main_session._ensure_base()
+                # burn done — push the CDP window back off-screen (generation runs invisible)
+                if not state.get("cloak") and self._headless:
+                    await _cdp_move_window(main_session.page, on_screen=False, log=alog)
                 # verify a fresh live account, then persist the cloak cookies
                 new_uid = int((await main_session.account_info()).get("user_id", 0) or 0)
                 alog(f"recreate: new user_id={new_uid}")
