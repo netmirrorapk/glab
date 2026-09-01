@@ -23,7 +23,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+import subprocess
+import sys
 import tempfile
+import time
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 from playwright.async_api import async_playwright
@@ -78,33 +83,106 @@ def _proxy_dict(url):
 
 
 # ── browser launch (ported from tools/dola_run.py) ─────────────────────────────
-async def _launch(profile_dir, proxy, headless):
-    """Real Chrome persistent context. dola detects every headless mode, so for
-    'invisible' we launch a genuine HEADED window moved OFF-SCREEN."""
-    chrome = _find_chrome()
-    p = await async_playwright().start()
-    extra = ["--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled",
-             "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
-             "--disable-background-timer-throttling"]
-    if headless:
-        extra += ["--window-position=-32000,-32000", "--window-size=1280,800"]
-    kwargs = dict(user_data_dir=profile_dir, executable_path=chrome, headless=False,
-                  ignore_default_args=["--enable-automation"], args=extra,
-                  viewport=None if headless else {"width": 1280, "height": 800})
-    pd = _proxy_dict(proxy)
-    if pd:
-        kwargs["proxy"] = pd
-    ctx = await p.chromium.launch_persistent_context(**kwargs)
+def _free_port(preferred: int = 0) -> int:
+    """A free localhost TCP port (tries `preferred` first)."""
+    if preferred:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", preferred)); s.close(); return preferred
+        except OSError:
+            try: s.close()
+            except Exception: pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    return port
+
+
+def _cdp_live(port: int) -> bool:
     try:
-        from playwright_stealth import Stealth
-        payload = Stealth().script_payload
-        if callable(payload):
-            payload = payload()
-        if payload:
-            await ctx.add_init_script(script=payload)
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+        return True
     except Exception:
-        pass
-    return p, ctx
+        return False
+
+
+class _CdpHolder:
+    """Wraps a subprocess-launched Chrome + its CDP Playwright connection so the runner's
+    `p.stop()` cleanly closes the browser and kills the Chrome process."""
+    def __init__(self, pw, browser, proc, port):
+        self._pw = pw; self._browser = browser; self._proc = proc; self._port = port
+
+    async def stop(self):
+        try:
+            await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate(); self._proc.wait(timeout=6)
+        except Exception:
+            try:
+                if self._proc:
+                    self._proc.kill()
+            except Exception:
+                pass
+        try:
+            await self._pw.stop()
+        except Exception:
+            pass
+
+
+async def _launch(profile_dir, proxy, headless, port_hint: int = 0, log=None):
+    """Real Chrome via a PLAIN subprocess + connect_over_cdp — NOT launch_persistent_context.
+    This is deliberate: Playwright-launched Chrome sets navigator.webdriver etc. and Google
+    BLOCKS its sign-in ('this browser or app may not be secure'), which breaks the dola
+    login AND the burn-recreate consent. A subprocess Chrome with
+    --disable-blink-features=AutomationControlled that we merely ATTACH to over CDP is
+    treated as a normal browser, so Google accepts it. Everything (login, generation, delete,
+    relogin) then runs in this ONE consistent real-Chrome profile — no cloak↔profile cookie
+    desync, so Gmail stays logged in and burns repeat. Returns (_CdpHolder, context)."""
+    def _l(*a):
+        if log:
+            log(*a)
+    chrome = _find_chrome()
+    port = _free_port(port_hint or 9300)
+    args = [
+        chrome,
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-background-timer-throttling",
+    ]
+    if headless:
+        # invisible for generation — a genuine headed window pushed OFF-SCREEN (dola/Google
+        # dislike --headless for the OAuth, so we hide rather than headless).
+        args += ["--window-position=-32000,-32000", "--window-size=1280,800"]
+    else:
+        args += ["--window-position=80,60", "--window-size=1280,860"]
+    pd = _proxy_dict(proxy)
+    if pd and pd.get("server"):
+        args.append(f"--proxy-server={pd['server']}")
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    proc = subprocess.Popen(args, creationflags=creationflags)
+    for _ in range(25):
+        if _cdp_live(port):
+            break
+        time.sleep(1)
+    if not _cdp_live(port):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError(f"Chrome CDP did not come up on port {port} (profile in use?)")
+    pw = await async_playwright().start()
+    browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+    _l(f"real-Chrome CDP up on :{port} ({'invisible' if headless else 'visible'})")
+    return _CdpHolder(pw, browser, proc, port), ctx
 
 
 async def _export_cookies(profile_dir, log=None):
@@ -503,7 +581,10 @@ class PlaywrightDolaModeManager:
         bmode = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
         cdisp = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
         self._cloak = (bmode == "cloakbrowser")
-        self._headless = (cdisp == "headless") if self._cloak else (bmode == "headless")
+        # non-cloak now = real-Chrome-via-CDP (Google-accepted). Everything except the
+        # explicit "visible" mode runs OFF-SCREEN (invisible background) — including
+        # "real_chrome" and "headless" — so login/gen/burn happen silently.
+        self._headless = (cdisp == "headless") if self._cloak else (bmode != "visible")
         self._auto_delete = self._bool_setting("dola_auto_delete", "1")
         self._remove_wm = self._bool_setting("dola_remove_watermark", "1")
         # Seconds to stagger each tab's FIRST submit so N tabs on one account don't fire
@@ -967,18 +1048,18 @@ class PlaywrightDolaModeManager:
             # evades that check, so the recreate's fresh Google consent can complete here
             # (this is how it worked originally). Real-Chrome burn was a wrong turn.
             try:
-                # RE-SEED cloak's Google from the profile (which stays logged-in) BEFORE the
-                # burn — the delete re-auth AND the recreate consent both need a live Google
-                # session in cloak, and cloak's own Google copy goes stale after a burn. We do
-                # this ONLY at burn time (rare), so the profile churns slowly, not on every gen.
-                if state.get("session_path"):
+                # CLOAK ONLY: re-seed cloak's Google from the profile before the burn (cloak's
+                # own Google copy goes stale after a burn; the profile stays logged-in). In
+                # real-Chrome-CDP mode the browser IS the profile, so its Google is native —
+                # and re-opening the profile here would clash with the live CDP browser.
+                if state.get("cloak") and state.get("session_path"):
                     try:
                         alog("re-seeding cloak Google from the profile for the burn…")
                         fresh = await _export_cookies(state["session_path"], log=alog)
                         await _add_cookies_robust(state["ctx"], fresh, log=alog)
                     except Exception as e:
                         alog("pre-burn Google re-seed failed:", str(e)[:60])
-                # delete in cloak (anti-detect re-auth)
+                # delete (cloak: anti-detect re-auth; real-Chrome-CDP: native Google session)
                 ok, detail = await main_session.delete_account(timeout=90, log=alog)
                 if not ok:
                     alog("delete failed → retiring:", detail)
