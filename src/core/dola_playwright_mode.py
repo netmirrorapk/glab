@@ -714,7 +714,15 @@ class PlaywrightDolaModeManager:
                 if not first_ok:
                     first_ok = await _fresh_relogin(main_session, session_path, log=alog, timeout=120)
             else:
-                first_ok = await main_session.login_via_google(timeout=90)
+                # real-Chrome CDP: the profile already holds the dola session (from the
+                # 'Login for dola (Google)' button). Confirm it FIRST via login_direct — NO
+                # Google touch — so generation never navigates Google (that's what churned
+                # __Secure-1PSIDTS → Gmail logout). Only if the dola session is genuinely dead
+                # do we do the one Google OAuth (login_via_google), which then re-persists it.
+                first_ok = await main_session.login_direct(timeout=20)
+                if not first_ok:
+                    alog("dola session not live in profile → one Google login (re-persists it)…")
+                    first_ok = await main_session.login_via_google(timeout=90)
             if not first_ok:
                 alog("login failed — retiring account (re-login it in Account Manager → "
                      "'Login for dola (Google)')")
