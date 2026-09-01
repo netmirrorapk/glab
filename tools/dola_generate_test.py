@@ -18,7 +18,8 @@ except Exception:
     pass
 
 from src.db.db_manager import get_accounts
-from src.core.dola_playwright_mode import _cookies_for, _launch_cloak, _proxy_dict, _save_cookies
+from src.core.dola_playwright_mode import (_cookies_for, _launch_cloak, _launch, _proxy_dict,
+                                           _save_cookies)
 from src.core.dola_api import (DolaSession, DOLA_ORIGIN, DolaError, DailyLimitReached,
                                GenerationRefused, HighDemand, NotLoggedIn)
 
@@ -76,21 +77,30 @@ async def run(args):
         print("account not found. available:", [a["name"] for a in get_accounts()]); return
     session_path = acc["session_path"]
     proxy = _proxy_dict(acc["proxy"]) if acc.get("proxy") else None
+    engine = "real-Chrome CDP" if args.real_chrome else "CloakBrowser"
     print("=" * 78)
-    print(f"account : {acc['name']}  | model={args.model} duration={args.duration}s burn={args.burn}")
+    print(f"account : {acc['name']}  | engine={engine} model={args.model} "
+          f"duration={args.duration}s burn={args.burn}")
     print("=" * 78)
 
     p = ctx = None
     try:
-        cookies = await _cookies_for(session_path, log=log)
-        p, ctx = await _launch_cloak(cookies, proxy, False, log=log)
+        if args.real_chrome:
+            # REAL CHROME via CDP — login + gen + delete + relogin ALL in the one profile
+            # (Google-accepted, no cloak). No cookie injection: the profile is used natively.
+            p, ctx = await _launch(session_path, acc.get("proxy") or "",
+                                   headless=not args.visible, log=log)
+        else:
+            cookies = await _cookies_for(session_path, log=log)
+            p, ctx = await _launch_cloak(cookies, proxy, False, log=log)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         session = DolaSession(ctx, page, logger=log)
         await page.goto(f"{DOLA_ORIGIN}/chat/create-video", wait_until="domcontentloaded")
         if not await _login(session, session_path):
             log("login failed — aborting"); return
         await session._ensure_base()
-        await _save_cookies(session_path, ctx)
+        if not args.real_chrome:
+            await _save_cookies(session_path, ctx)
         log(f"LOGGED IN — user_id={(await session.account_info()).get('user_id')}")
 
         # 1) first generation
@@ -104,8 +114,8 @@ async def run(args):
             print("\n[gen-test] DONE (no burn requested).")
             return
 
-        # 2) burn-recreate (simulate the credit-0 → delete → relogin flow)
-        log("BURN-RECREATE: delete → recreate (cloak) …")
+        # 2) burn-recreate (the credit-0 → delete → relogin flow, SAME browser)
+        log(f"BURN-RECREATE: delete → recreate ({engine}) …")
         ok, detail = await session.delete_account(timeout=90, log=log)
         log(f"delete: ok={ok} {detail}")
         if not ok:
@@ -115,7 +125,8 @@ async def run(args):
         if not await session.login_via_google(timeout=120):
             log("recreate login failed — stopping"); return
         await session._ensure_base()
-        await _save_cookies(session_path, ctx)
+        if not args.real_chrome:
+            await _save_cookies(session_path, ctx)
         new_uid = (await session.account_info()).get("user_id")
         log(f"RECREATED — fresh user_id={new_uid}")
 
@@ -154,6 +165,10 @@ def main():
     ap.add_argument("--ratio", default="9:16")
     ap.add_argument("--duration", type=int, default=30)
     ap.add_argument("--burn", action="store_true", help="also test burn-recreate + regenerate")
+    ap.add_argument("--real-chrome", action="store_true",
+                    help="use real-Chrome-via-CDP (login+gen+delete+relogin in ONE profile) instead of cloak")
+    ap.add_argument("--visible", action="store_true",
+                    help="(real-chrome) show the window on-screen instead of off-screen")
     asyncio.run(run(ap.parse_args()))
 
 
