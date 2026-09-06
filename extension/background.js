@@ -666,31 +666,33 @@ async function mainWorldExecute(action) {
 
   try {
     // ─── 1. Auth Session ───
-    // Google moved Flow from labs.google to flow.google.com; try the
-    // current-origin endpoint first (same-origin cookies attach without
-    // CORS), then fall back to whichever legacy endpoint still answers.
-    const authEndpoints = [
-      window.location.origin + "/api/auth/session",
-      "https://flow.google.com/api/auth/session",
-      "https://labs.google/fx/api/auth/session",
-    ];
-    for (const authUrl of authEndpoints) {
-      try {
-        const authResp = await fetch(authUrl, {
-          method: "GET",
-          credentials: "include",
-        });
-        if (!authResp.ok) continue;
-        const auth = await authResp.json().catch(() => null);
-        if (!auth || !auth.access_token) continue;
-        result.access_token = auth.access_token;
-        result.email = auth.email || (auth.user && auth.user.email) || null;
-        result.name = auth.name || (auth.user && auth.user.name) || null;
-        break;
-      } catch {}
-    }
+    // Google's new Flow (post the flow.google.com migration) has no
+    // access_token — the /api/auth/session endpoint returns HTML (SPA
+    // shell), not JSON. Auth is now SAPISIDHASH cookie-based. Read the
+    // email and XSRF token from the SPA's WIZ_global_data instead.
+    try {
+      const wiz = (window.WIZ_global_data || {});
+      result.email = wiz.oPEP7c || null;
+      result.name = wiz.zChJod || null;
+      // The batchexecute XSRF token — stored on result.access_token
+      // for backwards compatibility so downstream code that reads
+      // access_token gets the value it now needs to POST to the RPC
+      // endpoints. This is intentionally overloading a legacy field
+      // during the migration; a follow-up refactor renames it to
+      // xsrf_token everywhere.
+      result.access_token = wiz.SNlM0e || null;
 
-    if (!result.access_token) {
+      // Fallback: HTML scrape if globals aren't populated yet.
+      if (!result.email) {
+        const html = document.documentElement.outerHTML;
+        const em = html.match(/"oPEP7c":"([^"]+@[^"]+)"/);
+        if (em) result.email = em[1];
+        const xs = html.match(/"SNlM0e":"([^"]+)"/);
+        if (xs && !result.access_token) result.access_token = xs[1];
+      }
+    } catch {}
+
+    if (!result.email) {
       result.error = "no_auth_session";
       return result;
     }
@@ -891,27 +893,23 @@ async function findLabsTab(targetAccount) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           world: "MAIN",
-          args: [AUTH_SESSION_ENDPOINTS],
-          func: async (endpoints) => {
-            // Try both flow.google.com and labs.google auth endpoints
-            // (the tab may be on either origin depending on the URL Chrome
-            // resolved to). Return the first one that has a valid session.
-            for (const url of endpoints) {
-              try {
-                const resp = await fetch(url, {
-                  method: "GET", credentials: "include",
-                });
-                if (!resp.ok) continue;
-                const data = await resp.json().catch(() => null);
-                if (!data) continue;
-                return {
-                  email: data.email || (data.user && data.user.email) || "",
-                  name: data.name || (data.user && data.user.name) || "",
-                  logged_in: !!data.access_token,
-                };
-              } catch {}
-            }
-            return null;
+          func: async () => {
+            // Same email-from-WIZ_global_data path as detectAccounts.
+            try {
+              const wiz = window.WIZ_global_data || {};
+              let email = wiz.oPEP7c || "";
+              if (!email) {
+                const html = document.documentElement.outerHTML;
+                const m = html.match(/"oPEP7c":"([^"]+@[^"]+)"/);
+                if (m) email = m[1];
+              }
+              if (!email) return null;
+              return {
+                email: email,
+                name: wiz.zChJod || "",
+                logged_in: true,
+              };
+            } catch { return null; }
           },
         });
 
@@ -969,36 +967,63 @@ async function detectAccounts() {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         world: "MAIN",
-        args: [AUTH_SESSION_ENDPOINTS],
-        func: async (endpoints) => {
-          // Try each auth-session endpoint in order and return the first
-          // one that responds with a token. Google moved Flow from
-          // labs.google to flow.google.com and each origin serves its own
-          // /api/auth/session with the current tab's Google account.
-          for (const url of endpoints) {
-            try {
-              const resp = await fetch(url, {
-                method: "GET", credentials: "include",
-              });
-              if (!resp.ok) continue;
-              const data = await resp.json().catch(() => null);
-              if (!data || !data.access_token) continue;
+        func: async () => {
+          // Google migrated Flow from the old NextAuth architecture
+          // (labs.google/fx/api/auth/session returning JSON with
+          // access_token + email) to their internal Angular +
+          // batchexecute stack. There is no access_token anymore —
+          // auth is SAPISIDHASH-cookie-based, and the user's identity
+          // is embedded in the page's WIZ_global_data as `oPEP7c`
+          // (email), with the XSRF token in `SNlM0e` for POSTs.
+          //
+          // Read those globals directly. This runs in the page's MAIN
+          // world so we can touch window.WIZ_global_data without CSP
+          // or context-isolation trouble.
+          try {
+            const wiz = (window.WIZ_global_data || window["WIZ_global_data"] || {});
+            let email = wiz.oPEP7c || "";
+            let xsrf = wiz.SNlM0e || "";
 
-              let projectId = null;
-              const urlMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
-              if (urlMatch) projectId = urlMatch[1];
+            // Fallback 1: if WIZ_global_data isn't populated yet
+            // (rare — happens if the SPA is still loading), scrape
+            // the account chip's aria-label from the DOM.
+            if (!email) {
+              const chip = document.querySelector('a[aria-label*="Google Account"], a[aria-label*="@"]');
+              if (chip) {
+                const m = (chip.getAttribute("aria-label") || "").match(
+                  /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/
+                );
+                if (m) email = m[1];
+              }
+            }
 
-              return {
-                email: data.email || (data.user && data.user.email) || "",
-                name: data.name || (data.user && data.user.name) || "",
-                access_token: data.access_token,
-                project_id: projectId,
-                logged_in: true,
-                auth_origin: url,  // which endpoint answered — surfaced for logging
-              };
-            } catch {}
+            // Fallback 2: full HTML regex — the email appears in
+            // multiple structured JSON blobs and in the account chip.
+            if (!email) {
+              const html = document.documentElement.outerHTML;
+              const m = html.match(/"oPEP7c":"([^"]+@[^"]+)"/)
+                     || html.match(/([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/);
+              if (m) email = m[1];
+            }
+
+            if (!email) return null;
+
+            let projectId = null;
+            const urlMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+            if (urlMatch) projectId = urlMatch[1];
+
+            return {
+              email: email,
+              name: wiz.zChJod || "",  // display name (often empty in Flow's payload)
+              access_token: "",         // legacy field; new Flow uses cookie auth
+              xsrf_token: xsrf,         // SNlM0e — required for batchexecute POSTs
+              project_id: projectId,
+              logged_in: true,
+              auth_origin: "flow.google.com/WIZ_global_data",
+            };
+          } catch (e) {
+            return null;
           }
-          return null;
         },
       });
 
@@ -1271,18 +1296,14 @@ async function handleCommand(cmd) {
             try {
               const r = await chrome.scripting.executeScript({
                 target: { tabId: t.id }, world: "MAIN",
-                args: [AUTH_SESSION_ENDPOINTS],
-                func: async (endpoints) => {
-                  for (const url of endpoints) {
-                    try {
-                      const resp = await fetch(url, { credentials: "include" });
-                      if (!resp.ok) continue;
-                      const d = await resp.json().catch(() => null);
-                      const em = (d && (d.email || (d.user && d.user.email))) || "";
-                      if (em) return em;
-                    } catch {}
-                  }
-                  return "";
+                func: async () => {
+                  try {
+                    const wiz = window.WIZ_global_data || {};
+                    if (wiz.oPEP7c) return wiz.oPEP7c;
+                    const html = document.documentElement.outerHTML;
+                    const m = html.match(/"oPEP7c":"([^"]+@[^"]+)"/);
+                    return m ? m[1] : "";
+                  } catch { return ""; }
                 },
               });
               email = r?.[0]?.result || "";
