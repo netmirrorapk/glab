@@ -20,7 +20,24 @@ try { importScripts("dola.js"); } catch (e) { console.warn("dola.js not loaded:"
 
 const BRIDGE_URL = "http://127.0.0.1:18924";
 const POLL_INTERVAL = 1500;
+// Google renamed Flow's domain: the product used to live at
+// labs.google/fx/tools/flow and now serves from flow.google.com. Chrome
+// auto-redirects old links, so an account can be logged in on either
+// origin depending on how the user opened the tab. We accept both and
+// prefer whichever the user's tab is actually on.
 const LABS_ORIGIN = "https://labs.google";
+const FLOW_ORIGIN = "https://flow.google.com";
+const FLOW_TAB_PATTERNS = [
+  `${LABS_ORIGIN}/*`,
+  `${FLOW_ORIGIN}/*`,
+];
+// Auth-session endpoints — try flow.google.com's own API first when the
+// tab is on that host (same-origin cookies), then fall back to the
+// labs.google endpoint (which still exists for legacy tabs).
+const AUTH_SESSION_ENDPOINTS = [
+  "https://flow.google.com/api/auth/session",
+  "https://labs.google/fx/api/auth/session",
+];
 const ACCOUNT_DETECT_INTERVAL = 10000;
 
 // ─── State ───
@@ -409,7 +426,7 @@ async function handleWork(work) {
   //     because Google's CDN now requires an authenticated session.
   if (action && action.startsWith("FETCH_MEDIA_BYTES:")) {
     const mediaUrl = action.slice("FETCH_MEDIA_BYTES:".length);
-    const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+    const allLabsTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
     const tabId = allLabsTabs.length > 0 ? allLabsTabs[0].id : null;
     if (!tabId) {
       await submitResult(request_id, { error: "no_labs_tab_for_fetch" });
@@ -464,7 +481,7 @@ async function handleWork(work) {
   // ─── DOWNLOAD_MEDIA: resolve redirect URL via webRequest + MAIN world fetch (fallback) ───
   if (action && action.startsWith("DOWNLOAD_MEDIA:")) {
     const mediaUrl = action.slice("DOWNLOAD_MEDIA:".length);
-    const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+    const allLabsTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
     const tabId = allLabsTabs.length > 0 ? allLabsTabs[0].id : null;
     if (!tabId) {
       await submitResult(request_id, { error: "no_labs_tab_for_download" });
@@ -484,7 +501,10 @@ async function handleWork(work) {
         };
         chrome.webRequest.onBeforeRedirect.addListener(
           listener,
-          { urls: ["https://labs.google/fx/api/trpc/media.getMediaUrlRedirect*"] }
+          { urls: [
+            "https://labs.google/fx/api/trpc/media.getMediaUrlRedirect*",
+            "https://flow.google.com/api/trpc/media.getMediaUrlRedirect*",
+          ] }
         );
         // Timeout fallback
         setTimeout(() => {
@@ -521,7 +541,7 @@ async function handleWork(work) {
   }
 
   // Check if any Labs tab exists at all (before reCAPTCHA validation)
-  const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+  const allLabsTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
 
   // Find a Labs tab with reCAPTCHA ready for this account
   const tabId = await findLabsTab(account);
@@ -646,20 +666,29 @@ async function mainWorldExecute(action) {
 
   try {
     // ─── 1. Auth Session ───
-    try {
-      const authResp = await fetch("https://labs.google/fx/api/auth/session", {
-        method: "GET",
-        credentials: "include",
-      });
-      if (authResp.ok) {
+    // Google moved Flow from labs.google to flow.google.com; try the
+    // current-origin endpoint first (same-origin cookies attach without
+    // CORS), then fall back to whichever legacy endpoint still answers.
+    const authEndpoints = [
+      window.location.origin + "/api/auth/session",
+      "https://flow.google.com/api/auth/session",
+      "https://labs.google/fx/api/auth/session",
+    ];
+    for (const authUrl of authEndpoints) {
+      try {
+        const authResp = await fetch(authUrl, {
+          method: "GET",
+          credentials: "include",
+        });
+        if (!authResp.ok) continue;
         const auth = await authResp.json().catch(() => null);
-        if (auth) {
-          result.access_token = auth.access_token || null;
-          result.email = auth.email || (auth.user && auth.user.email) || null;
-          result.name = auth.name || (auth.user && auth.user.name) || null;
-        }
-      }
-    } catch {}
+        if (!auth || !auth.access_token) continue;
+        result.access_token = auth.access_token;
+        result.email = auth.email || (auth.user && auth.user.email) || null;
+        result.name = auth.name || (auth.user && auth.user.name) || null;
+        break;
+      } catch {}
+    }
 
     if (!result.access_token) {
       result.error = "no_auth_session";
@@ -831,7 +860,7 @@ function invalidateRecaptchaCache(tabId) {
 }
 
 async function findLabsTab(targetAccount) {
-  const tabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+  const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
 
   if (!tabs.length) return null;
 
@@ -862,19 +891,27 @@ async function findLabsTab(targetAccount) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           world: "MAIN",
-          func: async () => {
-            try {
-              const resp = await fetch("https://labs.google/fx/api/auth/session", {
-                method: "GET", credentials: "include",
-              });
-              const data = await resp.json().catch(() => null);
-              if (!data) return null;
-              return {
-                email: data.email || (data.user && data.user.email) || "",
-                name: data.name || (data.user && data.user.name) || "",
-                logged_in: !!data.access_token,
-              };
-            } catch { return null; }
+          args: [AUTH_SESSION_ENDPOINTS],
+          func: async (endpoints) => {
+            // Try both flow.google.com and labs.google auth endpoints
+            // (the tab may be on either origin depending on the URL Chrome
+            // resolved to). Return the first one that has a valid session.
+            for (const url of endpoints) {
+              try {
+                const resp = await fetch(url, {
+                  method: "GET", credentials: "include",
+                });
+                if (!resp.ok) continue;
+                const data = await resp.json().catch(() => null);
+                if (!data) continue;
+                return {
+                  email: data.email || (data.user && data.user.email) || "",
+                  name: data.name || (data.user && data.user.name) || "",
+                  logged_in: !!data.access_token,
+                };
+              } catch {}
+            }
+            return null;
           },
         });
 
@@ -924,7 +961,7 @@ async function findLabsTab(targetAccount) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function detectAccounts() {
-  const tabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+  const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
   const accounts = [];
 
   for (const tab of tabs) {
@@ -932,28 +969,36 @@ async function detectAccounts() {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         world: "MAIN",
-        func: async () => {
-          try {
-            const resp = await fetch("https://labs.google/fx/api/auth/session", {
-              method: "GET", credentials: "include",
-            });
-            if (!resp.ok) return null;
-            const data = await resp.json().catch(() => null);
-            if (!data || !data.access_token) return null;
+        args: [AUTH_SESSION_ENDPOINTS],
+        func: async (endpoints) => {
+          // Try each auth-session endpoint in order and return the first
+          // one that responds with a token. Google moved Flow from
+          // labs.google to flow.google.com and each origin serves its own
+          // /api/auth/session with the current tab's Google account.
+          for (const url of endpoints) {
+            try {
+              const resp = await fetch(url, {
+                method: "GET", credentials: "include",
+              });
+              if (!resp.ok) continue;
+              const data = await resp.json().catch(() => null);
+              if (!data || !data.access_token) continue;
 
-            // Also try to get project ID from URL
-            let projectId = null;
-            const urlMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
-            if (urlMatch) projectId = urlMatch[1];
+              let projectId = null;
+              const urlMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
+              if (urlMatch) projectId = urlMatch[1];
 
-            return {
-              email: data.email || (data.user && data.user.email) || "",
-              name: data.name || (data.user && data.user.name) || "",
-              access_token: data.access_token,
-              project_id: projectId,
-              logged_in: true,
-            };
-          } catch { return null; }
+              return {
+                email: data.email || (data.user && data.user.email) || "",
+                name: data.name || (data.user && data.user.name) || "",
+                access_token: data.access_token,
+                project_id: projectId,
+                logged_in: true,
+                auth_origin: url,  // which endpoint answered — surfaced for logging
+              };
+            } catch {}
+          }
+          return null;
         },
       });
 
@@ -1020,7 +1065,9 @@ function toPlaywrightCookie(c) {
 async function collectGoogleCookies() {
   const domains = [
     ".google.com", "google.com", "accounts.google.com",
-    "labs.google", ".labs.google", "www.google.com",
+    "labs.google", ".labs.google",
+    "flow.google.com", ".flow.google.com",
+    "www.google.com",
   ];
   const seen = new Set();
   const out = [];
@@ -1084,10 +1131,12 @@ async function handleCommand(cmd) {
       break;
 
     case "clean_tracking":
-      // Remove Service Workers + IndexedDB for labs.google — preserves login cookies
+      // Remove Service Workers + IndexedDB for BOTH Flow origins (Google
+      // serves the product from both labs.google and flow.google.com now).
+      // Login cookies live on .google.com so they're preserved.
       try {
         await chrome.browsingData.remove(
-          { origins: ["https://labs.google"] },
+          { origins: [LABS_ORIGIN, FLOW_ORIGIN] },
           {
             serviceWorkers: true,
             indexedDB: true,
@@ -1113,13 +1162,13 @@ async function handleCommand(cmd) {
       // cmd.data. New tabs open in the background (not focused).
       try {
         const want = Math.max(1, parseInt(cmd.data, 10) || 1);
-        const existing = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+        const existing = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
         const toOpen = want - existing.length;
         if (toOpen > 0) {
           for (let i = 0; i < toOpen; i++) {
             try {
               await chrome.tabs.create({
-                url: `${LABS_ORIGIN}/fx/tools/flow`,
+                url: FLOW_ORIGIN,
                 active: false,
               });
             } catch {}
@@ -1209,7 +1258,7 @@ async function handleCommand(cmd) {
       // is already open). Runs on-demand at resolve time so it sees the CURRENT
       // tab URL, not the last periodic detectAccounts sweep.
       try {
-        const labsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+        const labsTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
         let foundPid = "";
         for (const t of labsTabs) {
           const m = String(t.url || "").match(/\/project\/([a-z0-9-]{16,})/i);
@@ -1222,16 +1271,18 @@ async function handleCommand(cmd) {
             try {
               const r = await chrome.scripting.executeScript({
                 target: { tabId: t.id }, world: "MAIN",
-                func: async () => {
-                  try {
-                    const resp = await fetch(
-                      "https://labs.google/fx/api/auth/session",
-                      { credentials: "include" }
-                    );
-                    if (!resp.ok) return "";
-                    const d = await resp.json().catch(() => null);
-                    return (d && (d.email || (d.user && d.user.email))) || "";
-                  } catch { return ""; }
+                args: [AUTH_SESSION_ENDPOINTS],
+                func: async (endpoints) => {
+                  for (const url of endpoints) {
+                    try {
+                      const resp = await fetch(url, { credentials: "include" });
+                      if (!resp.ok) continue;
+                      const d = await resp.json().catch(() => null);
+                      const em = (d && (d.email || (d.user && d.user.email))) || "";
+                      if (em) return em;
+                    } catch {}
+                  }
+                  return "";
                 },
               });
               email = r?.[0]?.result || "";
@@ -1290,10 +1341,17 @@ async function handleCommand(cmd) {
           // Step 1: navigate to the flow dashboard if we're not
           // already there. We bail out of project-scoped URLs since
           // the New-project CTA only renders on the picker.
-          if (!/\/fx\/tools\/flow\/?(\?|$)/i.test(beforeUrl)) {
+          // Match Flow "home" on either labs.google/fx/tools/flow OR
+          // the current flow.google.com root (the New-project CTA lives
+          // on the picker screen at either domain's root).
+          const onFlowHome = (
+            /\/fx\/tools\/flow\/?(\?|$)/i.test(beforeUrl) ||
+            /^https:\/\/flow\.google\.com\/?(\?|$)/i.test(beforeUrl)
+          );
+          if (!onFlowHome) {
             try {
               await chrome.tabs.update(tabId, {
-                url: "https://labs.google/fx/tools/flow",
+                url: FLOW_ORIGIN,
               });
               // Wait for "complete" status. Cap at 15s.
               const navDeadline = Date.now() + 15000;
@@ -2521,7 +2579,7 @@ async function ecosystemTick() {
 async function installFlowRecaptchaWarmup() {
   let tabs;
   try {
-    tabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+    tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
   } catch {
     return;
   }
@@ -2685,7 +2743,10 @@ setTimeout(detectAccounts, 2000);
 
 // Listen for Labs tab changes
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && tab.url && tab.url.startsWith(LABS_ORIGIN)) {
+  const isFlowTab = tab.url && (
+    tab.url.startsWith(LABS_ORIGIN) || tab.url.startsWith(FLOW_ORIGIN)
+  );
+  if (changeInfo.status === "complete" && isFlowTab) {
     invalidateRecaptchaCache(tabId);  // force fresh check after reload
     setTimeout(() => detectAccounts(), 3000);
     // Re-install warmup loop after reload (window flag was wiped).
@@ -2786,7 +2847,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "openLabsTab") {
-    chrome.tabs.create({ url: `${LABS_ORIGIN}/fx/tools/flow` });
+    // Point at the new flow.google.com home; labs.google/fx/tools/flow
+    // still redirects there but going direct is faster and cleaner.
+    chrome.tabs.create({ url: FLOW_ORIGIN });
     sendResponse({ ok: true });
     return false;
   }

@@ -121,7 +121,7 @@ function updateStatus(status) {
       });
     });
   } else {
-    container.innerHTML = '<div class="no-accounts">No accounts detected.<br>Open labs.google.com and log in.</div>';
+    container.innerHTML = '<div class="no-accounts">No accounts detected.<br>Open flow.google.com and log in.</div>';
   }
 
   // Ecosystem state — toggle reflects LOCAL enabled flag, not just directive.
