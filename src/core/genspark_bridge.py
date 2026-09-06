@@ -146,12 +146,41 @@ class GensparkBridge:
     # Lifecycle
     # ═══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    @web.middleware
+    async def _cors_middleware(request, handler):
+        """CORS + Private Network Access headers for Chrome 130+ (PNA)."""
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Max-Age": "86400",
+        }
+        if request.method == "OPTIONS":
+            return web.Response(status=204, headers=cors_headers)
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            for k, v in cors_headers.items():
+                exc.headers[k] = v
+            raise
+        for k, v in cors_headers.items():
+            response.headers[k] = v
+        return response
+
     async def start(self) -> None:
         """Start the Genspark bridge HTTP server."""
         # Generated images are 2-5 MB base64-encoded. Default aiohttp limit
         # is 1 MB which silently 413s the submit_result POST. Bump to 50 MB
         # so we can comfortably handle 4K image base64 payloads.
-        self._app = web.Application(client_max_size=50 * 1024 * 1024)
+        self._app = web.Application(
+            client_max_size=50 * 1024 * 1024,
+            middlewares=[self._cors_middleware],
+        )
+        self._app.router.add_route(
+            "OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204)
+        )
         self._app.router.add_get("/genspark/poll", self._handle_poll)
         self._app.router.add_post("/genspark/work-result", self._handle_work_result)
         self._app.router.add_post("/genspark/accounts", self._handle_accounts)

@@ -79,10 +79,39 @@ class GrokBridge:
     # Lifecycle
     # ═══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    @web.middleware
+    async def _cors_middleware(request, handler):
+        """CORS + Private Network Access headers for Chrome 130+ (PNA)."""
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Max-Age": "86400",
+        }
+        if request.method == "OPTIONS":
+            return web.Response(status=204, headers=cors_headers)
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            for k, v in cors_headers.items():
+                exc.headers[k] = v
+            raise
+        for k, v in cors_headers.items():
+            response.headers[k] = v
+        return response
+
     async def start(self) -> None:
         """Start the Grok bridge HTTP server."""
         # Videos can be 5-30 MB base64-encoded. Be generous on client size.
-        self._app = web.Application(client_max_size=200 * 1024 * 1024)
+        self._app = web.Application(
+            client_max_size=200 * 1024 * 1024,
+            middlewares=[self._cors_middleware],
+        )
+        self._app.router.add_route(
+            "OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204)
+        )
         self._app.router.add_get("/grok/poll", self._handle_poll)
         self._app.router.add_post("/grok/work-result", self._handle_work_result)
         self._app.router.add_post("/grok/progress", self._handle_progress)

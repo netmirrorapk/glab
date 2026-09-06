@@ -153,9 +153,52 @@ class ExtensionBridge:
     # Lifecycle
     # ═══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    @web.middleware
+    async def _cors_middleware(request, handler):
+        """Attach CORS + Private Network Access headers to every response, and
+        answer OPTIONS preflights directly.
+
+        Chrome 130+ enforces Private Network Access: an extension calling
+        localhost from a public-network origin (labs.google, genspark.ai,
+        grok.com) must receive:
+
+          - Access-Control-Allow-Origin:            *
+          - Access-Control-Allow-Private-Network:   true
+          - Access-Control-Allow-Methods:           GET, POST, OPTIONS
+          - Access-Control-Allow-Headers:           Content-Type, Authorization
+
+        Without these headers the browser blocks the request BEFORE the
+        Python handler ever runs, and the extension popup shows
+        "Disconnected (Failed to fetch)" — which is exactly what broke
+        the moment Chrome auto-updated past the PNA rollout.
+        """
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Max-Age": "86400",
+        }
+        if request.method == "OPTIONS":
+            # Answer the preflight without invoking the actual handler.
+            return web.Response(status=204, headers=cors_headers)
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            for k, v in cors_headers.items():
+                exc.headers[k] = v
+            raise
+        for k, v in cors_headers.items():
+            response.headers[k] = v
+        return response
+
     async def start(self):
         """Start the bridge HTTP server."""
-        self._app = web.Application()
+        self._app = web.Application(middlewares=[self._cors_middleware])
+        # Catch-all OPTIONS route so preflight to unknown paths still returns
+        # 204 rather than 405. The middleware handles the headers.
+        self._app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         self._app.router.add_get("/poll", self._handle_poll)
         self._app.router.add_post("/token", self._handle_token)
         self._app.router.add_post("/accounts", self._handle_accounts)
