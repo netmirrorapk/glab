@@ -225,6 +225,69 @@ def _resolve_image_ratio(ratio_name):
     return "IMAGE_ASPECT_RATIO_LANDSCAPE"
 
 
+def _image_aspect_ratio_int(ratio_name):
+    """Map an image aspect ratio (UI name or IMAGE_ASPECT_RATIO_* enum) to
+    the integer Flow's batchexecute RPC expects at position [1][0][4] of
+    the ogiZ0b payload.
+
+    Observed from a real Landscape 16:9 request in the HAR: value = 3.
+    The other integers are best-effort guesses aligned with Google's
+    typical protobuf enum ordering (0 = UNSPECIFIED). If any of these
+    turn out wrong on-server we'll see a 400 response with a hint we can
+    correct against — safer than silently misgenerating.
+    """
+    raw = str(ratio_name or "").strip().lower()
+    if "portrait" in raw or "9:16" in raw:
+        return 2
+    if "square" in raw or "1:1" in raw:
+        return 1
+    if "3:4" in raw:
+        return 4
+    if "4:3" in raw:
+        return 5
+    # Default = LANDSCAPE 16:9 (the confirmed-working value from the HAR)
+    return 3
+
+
+def _find_flow_content_url(obj):
+    """Depth-first search for the first 'https://flow-content.google/...'
+    URL inside a batchexecute result tree. The ogiZ0b response nests the
+    signed CDN URL several levels deep and the array shape drifts between
+    Google pushes, so a shape-agnostic scan is more resilient than
+    indexing.
+    """
+    if isinstance(obj, str):
+        return obj if obj.startswith("https://flow-content.google/") else None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_flow_content_url(v)
+            if found:
+                return found
+        return None
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            found = _find_flow_content_url(v)
+            if found:
+                return found
+    return None
+
+
+def _find_media_id_near_url(obj, url):
+    """Extract the media UUID that owns `url`. In the ogiZ0b response the
+    UUID appears as the first element of the tuple that also carries the
+    URL. Falls back to parsing the UUID out of the URL path itself, which
+    matches the pattern flow-content.google/image/<UUID>?...
+    """
+    try:
+        import re as _re
+        m = _re.search(r"/image/([0-9a-f-]{8,})", url or "")
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 def _resolve_video_model(model, video_model=""):
     """Map UI video quality name to API video model key."""
     source = str(video_model or model or "").strip().lower()
@@ -767,7 +830,12 @@ class ExtensionWorker:
 
             self._log(f"[{self.slot_id}] Image: {api_model}, {api_ratio}")
 
-            # Get token + auth from extension via bridge
+            # Get project ID + XSRF from extension via bridge. Since Google
+            # migrated Flow off the old NextAuth stack there's no
+            # access_token anymore — batchexecute authenticates on the
+            # SAPISIDHASH cookie the browser already has. The bridge still
+            # returns the SNlM0e XSRF token in the `access_token` slot for
+            # legacy field-name reasons; we accept either shape here.
             bridge_result = await self._bridge.request_token(
                 self.account_email, "IMAGE_GENERATION", timeout=60
             )
@@ -775,163 +843,115 @@ class ExtensionWorker:
             if bridge_result.get("error"):
                 return None, f"Bridge error: {bridge_result['error']}"
 
-            token = bridge_result.get("token")
-            access_token = bridge_result.get("access_token")
+            access_token = bridge_result.get("access_token")  # now = XSRF for batchexecute
             project_id = bridge_result.get("project_id") or self._bridge.get_project_id(self.account_email)
-            self.last_access_token = access_token  # cache for download
+            self.last_access_token = access_token  # cache for download-path cookie warmup
 
-            if not access_token:
-                return None, "No access token from extension"
-
-            # If no project ID, resolve with lock (so only 1 worker creates per account)
+            # If no project ID, resolve with lock (so only 1 worker creates per account).
+            # _resolve_project_id() also handles the extension's get_project
+            # command which reads the project ID straight from the open tab —
+            # that path doesn't need access_token either.
             if not project_id:
-                project_id = await self._resolve_project_id(access_token)
+                project_id = await self._resolve_project_id(access_token or "")
 
             if not project_id:
-                return None, "No project ID available — open a project in labs.google/fx/tools/flow"
+                return None, "No project ID available — open a project in flow.google.com"
 
-            # Upload reference images if file paths provided
+            # Reference uploads still use the legacy tRPC path (which needs
+            # an access_token). Skip cleanly with a clear log when Flow no
+            # longer hands one out — this preserves plain-text-prompt gen
+            # while the reference-upload migration is pending.
             media_ids = list(references or [])
             if ref_paths:
-                try:
-                    uploaded = await self._upload_references(access_token, project_id, ref_paths)
-                    media_ids.extend(uploaded)
-                except Exception as e:
-                    return None, f"Reference upload failed: {str(e)[:200]}"
+                if not access_token:
+                    self._log(
+                        f"[{self.slot_id}] ⚠ Reference images requested but "
+                        f"no access_token available (Flow migrated off "
+                        f"NextAuth). Continuing without references — the "
+                        f"prompt-only generation still works."
+                    )
+                else:
+                    try:
+                        uploaded = await self._upload_references(access_token, project_id, ref_paths)
+                        media_ids.extend(uploaded)
+                    except Exception as e:
+                        self._log(
+                            f"[{self.slot_id}] ⚠ Reference upload failed "
+                            f"({str(e)[:150]}) — continuing without them."
+                        )
 
-            # Image gen — May 2026: Google tightened reCAPTCHA score
-            # threshold on the image endpoint to match video's level.
-            # The old "aiohttp direct + cached-pool token" route now
-            # gets uniformly rejected with "Score Too Low" because:
-            #   1. Cached pool tokens are minted by the background
-            #      warmup loop with no real DOM interaction signal,
-            #      so Google scores them at the floor.
-            #   2. aiohttp can't reproduce Chrome's signed headers
-            #      (x-browser-validation, x-client-data, sec-fetch-*),
-            #      so the server-side validator treats the request
-            #      as bot-origin even if the token itself is valid.
-            # Switching to the same EXECUTE_FETCH route the video
-            # endpoint uses fixes both: extension MAIN world mints
-            # a fresh token at submit time (high score, mirrors what
-            # labs.google's own UI does on Submit click) and Chrome
-            # auto-attaches all the right headers because the fetch
-            # originates from inside the labs.google tab.
+            # NEW FLOW (Dec 2026): Google migrated Flow's image endpoint
+            # from the labs.google tRPC + Bearer stack to their internal
+            # Angular + batchexecute stack on flow.google.com. See
+            # tests/flow-3-models.har for the field shape — the request
+            # goes through RPC id "ogiZ0b" and the response embeds the
+            # signed CDN URL synchronously (no polling needed).
             #
-            # Token placeholder is required at both injection paths —
-            # the extension's setAtPath skips paths whose parent
-            # object doesn't exist, so we pre-create recaptchaContext
-            # at both root and requests[0] for the inject to land.
-            recaptcha_placeholder = {
-                "token": "",
-                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-            }
-            client_context_root = {
-                "projectId": project_id,
-                "tool": "PINHOLE",
-                "sessionId": f";{int(time.time() * 1000)}",
-                "recaptchaContext": dict(recaptcha_placeholder),
-            }
-            client_context_req = {
-                "projectId": project_id,
-                "tool": "PINHOLE",
-                "sessionId": client_context_root["sessionId"],
-                "recaptchaContext": dict(recaptcha_placeholder),
-            }
+            # The reCAPTCHA token is embedded inside the payload string
+            # at TWO positions, both wrapped as ["<TOKEN>", 1]. We use
+            # the literal placeholder "<RECAPTCHA_TOKEN>" and the
+            # extension substitutes a freshly-minted token in-place
+            # before the POST fires.
+            aspect_int = _image_aspect_ratio_int(ratio)
+            uuid1 = str(uuid.uuid4()).upper()
+            uuid2 = str(uuid.uuid4()).upper()
+            uuid3 = str(uuid.uuid4()).upper()
 
-            body = {
-                "clientContext": client_context_root,
-                "mediaGenerationContext": {"batchId": batch_id},
-                "useNewMedia": True,
-                "requests": [{
-                    "clientContext": client_context_req,
-                    "imageModelName": api_model,
-                    "imageAspectRatio": api_ratio,
-                    "structuredPrompt": {"parts": [{"text": prompt_text}]},
-                    "seed": seed,
-                    "imageInputs": (
-                        [{"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": ref_id}
-                         for ref_id in media_ids]
-                        if media_ids else []
-                    ),
-                }],
-            }
+            def _build_payload(pid: str) -> str:
+                # This is the ogiZ0b payload as observed in the HAR,
+                # rebuilt with parameterized project_id / model / aspect
+                # / prompt / seed / UUIDs. Keep the field positions
+                # identical to what Flow sends — a shifted array is
+                # rejected server-side with an opaque parse error.
+                payload = [
+                    None,
+                    [[
+                        None, None, None, seed, aspect_int, api_model, None,
+                        [None, 22, None, None, None, pid, None, None, None, None,
+                         ["<RECAPTCHA_TOKEN>", 1]],
+                        [[[prompt_text]]],
+                        None, None, None,
+                        uuid1, uuid2,
+                    ]],
+                    1,
+                    [None, 22, None, None, None, pid, None, None, None, None,
+                     ["<RECAPTCHA_TOKEN>", 1]],
+                    [uuid3],
+                ]
+                return json.dumps(payload)
 
-            # We submit through EXECUTE_FETCH and, on a 429, fall through
-            # to a single in-place retry against a fresh project. The
-            # outer queue's retry/backoff still wraps this call, but
-            # transparent project rotation avoids surfacing the user-
-            # visible "429 strike" cascade for the well-understood
-            # case of "this project's quota is just exhausted".
-            # 3 attempts so we have room for one 429-burn rotation AND one
-            # transient-bridge-error retry on top of the initial try without
-            # running out of budget. Each branch below consumes one attempt.
+            # Retry budget: initial try + one 429-burn rotation + one
+            # transient-bridge-error retry.
             attempts_left = 3
             data = None
             err_msg = None
+            payload_str = _build_payload(project_id)
+            source_path = f"/project/{project_id}"
+
             while attempts_left > 0:
                 attempts_left -= 1
 
-                # client_context_root + _req both already reference the
-                # current project_id from outer scope. On retry after a
-                # burn we update project_id below and rebuild the body
-                # once before re-issuing the POST.
-
-                url = IMAGE_API_URL.format(project_id=project_id)
-                fetch_result = await self._bridge.request_api_fetch(
+                be_result = await self._bridge.request_batchexecute(
                     account=self.account_email,
-                    url=url,
-                    method="POST",
-                    body=json.dumps(body),
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                    },
+                    rpc_id="ogiZ0b",
+                    payload_template=payload_str,
+                    source_path=source_path,
                     recaptcha_action="IMAGE_GENERATION",
-                    inject_recaptcha_path=(
-                        "clientContext.recaptchaContext.token;"
-                        "requests.0.clientContext.recaptchaContext.token"
-                    ),
-                    # 120s — restored from the bumped 180s value (d09d835).
-                    # The 180s bump was meant to absorb Chrome's background-
-                    # tab JS throttling, but on production logs it instead
-                    # masked silent-throttle behavior: every request hung
-                    # for the full 180s instead of failing fast at 120s,
-                    # stretching the time before the worker could move on
-                    # to the next job. User asked to put the original value
-                    # back so failures surface sooner and the queue keeps
-                    # moving.
                     timeout=120,
                 )
-                err = fetch_result.get("error") or ""
+
+                err = be_result.get("error") or ""
                 if err:
-                    # Classify the bridge-side failure:
-                    #   - "fetch_failed: ..."           — native fetch() in MAIN world threw
-                    #     before the request ever left the browser. Google did NOT receive
-                    #     the request — safe to retry on a different tab.
-                    #   - "execute_fetch_threw: Frame with ID 0 was removed."
-                    #                                  — the labs.google tab was discarded
-                    #     by Chrome (energy saver / memory) or crashed mid-execute. The
-                    #     extension's findLabsTab() will pick a different tab on the
-                    #     next attempt. Definitely pre-Google failure — safe to retry.
-                    #   - "no_recaptcha_enterprise"    — tab's grecaptcha global is gone
-                    #     (page navigated). Will be present again on the alt tab.
-                    #   - "no_script_result"           — chrome.scripting.executeScript
-                    #     returned an empty results array, which happens when the injected
-                    #     MAIN-world async function never resolved (frame removed mid-
-                    #     execute, page navigated before the fetch resolved). Same class
-                    #     as the above — Google never received the request.
-                    #
-                    # Anything else (timeout, account_held, no_sitekey, etc.) is treated
-                    # as "Google may have received the request" and surfaced to the outer
-                    # queue's retry/dedup logic — DON'T retry transparently because that
-                    # risks duplicate generation.
                     err_lower = err.lower()
+                    # Transient bridge failures (safe-to-retry) mirror
+                    # the EXECUTE_FETCH classification list.
                     safe_to_retry = (
                         "fetch_failed" in err_lower
-                        or "execute_fetch_threw" in err_lower
+                        or "execute_batchexecute_threw" in err_lower
                         or "frame with id" in err_lower
                         or "no_recaptcha_enterprise" in err_lower
                         or "no_script_result" in err_lower
+                        or "no_labs_tab" in err_lower
                     )
                     if safe_to_retry and attempts_left > 0:
                         self._log(
@@ -940,65 +960,66 @@ class ExtensionWorker:
                         )
                         await asyncio.sleep(2)
                         continue
+
+                    # Server-side batchexecute error line (batchexecute_er:401
+                    # etc.) means Flow rejected the RPC — treat 401 as an
+                    # auth-lost signal so the outer recovery kicks in.
+                    if "batchexecute_er:401" in err_lower:
+                        return None, "🔑 Session expired (401) — reload the flow.google.com tab."
+                    if "batchexecute_er:429" in err_lower or "batchexecute_er:8" in err_lower:
+                        # 429 or RESOURCE_EXHAUSTED. Try a project rotate.
+                        if attempts_left > 0:
+                            self._log(
+                                f"[{self.slot_id}] batchexecute 429/exhausted on "
+                                f"project {project_id} — burning and rotating."
+                            )
+                            self._bridge.burn_project(self.account_email, project_id)
+                            new_pid = await self._resolve_project_id(access_token or "")
+                            if new_pid and new_pid != project_id:
+                                project_id = new_pid
+                                payload_str = _build_payload(project_id)
+                                source_path = f"/project/{project_id}"
+                                continue
+                        return None, "⛔ Quota exhausted (batchexecute 429)"
+
                     return None, f"Bridge error: {err}"
 
-                status = fetch_result.get("status") or 0
-                resp_text = fetch_result.get("body", "")
+                # Success path — extract the signed CDN URL from the
+                # deeply-nested result tree.
+                result_body = be_result.get("result")
+                if result_body is None:
+                    err_msg = "Empty batchexecute response"
+                    break
 
-                if status == 429 and attempts_left > 0:
-                    # Two different 429 flavors need opposite recovery:
-                    #   • per-MODEL quota ("Resource exhausted / check quota")
-                    #     — rotating the project does NOT help (the same model
-                    #     429s again on a fresh project, as the logs proved).
-                    #     Surface it so the OUTER handler swaps to a live model.
-                    #   • per-PROJECT rate limit (generic 429) — burn + rotate
-                    #     to a fresh project, which DOES clear it.
-                    _429_body = str(resp_text).lower()
-                    _is_quota_429 = (
-                        "exhausted" in _429_body
-                        or "check quota" in _429_body
-                        or "resource_exhausted" in _429_body
-                        or "daily limit" in _429_body
-                    )
-                    if _is_quota_429:
-                        # Don't thrash projects on a per-model quota — bubble
-                        # up immediately for the model-swap recovery.
-                        err_msg = _parse_api_error(status, resp_text)
-                        break
-                    # Per-project rate limit. Burn this project so the rest of
-                    # the worker pool stops using it, resolve a fresh project
-                    # (skipping burned ones, or creating a new one if all are
-                    # cool-down), rebuild the body with the new projectId, retry.
+                cdn_url = _find_flow_content_url(result_body)
+                if not cdn_url:
+                    # Log the shape so we can eyeball what changed.
+                    try:
+                        shape = json.dumps(result_body, indent=2, default=str)[:1500]
+                    except Exception:
+                        shape = str(result_body)[:1500]
                     self._log(
-                        f"[{self.slot_id}] 429 on project {project_id} — "
-                        "burning and rotating to a fresh project."
+                        f"[{self.slot_id}] No flow-content URL in ogiZ0b "
+                        f"response — result shape:\n{shape}"
                     )
-                    self._bridge.burn_project(self.account_email, project_id)
-                    new_project_id = await self._resolve_project_id(access_token)
-                    if not new_project_id or new_project_id == project_id:
-                        # Couldn't rotate — surface the 429 to outer retry
-                        err_msg = _parse_api_error(status, resp_text)
-                        break
-                    project_id = new_project_id
-                    # Update both clientContext copies to point at the
-                    # fresh project. The body dict is otherwise unchanged
-                    # so the fresh reCAPTCHA token slot stays in place.
-                    client_context_root["projectId"] = project_id
-                    client_context_req["projectId"] = project_id
-                    body["requests"][0]["clientContext"] = client_context_req
-                    continue
-
-                if status < 200 or status >= 300:
-                    err_msg = _parse_api_error(status, resp_text)
+                    err_msg = "No downloadable media URL in batchexecute response"
                     break
 
-                try:
-                    data = json.loads(resp_text)
-                    err_msg = None
-                    break
-                except json.JSONDecodeError:
-                    err_msg = f"Invalid JSON response: {resp_text[:200]}"
-                    break
+                media_id = _find_media_id_near_url(result_body, cdn_url)
+
+                # Shape the result to match what the download path expects:
+                # api_data["media"][0]["image"]["imageUrl"] = <cdn_url>
+                data = {
+                    "media": [{
+                        "name": media_id,
+                        "image": {"imageUrl": cdn_url},
+                    }],
+                    # Keep the raw batchexecute result for anyone who
+                    # wants to poke at it in logs.
+                    "_batchexecute_raw": result_body,
+                }
+                err_msg = None
+                break
 
             if err_msg:
                 return None, err_msg

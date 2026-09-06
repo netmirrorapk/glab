@@ -408,6 +408,189 @@ async function handleWork(work) {
     }
   }
 
+  // ─── EXECUTE_BATCHEXECUTE: post to Flow's new batchexecute RPC endpoint
+  //     from inside the flow.google.com tab. Handles XSRF + reCAPTCHA + the
+  //     f.req form-encoding + the )]}'-prefixed chunked response parsing.
+  //
+  //     Payload template uses "<RECAPTCHA_TOKEN>" as the placeholder for
+  //     where the freshly-minted token should go inside the RPC array —
+  //     it's substituted after the token is retrieved but before the
+  //     payload is JSON-stringified into the f.req wrapper.
+  //
+  //     Returns: { status, result }  where `result` is the already-parsed
+  //     inner value of the wrb.fr line for this rpcId (or an error object).
+  if (action === "EXECUTE_BATCHEXECUTE") {
+    let selectedTabId2 = null;
+    try {
+      const tabId = await findLabsTab(account);
+      if (!tabId) {
+        await submitResult(request_id, { error: "no_labs_tab" });
+        return;
+      }
+      selectedTabId2 = tabId;
+      _incTabInFlight(tabId);
+
+      const rpcId = work.rpc_id;
+      const payloadTemplate = work.payload_template || "";
+      const sourcePath = work.source_path || "/";
+      const captchaAction = work.recaptcha_action || null;
+
+      const result = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        args: [rpcId, payloadTemplate, sourcePath, captchaAction],
+        func: async (rpcId, payloadTemplate, sourcePath, captchaAction) => {
+          // 1. Mint reCAPTCHA token if requested (image-gen etc.).
+          let recaptchaToken = "";
+          if (captchaAction) {
+            try {
+              const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
+              if (!enterprise || typeof enterprise.execute !== "function") {
+                return { error: "no_recaptcha_enterprise" };
+              }
+              let siteKey = null;
+              try {
+                const clients = window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients;
+                if (clients) {
+                  for (const id of Object.keys(clients)) {
+                    const c = clients[id];
+                    if (!c || typeof c !== "object") continue;
+                    const walk = (obj, depth) => {
+                      if (depth > 5 || !obj || typeof obj !== "object") return null;
+                      for (const k of Object.keys(obj)) {
+                        const v = obj[k];
+                        if (typeof v === "string" && v.length >= 20 && v.length <= 50
+                          && /^[A-Za-z0-9_-]+$/.test(v)) {
+                          if (document.querySelector('script[src*="render=' + v + '"]')) return v;
+                        }
+                        if (typeof v === "object" && v !== null) {
+                          const r = walk(v, depth + 1);
+                          if (r) return r;
+                        }
+                      }
+                      return null;
+                    };
+                    siteKey = walk(c, 0);
+                    if (siteKey) break;
+                  }
+                }
+              } catch {}
+              if (!siteKey) {
+                for (const s of document.querySelectorAll('script[src*="recaptcha"][src*="render="]')) {
+                  try {
+                    const r = new URL(s.src).searchParams.get("render");
+                    if (r && r !== "explicit") { siteKey = r; break; }
+                  } catch {}
+                }
+              }
+              if (!siteKey) return { error: "no_sitekey" };
+              if (typeof enterprise.ready === "function") {
+                await new Promise((r) => enterprise.ready(r));
+              }
+              recaptchaToken = await enterprise.execute(siteKey, { action: captchaAction });
+              if (!recaptchaToken) return { error: "recaptcha_returned_null" };
+            } catch (e) {
+              return { error: "recaptcha_failed: " + (e?.message || e) };
+            }
+          }
+
+          // 2. XSRF token from the Angular SPA's globals.
+          const wiz = window.WIZ_global_data || {};
+          const at = wiz.SNlM0e || "";
+          if (!at) {
+            return { error: "no_xsrf_token" };
+          }
+          // Build label — Google embeds it in the SPA config; falling back
+          // to a plausible default only helps until the daily push rotates.
+          const bl = wiz.cfb2h || wiz.qwAQke || "boq_labs-ai-sandbox-frontend_20260903.13_p1";
+
+          // 3. Substitute the reCAPTCHA placeholder in the payload template.
+          const payloadStr = payloadTemplate.replace(/<RECAPTCHA_TOKEN>/g, recaptchaToken);
+
+          // 4. Wrap into f.req and POST.
+          const fReq = JSON.stringify([[[rpcId, payloadStr, null, "generic"]]]);
+          const reqId = Math.floor(Math.random() * 9000000) + 1000000;
+          const url = "/_/AiSandboxAngularFrontend/data/batchexecute" +
+            "?rpcids=" + encodeURIComponent(rpcId) +
+            "&source-path=" + encodeURIComponent(sourcePath) +
+            "&bl=" + encodeURIComponent(bl) +
+            "&hl=en&_reqid=" + reqId + "&rt=c";
+          const body = "f.req=" + encodeURIComponent(fReq) +
+                       "&at=" + encodeURIComponent(at) + "&";
+
+          let resp;
+          try {
+            resp = await fetch(url, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+              },
+              body: body,
+            });
+          } catch (e) {
+            return { error: "fetch_failed: " + (e?.message || e) };
+          }
+          const text = await resp.text();
+
+          // 5. Parse Google's chunked-JSON response format:
+          //    )]}'\n\n<size>\n<json>\n<size>\n<json>\n...
+          //    Each JSON line is `[["wrb.fr","<rpcId>","<result_json_string>",null,null,null,"generic"], ...]`.
+          //    The `result_json_string` needs a SECOND JSON.parse.
+          const stripped = text.replace(/^\)\]\}'\s*\n/, "");
+          const lines = stripped.split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("[")) continue;
+            let parsed;
+            try { parsed = JSON.parse(trimmed); } catch { continue; }
+            if (!Array.isArray(parsed)) continue;
+            for (const item of parsed) {
+              if (!Array.isArray(item)) continue;
+              if (item[0] === "wrb.fr" && item[1] === rpcId) {
+                let inner = null;
+                if (typeof item[2] === "string" && item[2].length) {
+                  try { inner = JSON.parse(item[2]); } catch { inner = item[2]; }
+                }
+                return { status: resp.status, result: inner, ok: true };
+              }
+              // Server-side error entry: ["er", ...] with an HTTP-like status
+              // at index 5 (401 = expired session, 429 = rate limit, etc.).
+              if (item[0] === "er") {
+                const errStatus = item[5] || 0;
+                return {
+                  status: errStatus || resp.status,
+                  error: "batchexecute_er:" + errStatus,
+                  raw: text.slice(0, 500),
+                  ok: false,
+                };
+              }
+            }
+          }
+          return {
+            status: resp.status,
+            error: "no_wrb_fr_for_rpc:" + rpcId,
+            raw: text.slice(0, 500),
+            ok: false,
+          };
+        },
+      });
+
+      const r = result?.[0]?.result;
+      if (!r) {
+        await submitResult(request_id, { error: "no_script_result" });
+        return;
+      }
+      await submitResult(request_id, r);
+      return;
+    } catch (e) {
+      await submitResult(request_id, { error: "execute_batchexecute_threw: " + (e?.message || e) });
+      return;
+    } finally {
+      _decTabInFlight(selectedTabId2);
+    }
+  }
+
   // ─── GET_COOKIES: return all cookies for labs.google (including .google.com parent) ───
   if (action === "GET_COOKIES") {
     try {

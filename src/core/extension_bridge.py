@@ -412,6 +412,81 @@ class ExtensionBridge:
                 self._dispatched_to.pop(request_id, None)
                 return {"error": "timeout"}
 
+    async def request_batchexecute(
+        self,
+        account: str,
+        rpc_id: str,
+        payload_template: str,
+        source_path: str = "/",
+        recaptcha_action: Optional[str] = None,
+        timeout: float = 180.0,
+    ) -> Dict[str, Any]:
+        """Have the extension POST a batchexecute RPC from inside the
+        flow.google.com tab.
+
+        Flow's new (Angular) backend replaced the labs.google tRPC endpoints
+        with Google's internal batchexecute pattern (same one Gmail, Drive,
+        etc. use). Auth is SAPISIDHASH-cookie-based — there's no more
+        access_token to Bearer-attach — and every write is XSRF-guarded by
+        the `SNlM0e` token embedded in the SPA's WIZ_global_data. Only code
+        running INSIDE a Flow tab can satisfy both, which is why this hop
+        through the extension is mandatory.
+
+        `payload_template` is a JSON string that will be embedded verbatim
+        as the second element of `f.req=[[[<rpc_id>, <payload>, null,
+        "generic"]]]`. If a reCAPTCHA action is provided, occurrences of
+        the literal substring `<RECAPTCHA_TOKEN>` inside the payload are
+        replaced with a freshly-minted token before the POST fires.
+
+        Returns: {status: int, result: <parsed JSON of the RPC's response>,
+                  ok: bool, error?: str}
+        """
+        if self.is_account_held(account):
+            info = self.get_hold_info(account)
+            return {
+                "error": f"account_held:{info['seconds_remaining']}s_remaining",
+                "held": True,
+            }
+
+        if recaptcha_action:
+            self._action_last_used[(account, str(recaptcha_action))] = time.time()
+
+        # Reuse the per-account EXECUTE_FETCH semaphore — a batchexecute
+        # POST occupies the same tab scripting channel, so the concurrency
+        # cap has to be shared.
+        semaphore = self._fetch_semaphores.get(account)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self.FETCH_CONCURRENCY_PER_ACCOUNT)
+            self._fetch_semaphores[account] = semaphore
+
+        async with semaphore:
+            self._request_counter += 1
+            request_id = f"be_{self._request_counter}_{int(time.time())}"
+
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+
+            self._pending_requests[request_id] = {
+                "account": account,
+                "action": "EXECUTE_BATCHEXECUTE",
+                "rpc_id": rpc_id,
+                "payload_template": payload_template,
+                "source_path": source_path,
+                "recaptcha_action": recaptcha_action,
+                "future": future,
+                "created": time.time(),
+                "_failed_ext_keys": set(),
+                "_reroute_count": 0,
+            }
+
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+                return result
+            except asyncio.TimeoutError:
+                self._pending_requests.pop(request_id, None)
+                self._dispatched_to.pop(request_id, None)
+                return {"error": "timeout"}
+
     def send_command(self, command_type: str, account: str = "", data: Any = None):
         """Queue a command for the extension (cookie clear, reload, etc.)."""
         self._pending_commands.append({
@@ -577,6 +652,13 @@ class ExtensionBridge:
                         work["fetch_headers"] = req.get("fetch_headers", {})
                         work["recaptcha_action"] = req.get("recaptcha_action")
                         work["inject_recaptcha_path"] = req.get("inject_recaptcha_path")
+                    elif req["action"] == "EXECUTE_BATCHEXECUTE":
+                        # Flow's new batchexecute RPC — extension composes
+                        # the actual POST inside the flow.google.com tab.
+                        work["rpc_id"] = req.get("rpc_id", "")
+                        work["payload_template"] = req.get("payload_template", "")
+                        work["source_path"] = req.get("source_path", "/")
+                        work["recaptcha_action"] = req.get("recaptcha_action")
                     response_data["work"] = work
                     # Track that this request is now dispatched to this extension
                     self._dispatched_to[req_id] = ext_key
@@ -711,6 +793,11 @@ class ExtensionBridge:
                             "status": None, "body": "", "headers": {},
                             "error": f"all_extensions_failed: {error}",
                         })
+                    elif req.get("action") == "EXECUTE_BATCHEXECUTE":
+                        req["future"].set_result({
+                            "status": None, "result": None, "ok": False,
+                            "error": f"all_extensions_failed: {error}",
+                        })
                     else:
                         req["future"].set_result({
                             "token": None, "access_token": None,
@@ -753,6 +840,16 @@ class ExtensionBridge:
                     "body": data.get("body", ""),
                     "headers": data.get("headers", {}),
                     "error": data.get("error"),
+                }
+            elif action == "EXECUTE_BATCHEXECUTE":
+                # Extension parsed the batchexecute chunked response and
+                # returned the wrb.fr row's inner parsed value as `result`.
+                result = {
+                    "status": data.get("status"),
+                    "result": data.get("result"),
+                    "ok": data.get("ok", False),
+                    "error": data.get("error"),
+                    "raw": data.get("raw"),
                 }
             else:
                 result = {
