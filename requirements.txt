@@ -8,3 +8,13 @@ requests>=2.31.0
 aiohttp>=3.9.0
 aiofiles>=23.2.0
 pyinstaller>=6.0
+# Watermark removal (Flow / Nano Banana sparkle) — cross-platform inpainting
+# via OpenCV. Ships wheels for Windows / macOS / Linux and needs no ffmpeg on
+# PATH, so it works out of the box on both platforms.
+opencv-python-headless>=4.9.0
+numpy>=1.24
+Pillow>=10.0
+# imageio-ffmpeg bundles a portable ffmpeg binary as a last-resort fallback
+# when OpenCV isn't available and no system ffmpeg is installed. Small
+# (~30 MB), no GUI, works on Win/mac/Linux.
+imageio-ffmpeg>=0.5.0

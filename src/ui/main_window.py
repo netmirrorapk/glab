@@ -5388,8 +5388,10 @@ class MainWindow(QMainWindow):
         self.chk_flow_remove_wm = QCheckBox("Remove AI watermark from images (Nano Banana / Flow)")
         self.chk_flow_remove_wm.setToolTip(
             "Auto-remove Google's bottom-right 'sparkle' watermark from every generated\n"
-            "image right after it downloads (ffmpeg delogo, in-place). Needs ffmpeg on PATH.\n"
-            "Note: only the VISIBLE mark is removed — Google's invisible SynthID stays."
+            "image right after it downloads. Uses OpenCV inpainting first (built-in,\n"
+            "no external tools needed on Windows or macOS), falls back to ffmpeg delogo\n"
+            "if OpenCV isn't available. Note: only the VISIBLE mark is removed —\n"
+            "Google's invisible SynthID stays."
         )
         self.chk_flow_remove_wm.setChecked(
             str(get_setting("flow_remove_watermark", "1") or "1").strip().lower() in ("1", "true", "on", "yes"))

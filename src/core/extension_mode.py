@@ -3562,6 +3562,35 @@ class ExtensionModeManager:
         with open(output_path, "wb") as f:
             f.write(data)
 
+        # Post-process: strip Google Flow's visible sparkle watermark
+        # from images when the toggle is on. Uses OpenCV inpainting
+        # first (cross-platform, no ffmpeg needed on macOS/Windows),
+        # then falls back to ffmpeg delogo. Video files (.mp4/.webm)
+        # are left alone — the sparkle isn't burned into video frames
+        # the same way and would need a stream filter path.
+        if ext in (".png", ".jpg", ".jpeg", ".webp"):
+            try:
+                from src.db.db_manager import get_setting
+                wm_enabled = str(
+                    get_setting("flow_remove_watermark", "1") or "1"
+                ).strip().lower() in ("1", "true", "on", "yes")
+            except Exception:
+                wm_enabled = True  # Default ON — matches UI toggle default.
+            if wm_enabled:
+                try:
+                    from src.core.watermark_remover import remove_flow_watermark
+                    # Do the inpaint on a worker thread — OpenCV holds the
+                    # GIL during the C++ call and inpaint takes 50–200 ms
+                    # on Flow-sized images, which would visibly stall the
+                    # async event loop otherwise.
+                    ok = await asyncio.to_thread(remove_flow_watermark, output_path)
+                    if not ok:
+                        # Silent no-op — image stays as-is. Not fatal; the
+                        # watermark is a nice-to-remove, not blocking.
+                        pass
+                except Exception:
+                    pass
+
         try:
             update_job_runtime_state(job_id, output_path=output_path)
         except Exception:
