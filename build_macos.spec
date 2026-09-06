@@ -12,9 +12,32 @@ stealth_datas, stealth_binaries, stealth_hiddenimports = collect_all("playwright
 fakeua_datas, fakeua_binaries, fakeua_hiddenimports = collect_all("fake_useragent")
 cloak_datas, cloak_binaries, cloak_hiddenimports = collect_all("cloakbrowser")
 
+# Watermark removal (OpenCV inpainting + fallback ffmpeg). collect_all
+# pulls native .so/.dylib codecs + numpy's compiled kernels + Pillow's
+# codecs so cv2.imread/imwrite work in the frozen app. imageio_ffmpeg
+# bundles a portable ffmpeg binary as the last-resort fallback when
+# neither OpenCV nor system ffmpeg is present — matters on stock macOS.
+try:
+    cv2_datas, cv2_binaries, cv2_hiddenimports = collect_all("cv2")
+except Exception:
+    cv2_datas, cv2_binaries, cv2_hiddenimports = ([], [], [])
+try:
+    np_datas, np_binaries, np_hiddenimports = collect_all("numpy")
+except Exception:
+    np_datas, np_binaries, np_hiddenimports = ([], [], [])
+try:
+    pil_datas, pil_binaries, pil_hiddenimports = collect_all("PIL")
+except Exception:
+    pil_datas, pil_binaries, pil_hiddenimports = ([], [], [])
+try:
+    imio_datas, imio_binaries, imio_hiddenimports = collect_all("imageio_ffmpeg")
+except Exception:
+    imio_datas, imio_binaries, imio_hiddenimports = ([], [], [])
+
 datas = [
     (str(project_dir / "assets"), "assets"),
-] + pw_datas + pyside_datas + stealth_datas + fakeua_datas + cloak_datas
+] + pw_datas + pyside_datas + stealth_datas + fakeua_datas + cloak_datas \
+  + cv2_datas + np_datas + pil_datas + imio_datas
 
 browsers_archive = project_dir / "playwright-browsers.tar.gz"
 if browsers_archive.exists():
@@ -43,12 +66,22 @@ hiddenimports = [
     "src.core.runtime_stdio",
     "src.db.db_manager",
     "src.ui.main_window",
-] + pw_hiddenimports + pyside_hiddenimports + stealth_hiddenimports + fakeua_hiddenimports + cloak_hiddenimports
+    # Watermark removal — lazy-imported inside a function body, so
+    # PyInstaller's static-import scan won't find it on its own.
+    "src.core.watermark_remover",
+    "cv2",
+    "numpy",
+    "PIL",
+    "PIL.Image",
+    "imageio_ffmpeg",
+] + pw_hiddenimports + pyside_hiddenimports + stealth_hiddenimports + fakeua_hiddenimports + cloak_hiddenimports \
+  + cv2_hiddenimports + np_hiddenimports + pil_hiddenimports + imio_hiddenimports
 
 a = Analysis(
     ["main.py"],
     pathex=[str(project_dir)],
-    binaries=pw_binaries + pyside_binaries + stealth_binaries + fakeua_binaries + cloak_binaries,
+    binaries=pw_binaries + pyside_binaries + stealth_binaries + fakeua_binaries + cloak_binaries
+             + cv2_binaries + np_binaries + pil_binaries + imio_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
