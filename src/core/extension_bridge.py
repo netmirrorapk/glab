@@ -97,10 +97,15 @@ class ExtensionBridge:
         # expiries) while zero video jobs ran. That waste is exactly the
         # "isolated execute() spam" signature reCAPTCHA Enterprise flags.
         #
-        # Target=2 keeps a small just-in-time pool so first-request latency
-        # stays low for either action, while letting unused-action pools
-        # decay to zero between bursts.
-        self.TOKEN_POOL_TARGET = 2
+        # Target=0 DISABLES proactive token pre-fetching entirely (2026-09-24).
+        # Live capture proved that Flow's own UI mints ONE reCAPTCHA token per
+        # generation, at the moment the generate button is clicked, and passes.
+        # Our proactive pool pre-minted tokens with no user interaction — an
+        # "isolated execute() spam" pattern reCAPTCHA Enterprise scores as a bot
+        # → PUBLIC_ERROR_UNUSUAL_ACTIVITY. With target=0 the pool stays empty and
+        # request_token() always mints ON DEMAND at submit time, exactly like the
+        # UI. (Set back to 1–2 only if you re-add human-like pacing.)
+        self.TOKEN_POOL_TARGET = 0
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
         # Which actions are ELIGIBLE for pre-fetch — actual refill also
         # gated on per-(account, action) recency via _action_last_used.
@@ -487,6 +492,71 @@ class ExtensionBridge:
                 self._dispatched_to.pop(request_id, None)
                 return {"error": "timeout"}
 
+    async def request_flow_ui(
+        self,
+        account: str,
+        prompt: str,
+        model: str = "",
+        aspect: str = "",
+        source_path: str = "/",
+        timeout: float = 260.0,
+    ) -> Dict[str, Any]:
+        """Have the extension generate one image by DRIVING Flow's real UI.
+
+        Instead of POSTing the ogiZ0b RPC ourselves (which mints our own
+        reCAPTCHA token and gets flagged PUBLIC_ERROR_UNUSUAL_ACTIVITY), the
+        extension types the prompt into Flow's composer, sets the model/aspect
+        in the settings popover, and clicks the actual "Start generation"
+        button with a TRUSTED chrome.debugger click. Flow's own code then mints
+        the token off that genuine gesture, so it passes exactly like a manual
+        generation. The extension observes Flow's ogiZ0b response and returns
+        the media id + signed CDN url.
+
+        `model` / `aspect` are the UI LABELS ("Nano Banana 2", "16:9"), not the
+        API enums. Returns: {ok, status, cdn_url, media_id, error?}.
+        """
+        if self.is_account_held(account):
+            info = self.get_hold_info(account)
+            return {
+                "error": f"account_held:{info['seconds_remaining']}s_remaining",
+                "held": True,
+            }
+
+        # Share the per-account tab-scripting semaphore with the fetch path —
+        # each UI-drive occupies the tab's scripting channel just the same.
+        semaphore = self._fetch_semaphores.get(account)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self.FETCH_CONCURRENCY_PER_ACCOUNT)
+            self._fetch_semaphores[account] = semaphore
+
+        async with semaphore:
+            self._request_counter += 1
+            request_id = f"ui_{self._request_counter}_{int(time.time())}"
+
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+
+            self._pending_requests[request_id] = {
+                "account": account,
+                "action": "EXECUTE_FLOW_UI",
+                "prompt": prompt,
+                "model": model,
+                "aspect": aspect,
+                "source_path": source_path,
+                "future": future,
+                "created": time.time(),
+                "_failed_ext_keys": set(),
+                "_reroute_count": 0,
+            }
+
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+                return result
+            except asyncio.TimeoutError:
+                self._pending_requests.pop(request_id, None)
+                self._dispatched_to.pop(request_id, None)
+                return {"error": "timeout", "ok": False}
+
     def send_command(self, command_type: str, account: str = "", data: Any = None):
         """Queue a command for the extension (cookie clear, reload, etc.)."""
         self._pending_commands.append({
@@ -522,6 +592,19 @@ class ExtensionBridge:
     def set_project_id(self, account: str, project_id: str):
         """Cache a project ID for an account."""
         self._project_ids[account] = project_id
+
+    def hold_account(self, account: str, seconds: int = 3600):
+        """Pause ALL activity for an account for `seconds`. Used when Google
+        flags the account (PUBLIC_ERROR_UNUSUAL_ACTIVITY) so we stop hammering
+        Flow — continuing only makes the abuse flag worse. While held,
+        request_batchexecute returns an account_held error immediately."""
+        if not account:
+            return
+        self._ecosystem_held_accounts[account] = time.time() + max(60, int(seconds))
+        self._log(
+            f"[Bridge] HELD {account} for {max(60, int(seconds)) // 60} min "
+            f"— Google flagged unusual activity; pausing to let the flag cool off."
+        )
 
     def burn_project(self, account: str, project_id: str):
         """Mark a project as rate-limit-exhausted for PROJECT_BURN_COOLDOWN_S.
@@ -659,6 +742,13 @@ class ExtensionBridge:
                         work["payload_template"] = req.get("payload_template", "")
                         work["source_path"] = req.get("source_path", "/")
                         work["recaptcha_action"] = req.get("recaptcha_action")
+                    elif req["action"] == "EXECUTE_FLOW_UI":
+                        # UI-drive: extension types the prompt + clicks Flow's
+                        # real Generate button (trusted) inside the tab.
+                        work["prompt"] = req.get("prompt", "")
+                        work["model"] = req.get("model", "")
+                        work["aspect"] = req.get("aspect", "")
+                        work["source_path"] = req.get("source_path", "/")
                     response_data["work"] = work
                     # Track that this request is now dispatched to this extension
                     self._dispatched_to[req_id] = ext_key
@@ -798,6 +888,11 @@ class ExtensionBridge:
                             "status": None, "result": None, "ok": False,
                             "error": f"all_extensions_failed: {error}",
                         })
+                    elif req.get("action") == "EXECUTE_FLOW_UI":
+                        req["future"].set_result({
+                            "status": None, "cdn_url": None, "media_id": None,
+                            "ok": False, "error": f"all_extensions_failed: {error}",
+                        })
                     else:
                         req["future"].set_result({
                             "token": None, "access_token": None,
@@ -850,6 +945,16 @@ class ExtensionBridge:
                     "ok": data.get("ok", False),
                     "error": data.get("error"),
                     "raw": data.get("raw"),
+                }
+            elif action == "EXECUTE_FLOW_UI":
+                # Extension drove Flow's UI and observed the ogiZ0b result —
+                # returns the media id + signed CDN url (or an error string).
+                result = {
+                    "status": data.get("status"),
+                    "cdn_url": data.get("cdn_url"),
+                    "media_id": data.get("media_id"),
+                    "ok": data.get("ok", False),
+                    "error": data.get("error"),
                 }
             else:
                 result = {

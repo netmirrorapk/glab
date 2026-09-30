@@ -225,6 +225,62 @@ def _resolve_image_ratio(ratio_name):
     return "IMAGE_ASPECT_RATIO_LANDSCAPE"
 
 
+def _resolve_image_model_ui(model_name):
+    """Map a model (UI name OR resolved API enum) to the exact label Flow's
+    model dropdown shows, for the UI-drive path. Verified live against Flow's
+    'Select model family' menu: 'Nano Banana Pro', 'Nano Banana 2',
+    'Nano Banana 2 Lite'. Empty string = leave Flow's current selection."""
+    raw = str(model_name or "").strip()
+    lower = raw.lower()
+    # API enums (from _resolve_image_model)
+    if raw in ("GEM_PIX_2",) or "nano banana pro" in lower:
+        return "Nano Banana Pro"
+    if raw in ("HARBOR_SEAL",) or ("lite" in lower and "nano banana" in lower):
+        return "Nano Banana 2 Lite"
+    if raw in ("NARWHAL",) or "nano banana" in lower:
+        return "Nano Banana 2"
+    # Imagen and anything unknown → default to the standard model.
+    if "imagen" in lower:
+        return "Nano Banana 2"
+    return "Nano Banana 2"
+
+
+def _resolve_image_ratio_ui(ratio_name):
+    """Map a ratio (UI name or IMAGE_ASPECT_RATIO_* enum) to the aspect label
+    Flow's settings popover shows: 16:9, 4:3, 1:1, 3:4, 9:16."""
+    raw = str(ratio_name or "").strip()
+    lower = raw.lower()
+    if "four_three" in lower or "4:3" in lower:
+        return "4:3"
+    if "three_four" in lower or "3:4" in lower:
+        return "3:4"
+    if "portrait" in lower or "9:16" in lower:
+        return "9:16"
+    if "square" in lower or "1:1" in lower:
+        return "1:1"
+    return "16:9"
+
+
+def _parse_prompt_segments(raw):
+    """Parse a job's stored prompt_segments (JSON list of {type:text|ref}) into
+    a Python list, or None. Used to build Flow's positional inline reference
+    markers in the ogiZ0b prompt slot."""
+    if not raw:
+        return None
+    if isinstance(raw, list):
+        return raw or None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            val = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return val if (isinstance(val, list) and val) else None
+    return None
+
+
 def _image_aspect_ratio_int(ratio_name):
     """Map an image aspect ratio (UI name or IMAGE_ASPECT_RATIO_* enum) to
     the integer Flow's batchexecute RPC expects at position [1][0][4] of
@@ -285,6 +341,34 @@ def _find_media_id_near_url(obj, url):
             return m.group(1)
     except Exception:
         pass
+    return ""
+
+
+def _find_first_uuid(obj):
+    """Depth-first search for the first UUID-shaped string in a batchexecute
+    result tree. Flow's `maseQ` (image upload) RPC returns the freshly-created
+    media's id as a bare UUID nested a few levels into the response; the exact
+    position drifts between pushes, so a shape-agnostic scan is more resilient
+    than indexing. Returns the UUID string or "".
+    """
+    import re as _re
+    _UUID_RE = _re.compile(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    )
+    if isinstance(obj, str):
+        return obj if _UUID_RE.match(obj) else ""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_first_uuid(v)
+            if found:
+                return found
+        return ""
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            found = _find_first_uuid(v)
+            if found:
+                return found
     return ""
 
 
@@ -521,9 +605,36 @@ class ExtensionWorker:
         self.is_busy = False
         self.last_access_token = None  # cached for download auth
         self.jobs_completed = 0
+        # Generate images by driving Flow's real UI (trusted Generate click)
+        # instead of the direct batchexecute POST, which reCAPTCHA flags as
+        # PUBLIC_ERROR_UNUSUAL_ACTIVITY. The UI path is what manual generation
+        # uses, so it passes. (References are text-only in this mode.)
+        self.use_ui_drive = True
 
-    async def _upload_reference_image(self, access_token, project_id, file_path):
-        """Upload a single reference image via aiohttp, return media name."""
+    async def _upload_reference_image(self, project_id, file_path):
+        """Upload a single reference image and return its media id (UUID).
+
+        New Flow (flow.google.com) uploads through the `maseQ` batchexecute
+        RPC — the old aisandbox-pa `flow/uploadImage` + Bearer path is dead
+        (there's no access_token after the NextAuth→Angular migration). The
+        payload shape was captured live from Flow's own upload request:
+
+            [ [None,22,None,None,None, <projectId>, None,None,None,None,
+               ["<RECAPTCHA_TOKEN>", 1]],   # clientContext
+              "<base64 image bytes>",        # [1]
+              "<mimeType>",                  # [2]
+              1,                             # [3]
+              None,None,None,None,           # [4..7]
+              "<fileName>",                  # [8]
+              None,                          # [9]
+              "<uuid1>", "<uuid2>" ]         # [10..11]
+
+        The extension mints a fresh reCAPTCHA token in the flow.google.com
+        tab's MAIN world (cookie/SAPISIDHASH auth), substitutes it for the
+        "<RECAPTCHA_TOKEN>" placeholder, and POSTs from inside the page so
+        Chrome's signed browser headers are attached. Returns the new media
+        UUID which the caller drops into the ogiZ0b reference slot.
+        """
         if not file_path or not os.path.exists(file_path):
             raise RuntimeError(f"Reference file not found: {file_path}")
 
@@ -532,55 +643,46 @@ class ExtensionWorker:
 
         file_name = os.path.basename(file_path)
         mime_type, _ = mimetypes.guess_type(file_path)
-        mime_type = mime_type or "image/jpeg"
+        mime_type = mime_type or "image/png"
 
-        body = {
-            "clientContext": {
-                "projectId": project_id,
-                "tool": "PINHOLE",
-                "sessionId": f";{int(time.time() * 1000)}",
-            },
-            "fileName": file_name,
-            "mimeType": mime_type,
-            "imageBytes": image_bytes_b64,
-            "isHidden": False,
-            "isUserUploaded": True,
-        }
+        payload = [
+            [None, 22, None, None, None, project_id, None, None, None, None,
+             ["<RECAPTCHA_TOKEN>", 1]],
+            image_bytes_b64,
+            mime_type,
+            1,
+            None, None, None, None,
+            file_name,
+            None,
+            str(uuid.uuid4()).upper(),
+            str(uuid.uuid4()).upper(),
+        ]
+        payload_template = json.dumps(payload)
 
-        async with _make_aiohttp_session() as session:
-            async with session.post(
-                UPLOAD_IMAGE_URL,
-                headers={
-                    "content-type": "text/plain;charset=UTF-8",
-                    "authorization": f"Bearer {access_token}",
-                    "origin": "https://labs.google",
-                    "referer": "https://labs.google/",
-                },
-                data=json.dumps(body),
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                resp_text = await resp.text()
-                if not resp.ok:
-                    raise RuntimeError(f"Upload failed: {_parse_api_error(resp.status, resp_text)}")
+        be_result = await self._bridge.request_batchexecute(
+            account=self.account_email,
+            rpc_id="maseQ",
+            payload_template=payload_template,
+            source_path=f"/project/{project_id}",
+            recaptcha_action="IMAGE_GENERATION",
+            timeout=120,
+        )
 
-                try:
-                    data = json.loads(resp_text)
-                except json.JSONDecodeError:
-                    raise RuntimeError(f"Upload response not JSON: {resp_text[:200]}")
+        err = be_result.get("error")
+        if err:
+            raise RuntimeError(f"Upload failed (maseQ): {err}")
 
-                media_name = (
-                    data.get("name")
-                    or data.get("mediaName")
-                    or (data.get("media", {}).get("name") if isinstance(data.get("media"), dict) else "")
-                    or (data["media"][0].get("name", "") if isinstance(data.get("media"), list) and data["media"] else "")
-                )
-                if not media_name:
-                    raise RuntimeError(f"Upload response missing media name: {resp_text[:200]}")
+        media_id = _find_first_uuid(be_result.get("result"))
+        if not media_id:
+            raise RuntimeError(
+                f"Upload response missing media id: "
+                f"{str(be_result.get('result'))[:200]}"
+            )
 
-                self._log(f"[{self.slot_id}] Uploaded reference: {file_name} -> {media_name}")
-                return media_name
+        self._log(f"[{self.slot_id}] Uploaded reference: {file_name} -> {media_id}")
+        return media_id
 
-    async def _upload_and_cache_reference(self, access_token, project_id, file_path):
+    async def _upload_and_cache_reference(self, project_id, file_path):
         """Upload reference image with 2-level cache (memory + DB) to avoid duplicate uploads.
 
         Memory cache is fast but lost on restart.
@@ -613,20 +715,20 @@ class ExtensionWorker:
             if cached:
                 return cached
 
-            media_name = await self._upload_reference_image(access_token, project_id, file_path)
+            media_name = await self._upload_reference_image(project_id, file_path)
             # Store in both caches
             ExtensionWorker._reference_cache[cache_key] = media_name
             set_cached_media_id(project_id, abs_path, media_name)
             return media_name
 
-    async def _upload_references(self, access_token, project_id, ref_paths):
+    async def _upload_references(self, project_id, ref_paths):
         """Upload multiple reference images, return list of media IDs."""
         media_ids = []
         for path in ref_paths:
             path = str(path).strip()
             if not path:
                 continue
-            media_name = await self._upload_and_cache_reference(access_token, project_id, path)
+            media_name = await self._upload_and_cache_reference(project_id, path)
             media_ids.append(media_name)
         return media_ids
 
@@ -818,8 +920,136 @@ class ExtensionWorker:
         except Exception as e:
             return None, f"Upscale error: {str(e)[:200]}"
 
-    async def generate_image(self, prompt, model, ratio, references=None, ref_paths=None):
-        """Generate image via direct API call (token from extension)."""
+    async def _generate_image_ui(self, prompt, model, ratio):
+        """Generate one image by driving Flow's real UI via the extension.
+
+        The extension types the prompt into Flow's composer, sets model/aspect
+        in the settings popover, and clicks the actual "Start generation"
+        button with a TRUSTED chrome.debugger click. Flow mints the reCAPTCHA
+        token off that gesture, so it passes exactly like a manual generation
+        (no PUBLIC_ERROR_UNUSUAL_ACTIVITY). Returns (data, None) on success or
+        (None, error_message) — same contract as generate_image.
+        """
+        self.is_busy = True
+        try:
+            model_ui = _resolve_image_model_ui(model)
+            aspect_ui = _resolve_image_ratio_ui(ratio)
+            self._log(f"[{self.slot_id}] Image (UI-drive): {model_ui}, {aspect_ui}")
+
+            # A project must be open in the tab for the composer to exist. Use a
+            # cached project id if we have one; the extension also opens/creates
+            # a project itself when the composer is missing.
+            project_id = self._bridge.get_project_id(self.account_email)
+            if not project_id:
+                try:
+                    project_id = await self._resolve_project_id("")
+                except Exception:
+                    project_id = None
+            source_path = f"/project/{project_id}" if project_id else "/"
+
+            res = await self._bridge.request_flow_ui(
+                account=self.account_email,
+                prompt=prompt,
+                model=model_ui,
+                aspect=aspect_ui,
+                source_path=source_path,
+                timeout=260,
+            )
+
+            # Diagnostic: when the extension returns neither a URL nor an error,
+            # dump exactly what came back so we can see WHY (empty result, lost
+            # media id, reroute shape, etc.).
+            if not (res.get("cdn_url")):
+                try:
+                    _raw = json.dumps(res, default=str)[:600]
+                except Exception:
+                    _raw = str(res)[:600]
+                self._log(f"[{self.slot_id}] UI-drive non-success res: {_raw}")
+
+            err = res.get("error") or ""
+            if err:
+                el = err.lower()
+                if "gen_error:" in el:
+                    reason = err.split("gen_error:", 1)[-1].strip()
+                    if "unusual_activity" in el:
+                        # Rare on the UI path, but if Flow ever flags it, a short
+                        # cool-off + single-slot spacing is the fix.
+                        try:
+                            self._bridge.hold_account(self.account_email, 300)
+                        except Exception:
+                            pass
+                        return None, (
+                            "🚫 reCAPTCHA flagged UNUSUAL ACTIVITY (rare on the UI path). "
+                            "Paused 5 min. Keep the flow.google.com tab open/visible, use "
+                            "1 parallel slot, and add a small stagger between images."
+                        )
+                    return None, f"⛔ Flow generation error: {reason}"
+                if "no_labs_tab" in el:
+                    return None, "No flow.google.com tab open — open Flow (and a project)."
+                if "no_composer" in el:
+                    return None, ("Flow project not open — open a project in the "
+                                  "flow.google.com tab so the prompt box is visible.")
+                if "generate_disabled" in el:
+                    return None, "Flow's Generate button stayed disabled (still busy) — retrying."
+                if "flow_did_not_accept" in el:
+                    return None, "Flow didn't accept the prompt (Generate click didn't register) — retrying."
+                if "no_result_timeout" in el or "timeout" in el:
+                    return None, "No image came back within the time limit — retrying."
+                return None, f"Bridge error: {err}"
+
+            cdn_url = res.get("cdn_url")
+            media_id = res.get("media_id")
+            if not cdn_url:
+                # An empty result (no url AND no error) means the extension that
+                # served this account fell through to the old token-mint path —
+                # i.e. it has NO EXECUTE_FLOW_UI handler, so it's running an OLD
+                # version. Each Chrome profile/window loads the unpacked
+                # extension independently: reloading it in one profile does NOT
+                # update another. Reload it in THIS account's Chrome.
+                return None, (
+                    "⛔ The Chrome serving this account is running an OLD G-Labs "
+                    "Studio Helper (no UI-drive support). Reload the extension in "
+                    "THAT account's Chrome profile: chrome://extensions → G-Labs "
+                    "Studio Helper → Reload (needs v2.8.1+), then retry."
+                )
+
+            # Same shape the download path expects (media[0].image.imageUrl).
+            data = {
+                "media": [{
+                    "name": media_id,
+                    "image": {"imageUrl": cdn_url},
+                }],
+            }
+            self.jobs_completed += 1
+            return data, None
+        except Exception as e:
+            return None, f"Exception (UI-drive): {str(e)[:300]}"
+        finally:
+            self.is_busy = False
+
+    async def generate_image(self, prompt, model, ratio, references=None, ref_paths=None,
+                             prompt_segments=None):
+        """Generate image via direct API call (token from extension).
+
+        `prompt_segments` (optional) is an ordered list of {type:text|ref} that
+        places references INLINE at their exact position in the prompt (Flow's
+        native format). When present the ogiZ0b prompt slot is built as
+        interleaved text + reference markers; otherwise the flat single-string
+        prompt is used with references appended to the reference slot only.
+        """
+        # UI-drive path: type the prompt + click Flow's real Generate button
+        # (trusted). This is the reliable path that dodges the reCAPTCHA
+        # UNUSUAL_ACTIVITY block the direct POST hits. References are dropped
+        # here (text-only) — the self-contained prompts describe the scene.
+        if getattr(self, "use_ui_drive", True):
+            if ref_paths or prompt_segments:
+                self._log(
+                    f"[{self.slot_id}] ⚠ UI-drive is text-only — "
+                    f"{len(ref_paths or [])} reference image(s) not attached "
+                    f"(the prompt text carries the description)."
+                )
+            return await self._generate_image_ui(prompt, model, ratio)
+
         self.is_busy = True
         try:
             api_model = _resolve_image_model(model)
@@ -857,28 +1087,37 @@ class ExtensionWorker:
             if not project_id:
                 return None, "No project ID available — open a project in flow.google.com"
 
-            # Reference uploads still use the legacy tRPC path (which needs
-            # an access_token). Skip cleanly with a clear log when Flow no
-            # longer hands one out — this preserves plain-text-prompt gen
-            # while the reference-upload migration is pending.
+            # Reference images (character / location consistency) upload
+            # through the `maseQ` batchexecute RPC — cookie-auth via the
+            # extension, no access_token needed. Each upload is cached per
+            # (project, file) so a character photo only uploads once. The
+            # returned media UUIDs are injected into the ogiZ0b reference
+            # slot below.
             media_ids = list(references or [])
             if ref_paths:
-                if not access_token:
+                try:
+                    uploaded = await self._upload_references(project_id, ref_paths)
+                    media_ids.extend(uploaded)
+                except Exception as e:
                     self._log(
-                        f"[{self.slot_id}] ⚠ Reference images requested but "
-                        f"no access_token available (Flow migrated off "
-                        f"NextAuth). Continuing without references — the "
-                        f"prompt-only generation still works."
+                        f"[{self.slot_id}] ⚠ Reference upload failed "
+                        f"({str(e)[:150]}) — continuing without them."
                     )
-                else:
-                    try:
-                        uploaded = await self._upload_references(access_token, project_id, ref_paths)
-                        media_ids.extend(uploaded)
-                    except Exception as e:
-                        self._log(
-                            f"[{self.slot_id}] ⚠ Reference upload failed "
-                            f"({str(e)[:150]}) — continuing without them."
-                        )
+
+            # Positional inline references (Flow-native): map each segment's
+            # file path to its uploaded media id (cache-hit — already uploaded
+            # above via ref_paths). Enables interleaved text+reference prompt.
+            seg_media_map = {}
+            if prompt_segments:
+                for seg in prompt_segments:
+                    if not (isinstance(seg, dict) and seg.get("type") == "ref"):
+                        continue
+                    p = str(seg.get("path") or "").strip()
+                    if p and p not in seg_media_map:
+                        try:
+                            seg_media_map[p] = await self._upload_and_cache_reference(project_id, p)
+                        except Exception:
+                            pass
 
             # NEW FLOW (Dec 2026): Google migrated Flow's image endpoint
             # from the labs.google tRPC + Bearer stack to their internal
@@ -903,13 +1142,51 @@ class ExtensionWorker:
                 # / prompt / seed / UUIDs. Keep the field positions
                 # identical to what Flow sends — a shifted array is
                 # rejected server-side with an opaque parse error.
+                #
+                # Reference images (character / location consistency) live
+                # at position [2] of the inner generation item as a list of
+                # [media_id, None, None, None, 1] entries — None when there
+                # are no references. Verified live against Flow's own
+                # ogiZ0b request: attaching one entry keeps the character,
+                # two entries (character + location) keep both consistent.
+                ref_slot = (
+                    [[mid, None, None, None, 1] for mid in media_ids]
+                    if media_ids else None
+                )
+
+                # Prompt slot [8]: positional inline references (Flow-native)
+                # when we have segments + their media ids — an ordered mix of
+                # text runs ["text"] and reference markers
+                # [None, [[media_id, filename]]]. Falls back to the flat single
+                # string [[[prompt_text]]] for plain prompts / legacy jobs.
+                prompt_slot = [[[prompt_text]]]
+                if prompt_segments and seg_media_map:
+                    parts = []
+                    for seg in prompt_segments:
+                        if not isinstance(seg, dict):
+                            continue
+                        if seg.get("type") == "text":
+                            t = seg.get("text", "")
+                            if t:
+                                parts.append([t])
+                        elif seg.get("type") == "ref":
+                            p = str(seg.get("path") or "").strip()
+                            mid = seg_media_map.get(p)
+                            if mid:
+                                parts.append([None, [[mid, seg.get("name")
+                                                      or os.path.basename(p)]]])
+                    if any(isinstance(x, list) and len(x) == 2 and x[0] is None
+                           for x in parts):
+                        # only use positional form if it actually placed a ref
+                        prompt_slot = [parts]
+
                 payload = [
                     None,
                     [[
-                        None, None, None, seed, aspect_int, api_model, None,
+                        None, None, ref_slot, seed, aspect_int, api_model, None,
                         [None, 22, None, None, None, pid, None, None, None, None,
                          ["<RECAPTCHA_TOKEN>", 1]],
-                        [[[prompt_text]]],
+                        prompt_slot,
                         None, None, None,
                         uuid1, uuid2,
                     ]],
@@ -961,6 +1238,33 @@ class ExtensionWorker:
                         await asyncio.sleep(2)
                         continue
 
+                    # Google embedded a generation error inside the wrb.fr row
+                    # (bot/abuse flag, policy block, etc.). Retrying an
+                    # UNUSUAL_ACTIVITY flag only deepens it — hold the account and
+                    # surface a clear, actionable message instead.
+                    if "gen_error:" in err_lower:
+                        reason = err.split("gen_error:", 1)[-1].strip()
+                        if "unusual_activity" in err_lower:
+                            # NOT an account ban (manual generation still works) —
+                            # it's reCAPTCHA bot-SCORING on the generation action,
+                            # triggered by parallel/rapid automated requests. Brief
+                            # cool-off (10 min) to break the bot-like burst, and tell
+                            # the user the real fix: 1 slot + spacing.
+                            try:
+                                self._bridge.hold_account(self.account_email, 600)
+                            except Exception:
+                                pass
+                            return None, (
+                                "🚫 reCAPTCHA flagged UNUSUAL ACTIVITY on generation "
+                                "(the account is fine — manual gen still works; it's the "
+                                "automated burst that scores as a bot). Paused 10 min. FIX: "
+                                "Settings → set Parallel slots = 1, add a 15–30s stagger, "
+                                "run smaller batches, and keep the flow.google.com tab active "
+                                "(generate one by hand occasionally). 5 parallel tabs on one "
+                                "account is the main trigger."
+                            )
+                        return None, f"⛔ Flow generation error: {reason}"
+
                     # Server-side batchexecute error line (batchexecute_er:401
                     # etc.) means Flow rejected the RPC — treat 401 as an
                     # auth-lost signal so the outer recovery kicks in.
@@ -988,6 +1292,21 @@ class ExtensionWorker:
                 # deeply-nested result tree.
                 result_body = be_result.get("result")
                 if result_body is None:
+                    # Diagnostics: dump exactly what Flow returned so we can tell
+                    # apart a quota/moderation block, a changed response shape, or
+                    # a token problem. (status 200 + null result = Flow accepted
+                    # but produced nothing; non-200 = server rejection.)
+                    try:
+                        _keys = list(be_result.keys())
+                        _status = be_result.get("status")
+                        _raw = json.dumps(be_result, default=str)
+                    except Exception:
+                        _keys, _status, _raw = "?", "?", str(be_result)
+                    self._log(
+                        f"[{self.slot_id}] EMPTY RESULT diag — status={_status} "
+                        f"keys={_keys} refs={len(ref_paths or [])} "
+                        f"promptlen={len(prompt or '')} raw={_raw[:1400]}"
+                    )
                     err_msg = "Empty batchexecute response"
                     break
 
@@ -1091,15 +1410,15 @@ class ExtensionWorker:
             try:
                 if ref_path and sub_mode == "ingredients":
                     ref_media_id = await self._upload_and_cache_reference(
-                        access_token, project_id, ref_path
+                        project_id, ref_path
                     )
                 if start_image_path and sub_mode in ("frames_start", "frames_start_end"):
                     start_media_id = await self._upload_and_cache_reference(
-                        access_token, project_id, start_image_path
+                        project_id, start_image_path
                     )
                 if end_image_path and sub_mode == "frames_start_end":
                     end_media_id = await self._upload_and_cache_reference(
-                        access_token, project_id, end_image_path
+                        project_id, end_image_path
                     )
             except Exception as e:
                 return None, f"Image upload failed: {str(e)[:200]}"
@@ -1742,23 +2061,19 @@ class ExtensionModeManager:
                 self._workers[account_name] = workers
                 self._log(f"[ExtMode] {account_name}: {len(workers)} worker(s) ready.")
 
-                # Ask the extension to open ONE labs.google tab per slot for
-                # this account. Multiple slots sharing a SINGLE tab collide: a
-                # recovery/clean_tracking reload kills the other slots'
-                # in-flight fetches ("Failed to fetch") and Google may generate
-                # a duplicate on the retry (image shows in Flow UI but never
-                # downloads). One tab per slot isolates each slot's scripting
-                # channel, so the user gets clean one-shot downloads WITHOUT
-                # manually opening tabs.
+                # Open ONE Flow tab per slot so slots run in PARALLEL across tabs
+                # (findLabsTab spreads each slot to the least-busy tab). For
+                # UI-drive the extension drives each tab even in the background,
+                # and auto-creates a project in any tab that opened on Flow home.
                 if slots_per_account > 1:
                     try:
                         self._bridge.send_command(
                             "ensure_tabs", account_name, data=slots_per_account
                         )
                         self._log(
-                            f"[ExtMode] Requested {slots_per_account} labs.google "
-                            f"tab(s) for {account_name} (1 per slot) — avoids "
-                            f"same-tab fetch collisions + duplicate images."
+                            f"[ExtMode] Requested {slots_per_account} Flow tab(s) "
+                            f"for {account_name} (1 per slot) — parallel across "
+                            f"tabs; the extension drives them even in the background."
                         )
                     except Exception:
                         pass
@@ -2244,6 +2559,7 @@ class ExtensionModeManager:
             img_result, img_error = await worker.generate_image(
                 prompt, model, ratio,
                 ref_paths=ref_paths if ref_paths else None,
+                prompt_segments=_parse_prompt_segments(job.get("prompt_segments")),
             )
 
             if img_error or not img_result:
@@ -2587,6 +2903,7 @@ class ExtensionModeManager:
                         prompt, model, ratio,
                         references=job.get("reference_media_ids"),
                         ref_paths=ref_paths if ref_paths else None,
+                        prompt_segments=_parse_prompt_segments(job.get("prompt_segments")),
                     )
 
                 if result and not error:

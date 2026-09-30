@@ -64,6 +64,394 @@ function _decTabInFlight(tabId) {
   _tabInFlight[tabId] = Math.max(0, (_tabInFlight[tabId] || 0) - 1);
 }
 
+// Inject a short burst of TRUSTED mouse movement into a Flow tab via the Chrome
+// DevTools Protocol (chrome.debugger). Unlike JS `dispatchEvent` (isTrusted:false,
+// which reCAPTCHA Enterprise ignores), Input.dispatchMouseEvent produces
+// isTrusted:true events, so reCAPTCHA's behavioural collector treats it as a
+// genuine interactive session — raising the score of the token minted right after.
+// Mouse MOVES only (no click) so nothing in the Flow UI is accidentally triggered.
+async function injectTrustedGesture(tabId) {
+  if (tabId == null) return false;
+  let attached = false;
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+    attached = true;
+    let x = 300 + Math.floor(Math.random() * 400);
+    let y = 250 + Math.floor(Math.random() * 260);
+    for (let i = 0; i < 6; i++) {
+      x = Math.max(6, x + Math.floor(Math.random() * 70 - 35));
+      y = Math.max(6, y + Math.floor(Math.random() * 50 - 25));
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x, y,
+      });
+      await new Promise((r) => setTimeout(r, 22 + Math.random() * 45));
+    }
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    if (attached) { try { await chrome.debugger.detach({ tabId }); } catch (e) {} }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Trusted click + UI-drive generation (Flow)
+//
+// The direct batchexecute POST mints its OWN reCAPTCHA token, which Flow's
+// risk model flags as PUBLIC_ERROR_UNUSUAL_ACTIVITY. The ONLY reliable path
+// is to drive Flow's real UI: type the prompt into the composer and click the
+// actual "Start generation" button with a TRUSTED chrome.debugger click, so
+// FLOW's own code mints the token off a genuine interaction. This is the same
+// approach as the standalone flow-batch-extension, ported here per-prompt.
+// ═══════════════════════════════════════════════════════════════════
+
+// Tabs this SW currently holds a debugger session on. Kept attached across
+// clicks so the "…is debugging this browser" banner doesn't flicker per prompt.
+const _dbgAttached = new Set();
+chrome.debugger.onDetach.addListener((src) => { if (src && src.tabId != null) _dbgAttached.delete(src.tabId); });
+chrome.tabs.onRemoved.addListener((tabId) => { _dbgAttached.delete(tabId); });
+
+async function attachDbg(tabId) {
+  if (_dbgAttached.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+  } catch (e) {
+    // A concurrent path (e.g. injectTrustedGesture on the video flow) may
+    // already hold it — treat "already attached" as success.
+    if (!/already attached/i.test(e?.message || "")) throw e;
+  }
+  _dbgAttached.add(tabId);
+}
+
+// A trusted left click at viewport CSS coords (x, y). getBoundingClientRect()
+// centre from the page maps 1:1 to Input.dispatchMouseEvent coordinates.
+async function trustedClick(tabId, x, y) {
+  const send = (type, extra) =>
+    chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent",
+      { type, x, y, button: "left", ...extra });
+  const doClick = async () => {
+    await send("mouseMoved", { buttons: 0 });
+    await send("mousePressed", { clickCount: 1, buttons: 1 });
+    await send("mouseReleased", { clickCount: 1, buttons: 0 });
+  };
+  await attachDbg(tabId);
+  try {
+    await doClick();
+  } catch (e) {
+    // Lost the session (a concurrent detach). Re-attach once and retry.
+    if (/not attached|target.*closed|detached/i.test(e?.message || "")) {
+      _dbgAttached.delete(tabId);
+      await attachDbg(tabId);
+      await doClick();
+    } else {
+      throw e;
+    }
+  }
+}
+
+// Robust trusted click: locate the element with CDP's OWN DOM domain
+// (DOM.getBoxModel) and click its centre. getBoxModel returns coordinates in
+// the SAME space Input.dispatchMouseEvent consumes, so this is correct at ANY
+// page zoom / display scaling (devicePixelRatio) — no coordinate guessing.
+// This is how Puppeteer/Playwright click. Returns the clicked point.
+async function trustedClickSelector(tabId, selector) {
+  await attachDbg(tabId);
+  const doc = await chrome.debugger.sendCommand({ tabId }, "DOM.getDocument", { depth: 0 });
+  const rootId = doc && doc.root && doc.root.nodeId;
+  if (!rootId) throw new Error("no_document_root");
+  const q = await chrome.debugger.sendCommand({ tabId }, "DOM.querySelector", { nodeId: rootId, selector });
+  const nodeId = q && q.nodeId;
+  if (!nodeId) throw new Error("selector_not_found:" + selector);
+  const box = await chrome.debugger.sendCommand({ tabId }, "DOM.getBoxModel", { nodeId });
+  const c = box && box.model && box.model.content;
+  if (!c || c.length < 8) throw new Error("no_box_model");
+  const x = (c[0] + c[2] + c[4] + c[6]) / 4;
+  const y = (c[1] + c[3] + c[5] + c[7]) / 4;
+  const send = (type, extra) =>
+    chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", { type, x, y, button: "left", ...extra });
+  await send("mouseMoved", { buttons: 0 });
+  await send("mousePressed", { clickCount: 1, buttons: 1 });
+  await send("mouseReleased", { clickCount: 1, buttons: 0 });
+  return { x, y };
+}
+
+// Serialize UI-drive per tab — only one prompt may occupy the single Flow
+// composer at a time. Concurrent EXECUTE_FLOW_UI items for the same tab queue
+// behind each other (Flow still generates them in parallel on its side once
+// each has been submitted).
+const _flowUiLocks = new Map();  // tabId → tail promise
+function withFlowUiLock(tabId, fn) {
+  const prev = _flowUiLocks.get(tabId) || Promise.resolve();
+  const run = prev.then(fn, fn);          // run after prev settles (success or failure)
+  _flowUiLocks.set(tabId, run.then(() => {}, () => {}));  // tail never rejects, so the queue survives errors
+  return run;
+}
+
+// Make sure a tab is on a Flow PROJECT (so it HAS a composer). A tab that
+// opened on Flow home has no composer and UI-drive can't type into it — which
+// is why an extra tab sat idle. Navigate such a tab to an EXISTING project URL
+// (reliable even in the background), and wait for it to load. If no project
+// exists anywhere yet, leave it — __glabsFlowUiPrepare then clicks "New project".
+async function ensureTabOnProject(tabId) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch (e) { return; }
+  if (/\/project\//.test(tab.url || "")) return;    // already on a project
+  let proj = null;
+  try {
+    const all = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    proj = all.find((t) => t.id !== tabId && /\/project\//.test(t.url || ""));
+  } catch (e) {}
+  if (!proj || !proj.url) return;                    // nothing to copy; prepare will create one
+  try { await chrome.tabs.update(tabId, { url: proj.url }); } catch (e) { return; }
+  const end = Date.now() + 25000;                    // background tabs load slowly
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 500));
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.status === "complete" && /\/project\//.test(t.url || "")) break;
+    } catch (e) { break; }
+  }
+  await new Promise((r) => setTimeout(r, 1500));      // let Angular hydrate the composer
+}
+
+// ── Injected into Flow's MAIN world: install the ogiZ0b observer (once),
+//    open a project if needed, apply model/aspect via the settings popover,
+//    type the prompt, and return the enabled Generate button's centre so the
+//    background can click it with a trusted event. ──
+async function __glabsFlowUiPrepare(prompt, model, aspect) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+
+  // ---- ogiZ0b observer (idempotent) ----
+  if (!window.__glabsFlow) {
+    const RPC = "ogiZ0b";
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const store = { events: [], requests: [] };
+    window.__glabsFlow = store;
+    const strings = (v, out, depth) => {
+      out = out || []; depth = depth || 0;
+      if (depth > 40 || v == null) return out;
+      if (typeof v === "string") {
+        const t = v.trim();
+        if ((t[0] === "[" || t[0] === "{") && t.length > 1) {
+          try { strings(JSON.parse(t), out, depth + 1); return out; } catch (e) {}
+        }
+        out.push(v);
+      } else if (Array.isArray(v)) { for (const x of v) strings(x, out, depth + 1); }
+      else if (typeof v === "object") { for (const x of Object.values(v)) strings(x, out, depth + 1); }
+      return out;
+    };
+    const reqStrings = (body) => {
+      try {
+        const raw = typeof body === "string" ? body
+          : (body instanceof URLSearchParams ? body.toString() : "");
+        const freq = new URLSearchParams(raw).get("f.req");
+        return freq ? strings(JSON.parse(freq)).filter((s) => s.length > 2 && s.length < 20000) : [];
+      } catch (e) { return []; }
+    };
+    const wrbEntries = (text) => {
+      const found = [];
+      for (const line of String(text || "").split("\n")) {
+        if (!line.startsWith("[[")) continue;
+        try { for (const e of JSON.parse(line)) if (Array.isArray(e) && e[0] === "wrb.fr") found.push(e); } catch (e) {}
+      }
+      return found;
+    };
+    const isOgiz = (url) => {
+      try { return (new URL(url, location.href).searchParams.get("rpcids") || "").split(",").includes(RPC); }
+      catch (e) { return false; }
+    };
+    const onReq = (url, body) => {
+      if (!isOgiz(url)) return;
+      store.requests.push({ ts: Date.now(), prompts: reqStrings(body) });
+      if (store.requests.length > 60) store.requests.shift();
+    };
+    const onResp = (url, body, text, status) => {
+      if (!isOgiz(url)) return;
+      const ev = { ts: Date.now(), prompts: reqStrings(body), status, ok: false, mediaId: null, url: null, reason: null };
+      const entry = wrbEntries(text).find((e) => e[1] === RPC);
+      if (entry && typeof entry[2] === "string" && entry[2].length) {
+        let payload = null; try { payload = JSON.parse(entry[2]); } catch (e) {}
+        const all = strings(payload);
+        ev.mediaId = all.find((s) => UUID.test(s)) || null;
+        ev.url = all.find((s) => /^https:\/\/[^/]*(flow-content\.google|googleusercontent\.com|storage\.googleapis\.com)\//.test(s)) || null;
+        ev.ok = !!ev.mediaId;
+        if (!ev.ok) {
+          const codes = entry[5] ? strings(entry[5]).filter((s) => /ERROR|UNSAFE|QUOTA|LIMIT|UNUSUAL/i.test(s)) : [];
+          ev.reason = codes.join(", ") || "no_media";
+        }
+      } else if (entry) {
+        const codes = strings(entry[5]).filter((s) => /ERROR|UNSAFE|QUOTA|LIMIT|UNUSUAL/i.test(s));
+        ev.reason = codes.join(", ") || ("http_" + status);
+      } else {
+        ev.reason = status ? ("http_" + status) : "no_wrb_fr";
+      }
+      store.events.push(ev);
+      if (store.events.length > 60) store.events.shift();
+    };
+    const O = XMLHttpRequest.prototype.open, S = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) { this.__gu = String(u); return O.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function (b) {
+      if (this.__gu && this.__gu.includes("batchexecute")) {
+        try { onReq(this.__gu, b); } catch (e) {}
+        this.addEventListener("loadend", () => { try { onResp(this.__gu, b, this.responseText, this.status); } catch (e) {} });
+      }
+      return S.apply(this, arguments);
+    };
+    const NF = window.fetch;
+    window.fetch = function (input, init) {
+      const u = String((input && input.url) || input);
+      const r = NF.apply(this, arguments);
+      if (u.includes("batchexecute")) {
+        const b = init && init.body;
+        try { onReq(u, b); } catch (e) {}
+        r.then((x) => x.clone().text().then((t) => onResp(u, b, t, x.status))).catch(() => {});
+      }
+      return r;
+    };
+  }
+
+  const composer = () => document.querySelector('.ProseMirror[contenteditable="true"]');
+  const genBtn = () => document.querySelector('button[aria-label="Start generation"]');
+  const setBtn = () => document.querySelector('button[aria-label="Settings trigger"]');
+  const settingsOpen = () => !!document.querySelector('.cdk-overlay-container [role="radiogroup"]');
+  const waitFor = async (fn, t) => {
+    const end = Date.now() + t;
+    while (Date.now() < end) { const v = fn(); if (v) return v; await sleep(200); }
+    return null;
+  };
+
+  // ensure a project (composer present). Background/just-opened tabs load
+  // slowly (Chrome throttles hidden tabs), so wait for the page to settle
+  // first, then — if this tab landed on Flow home — click "New project".
+  let ed = await waitFor(composer, 8000);
+  if (!ed) {
+    // Find a clickable "New project" affordance (button, link, the home card,
+    // or the top-bar + ). Home tabs render it as a div with role=button.
+    const findNew = () => {
+      const els = [...document.querySelectorAll('button, a, [role="button"], [aria-label]')];
+      return els.find((b) => {
+        if (b.offsetParent === null) return false;               // must be visible
+        const t = (b.innerText || "") + " " + (b.getAttribute("aria-label") || "");
+        return /new project|create project/i.test(t);
+      }) || null;
+    };
+    const nb = await waitFor(findNew, 15000);
+    if (nb) {
+      (nb.closest('button, a, [role="button"]') || nb).click();
+      ed = await waitFor(composer, 25000);   // project load + composer, hidden-tab safe
+    }
+  }
+  if (!ed) return { error: "no_composer" };
+
+  if (settingsOpen()) { const sb = setBtn(); if (sb) sb.click(); await sleep(200); }
+
+  // model + aspect via the settings popover (plain clicks; only Generate needs trust)
+  if (model || aspect) {
+    const sb = await waitFor(setBtn, 8000);
+    if (sb) {
+      if (!settingsOpen()) { sb.click(); await waitFor(settingsOpen, 4000); }
+      const radio = (label) => [...document.querySelectorAll('.cdk-overlay-container button[role="radio"]')]
+        .find((b) => (b.innerText || "").split(/\s+/).includes(label));
+      const choose = async (label) => {
+        const b = await waitFor(() => radio(label), 4000);
+        if (b && b.getAttribute("aria-checked") !== "true") { b.click(); await sleep(150); }
+      };
+      await choose("Image");
+      if (model) {
+        const mBtn = await waitFor(() => document.querySelector('.cdk-overlay-container button[aria-label="Select model family"]'), 4000);
+        const mName = (el) => norm((el && el.innerText) || "").replace(/^[^A-Za-z]+/, "").replace(/\s+[a-z_]+$/, "").trim();
+        if (mBtn && mName(mBtn) !== norm(model)) {
+          mBtn.click(); await sleep(250);
+          const opt = await waitFor(() => [...document.querySelectorAll('.cdk-overlay-container [role="menuitem"]')].find((m) => mName(m) === norm(model)), 4000);
+          if (opt) { opt.click(); await sleep(250); }
+        }
+      }
+      if (aspect) await choose(aspect);
+      await choose("x1");
+      const sbc = setBtn(); if (sbc) sbc.click();
+      await waitFor(() => !settingsOpen(), 4000);
+    }
+  }
+
+  // type the prompt
+  ed = composer(); if (!ed) return { error: "no_composer" };
+  ed.focus();
+  document.execCommand("selectAll");
+  if (prompt) document.execCommand("insertText", false, prompt);
+  else document.execCommand("delete");
+  await sleep(150);
+  if (norm(ed.innerText) !== norm(prompt)) {
+    ed.focus(); document.execCommand("selectAll");
+    document.execCommand("insertText", false, prompt);
+    await sleep(200);
+  }
+
+  // Generate must be enabled (Flow disables it while earlier gens are busy).
+  // Hidden tabs process the input event slower, so allow a generous window.
+  const gb = await waitFor(() => { const b = genBtn(); return b && !b.disabled ? b : null; }, 30000);
+  if (!gb) return { error: "generate_disabled" };
+  try { gb.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (e) {}
+  await sleep(120);
+  const r = gb.getBoundingClientRect();
+  // Rect centre is in CSS pixels. chrome.debugger Input.dispatchMouseEvent needs
+  // DEVICE pixels when the OS/display is scaled (devicePixelRatio > 1), so we
+  // also report dpr — the background tries the CSS coord first, then dpr-scaled.
+  return {
+    ok: true,
+    rect: { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) },
+    dpr: window.devicePixelRatio || 1,
+    sinceTs: Date.now(),
+  };
+}
+
+// ── Injected right after a trusted Generate click: confirm the ogiZ0b request
+//    left the page (Flow accepted the prompt). This is the ONLY part that needs
+//    the composer, so the per-tab lock is held only for this short window —
+//    letting the next slot submit its prompt while this image still generates
+//    (pipelined, like a person typing prompts back-to-back). ──
+async function __glabsFlowUiConfirmRequest(prompt, requestWaitMs, sinceTs) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const store = window.__glabsFlow || { events: [], requests: [] };
+  const want = norm(prompt);
+  const floor = sinceTs - 3000;
+  const hit = (prompts) => (prompts || []).some((p) => {
+    const n = norm(p);
+    return n === want || (n.length > 12 && want.includes(n)) || (want.length > 12 && n.includes(want));
+  });
+  const reqEnd = Date.now() + requestWaitMs;
+  while (Date.now() < reqEnd) {
+    if (store.requests.some((rq) => rq.ts >= floor && hit(rq.prompts))) return { requested: true };
+    if (store.events.some((ev) => ev.ts >= floor && hit(ev.prompts))) return { requested: true };
+    await sleep(250);
+  }
+  return { requested: false };
+}
+
+// ── Injected AFTER the lock is released: wait for THIS prompt's ogiZ0b response
+//    (the observer keeps capturing all responses; we match ours by prompt). Runs
+//    concurrently with other in-flight prompts, so Flow generates them in
+//    parallel on its side. ──
+async function __glabsFlowUiAwaitResult(prompt, resultWaitMs, sinceTs) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const store = window.__glabsFlow || { events: [], requests: [] };
+  const want = norm(prompt);
+  const floor = sinceTs - 3000;
+  const hit = (prompts) => (prompts || []).some((p) => {
+    const n = norm(p);
+    return n === want || (n.length > 12 && want.includes(n)) || (want.length > 12 && n.includes(want));
+  });
+  const resEnd = Date.now() + resultWaitMs;
+  while (Date.now() < resEnd) {
+    const ev = store.events.find((e) => e.ts >= floor && hit(e.prompts));
+    if (ev) return { ok: ev.ok, media_id: ev.mediaId, url: ev.url, reason: ev.reason, status: ev.status };
+    await sleep(300);
+  }
+  return { timeout: true };
+}
+
 // ─── reCAPTCHA readiness cache (30s validity) ───
 const _recaptchaCache = {};  // tabId → { valid: bool, ts: timestamp }
 const _RECAPTCHA_CACHE_TTL = 30000;  // 30 seconds
@@ -435,6 +823,15 @@ async function handleWork(work) {
       const sourcePath = work.source_path || "/";
       const captchaAction = work.recaptcha_action || null;
 
+      // Feed a TRUSTED interaction gesture into the Flow tab right before its
+      // reCAPTCHA token is minted below. Synthetic JS events (dispatchEvent) are
+      // isTrusted:false and reCAPTCHA Enterprise ignores them; chrome.debugger
+      // Input events are isTrusted:true, so reCAPTCHA's behavioural collector
+      // counts them and the freshly-minted token scores like a genuine
+      // interactive session (this is what makes manual/UI generation pass while
+      // the old gesture-less programmatic mint got PUBLIC_ERROR_UNUSUAL_ACTIVITY).
+      if (captchaAction) { try { await injectTrustedGesture(tabId); } catch (_g) {} }
+
       const result = await chrome.scripting.executeScript({
         target: { tabId },
         world: "MAIN",
@@ -487,6 +884,9 @@ async function handleWork(work) {
               if (typeof enterprise.ready === "function") {
                 await new Promise((r) => enterprise.ready(r));
               }
+              // (A trusted chrome.debugger mouse gesture was injected from the
+              // background script just before this executeScript ran, so this
+              // mint carries genuine-interaction evidence.)
               recaptchaToken = await enterprise.execute(siteKey, { action: captchaAction });
               if (!recaptchaToken) return { error: "recaptcha_returned_null" };
             } catch (e) {
@@ -552,6 +952,35 @@ async function handleWork(work) {
                 if (typeof item[2] === "string" && item[2].length) {
                   try { inner = JSON.parse(item[2]); } catch { inner = item[2]; }
                 }
+                if (inner === null || inner === undefined) {
+                  // Flow returned the RPC row with no result. Google often
+                  // embeds the real reason at index 5 as a google.rpc.ErrorInfo
+                  // (e.g. PUBLIC_ERROR_UNUSUAL_ACTIVITY = bot/abuse flag). Detect
+                  // it so the app can react instead of showing "empty response".
+                  let genReason = "";
+                  try {
+                    const s = JSON.stringify(item[5] || "");
+                    const m = s.match(/PUBLIC_ERROR_[A-Z_]+/) ||
+                              s.match(/[A-Z][A-Z_]*ERROR[A-Z_]*/);
+                    if (m) genReason = m[0];
+                  } catch (_e) {}
+                  if (genReason) {
+                    return {
+                      status: resp.status,
+                      error: "gen_error:" + genReason,
+                      raw: text.slice(0, 800),
+                      ok: false,
+                    };
+                  }
+                  return {
+                    status: resp.status,
+                    result: null,
+                    ok: true,
+                    raw: text.slice(0, 2500),
+                    item2type: typeof item[2],
+                    item2len: (typeof item[2] === "string") ? item[2].length : -1,
+                  };
+                }
                 return { status: resp.status, result: inner, ok: true };
               }
               // Server-side error entry: ["er", ...] with an HTTP-like status
@@ -588,6 +1017,102 @@ async function handleWork(work) {
       return;
     } finally {
       _decTabInFlight(selectedTabId2);
+    }
+  }
+
+  // ─── EXECUTE_FLOW_UI: generate one image by DRIVING Flow's real UI ───
+  //     Type the prompt into the composer, set model/aspect in the settings
+  //     popover, then click the actual "Start generation" button with a
+  //     TRUSTED chrome.debugger click. Because Flow's own code mints the
+  //     reCAPTCHA token off that genuine gesture, this passes where the direct
+  //     batchexecute POST hits PUBLIC_ERROR_UNUSUAL_ACTIVITY. The page-side
+  //     observer (installed by __glabsFlowUiPrepare) reports the ogiZ0b result
+  //     so we can return the media id + CDN url the same shape as batchexecute.
+  if (action === "EXECUTE_FLOW_UI") {
+    let tabId = null;
+    let held = false;   // is this request still counted in _tabInFlight?
+    try {
+      tabId = await findLabsTab(account);
+      if (!tabId) { await submitResult(request_id, { error: "no_labs_tab" }); return; }
+      _incTabInFlight(tabId);
+      held = true;
+
+      // If this tab is on Flow home (no composer), move it onto a project so it
+      // can actually generate — this is what makes the EXTRA parallel tab work
+      // instead of sitting idle.
+      await ensureTabOnProject(tabId);
+
+      const prompt = work.prompt || "";
+      const model = work.model || "";
+      const aspect = work.aspect || "";
+
+      // ── Phase 1 (serialized per tab): type the prompt, set model/aspect, click
+      //    Generate, and confirm Flow accepted it. Only THIS occupies the shared
+      //    composer, so the lock — and the tab's in-flight slot — are released as
+      //    soon as the prompt is accepted, letting the next slot submit while
+      //    this image is still generating (pipeline). ──
+      const submitted = await withFlowUiLock(tabId, async () => {
+        const prep = await chrome.scripting.executeScript({
+          target: { tabId }, world: "MAIN", func: __glabsFlowUiPrepare, args: [prompt, model, aspect],
+        });
+        const p = prep && prep[0] && prep[0].result;
+        if (!p || p.error) return { error: p && p.error ? p.error : "prepare_failed" };
+
+        // Trusted click. Primary: CDP DOM.getBoxModel (correct at any zoom /
+        // display scaling). Fallbacks: the CSS rect, then the dpr-scaled rect.
+        const dpr = p.dpr || 1;
+        const clicks = [
+          () => trustedClickSelector(tabId, 'button[aria-label="Start generation"]'),
+          () => trustedClick(tabId, p.rect.x, p.rect.y),
+          () => trustedClick(tabId, Math.round(p.rect.x * dpr), Math.round(p.rect.y * dpr)),
+        ];
+        let confirmed = null;
+        for (let attempt = 0; attempt < clicks.length; attempt++) {
+          try { await clicks[attempt](); } catch (clickErr) { continue; }
+          const conf = await chrome.scripting.executeScript({
+            target: { tabId }, world: "MAIN", func: __glabsFlowUiConfirmRequest,
+            args: [prompt, 9000, p.sinceTs],
+          });
+          confirmed = (conf && conf[0] && conf[0].result) || {};
+          if (confirmed.requested) break;
+        }
+        if (!confirmed || !confirmed.requested) return { error: "flow_did_not_accept" };
+        return { ok: true, sinceTs: p.sinceTs };
+      });
+
+      // Note: the tab stays counted in _tabInFlight through the whole generation
+      // so findLabsTab spreads the NEXT slot to a DIFFERENT tab (multi-tab
+      // parallel). The composer LOCK, however, was released the moment Flow
+      // accepted the prompt — so if two slots do land on the same tab they
+      // pipeline instead of blocking.
+      if (!submitted || submitted.error) {
+        await submitResult(request_id, { ok: false, error: (submitted && submitted.error) || "submit_failed" });
+        return;
+      }
+
+      // ── Phase 2 (concurrent): wait for THIS prompt's result. Other slots'
+      //    prompts wait in parallel — Flow generates them all at once. ──
+      const r = await chrome.scripting.executeScript({
+        target: { tabId }, world: "MAIN", func: __glabsFlowUiAwaitResult,
+        args: [prompt, 230000, submitted.sinceTs],
+      });
+      const res = (r && r[0] && r[0].result) || {};
+      if (res.timeout) { await submitResult(request_id, { ok: false, error: "no_result_timeout" }); return; }
+      if (!res.ok) {
+        const reason = String(res.reason || "").toUpperCase();
+        if (/UNUSUAL/.test(reason)) { await submitResult(request_id, { ok: false, error: "gen_error:PUBLIC_ERROR_UNUSUAL_ACTIVITY" }); return; }
+        await submitResult(request_id, { ok: false, error: "gen_error:" + (reason || "NO_MEDIA") });
+        return;
+      }
+      const cdn = res.url || (res.media_id ? ("https://flow-content.google/image/" + res.media_id) : null);
+      if (!cdn) { await submitResult(request_id, { ok: false, error: "no_media_url" }); return; }
+      await submitResult(request_id, { ok: true, status: res.status || 200, media_id: res.media_id || null, cdn_url: cdn });
+      return;
+    } catch (e) {
+      await submitResult(request_id, { ok: false, error: "execute_flow_ui_threw: " + (e?.message || e) });
+      return;
+    } finally {
+      if (held) _decTabInFlight(tabId);
     }
   }
 
@@ -1373,16 +1898,19 @@ async function handleCommand(cmd) {
         const existing = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
         const toOpen = want - existing.length;
         if (toOpen > 0) {
+          // Open new tabs on an EXISTING project URL so they come up WITH a
+          // composer ready (no "create a project" dance on a hidden tab). Fall
+          // back to Flow home only if no project tab is open yet — the UI-drive
+          // prepare step then creates a project on first use.
+          const proj = existing.find((t) => /\/project\//.test(t.url || ""));
+          const openUrl = (proj && proj.url) ? proj.url : FLOW_ORIGIN;
           for (let i = 0; i < toOpen; i++) {
             try {
-              await chrome.tabs.create({
-                url: FLOW_ORIGIN,
-                active: false,
-              });
+              await chrome.tabs.create({ url: openUrl, active: false });
             } catch {}
           }
           console.log(
-            `[G-Labs Helper] ensure_tabs: opened ${toOpen} tab(s) ` +
+            `[G-Labs Helper] ensure_tabs: opened ${toOpen} tab(s) at ${openUrl} ` +
             `(had ${existing.length}, want ${want})`
           );
           // Let the new tabs load + authenticate, then re-detect so they

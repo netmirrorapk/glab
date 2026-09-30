@@ -144,6 +144,10 @@ def _ensure_db_schema(conn):
         cursor.execute("ALTER TABLE jobs ADD COLUMN progress_step TEXT DEFAULT ''")
     if "progress_poll_count" not in existing_cols:
         cursor.execute("ALTER TABLE jobs ADD COLUMN progress_poll_count INTEGER DEFAULT 0")
+    if "prompt_segments" not in existing_cols:
+        # Ordered [text|ref] segments for positional inline reference markers
+        # (Flow-native format). JSON list; NULL for plain/legacy jobs.
+        cursor.execute("ALTER TABLE jobs ADD COLUMN prompt_segments TEXT")
 
     cursor.execute("UPDATE jobs SET job_type = 'image' WHERE job_type IS NULL OR TRIM(job_type) = ''")
     cursor.execute("UPDATE jobs SET video_model = '' WHERE video_model IS NULL")
@@ -194,6 +198,19 @@ def _ensure_db_schema(conn):
             media_id TEXT,
             uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (project_id, file_path)
+        )
+    ''')
+
+    # Reference library — named character/location photos the user can tag
+    # (@name) in prompts for consistent image generation. `name` is the tag
+    # (unique, lower-cased), `category` is 'character' or 'location', and
+    # `photo_path` is the local file uploaded to Flow (via maseQ) at gen time.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reference_library (
+            name TEXT PRIMARY KEY,
+            category TEXT DEFAULT 'character',
+            photo_path TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
 
@@ -405,6 +422,7 @@ def _normalize_job_payload(
     output_index=None,
     is_retry=False,
     retry_source="",
+    prompt_segments=None,
 ):
     normalized_job_type = str(job_type or "image").strip().lower()
     if normalized_job_type not in ("image", "video", "pipeline"):
@@ -452,6 +470,10 @@ def _normalize_job_payload(
         "output_index": normalized_output_index,
         "is_retry": 1 if is_retry else 0,
         "retry_source": str(retry_source or "").strip(),
+        "prompt_segments_json": (
+            json.dumps(prompt_segments)
+            if prompt_segments else None
+        ),
     }
 
 
@@ -476,6 +498,7 @@ def add_job(
     output_index=None,
     is_retry=False,
     retry_source="",
+    prompt_segments=None,
 ):
     assigned_queue_no = 0
     job_payload = _normalize_job_payload(
@@ -499,6 +522,7 @@ def add_job(
         output_index=output_index,
         is_retry=is_retry,
         retry_source=retry_source,
+        prompt_segments=prompt_segments,
     )
 
     def _op(conn):
@@ -512,9 +536,9 @@ def add_job(
                 id, prompt, job_type, model, aspect_ratio, output_count,
                 video_model, video_sub_mode, video_ratio, video_prompt, video_upscale, video_length, video_output_count,
                 ref_path, ref_paths, start_image_path, end_image_path,
-                queue_no, output_index, is_retry, retry_source, created_at
+                queue_no, output_index, is_retry, retry_source, prompt_segments, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             (
                 job_payload["job_id"],
@@ -538,6 +562,7 @@ def add_job(
                 job_payload["output_index"] if job_payload["output_index"] is not None else assigned_queue_no,
                 job_payload["is_retry"],
                 job_payload["retry_source"],
+                job_payload["prompt_segments_json"],
                 datetime.now(),
             ),
         )
@@ -571,6 +596,7 @@ def add_jobs_bulk(job_specs, progress_cb=None, should_stop=None):
                 output_index=spec.get("output_index"),
                 is_retry=spec.get("is_retry", False),
                 retry_source=spec.get("retry_source", ""),
+                prompt_segments=spec.get("prompt_segments"),
             )
         )
 
@@ -596,9 +622,9 @@ def add_jobs_bulk(job_specs, progress_cb=None, should_stop=None):
                     id, prompt, job_type, model, aspect_ratio, output_count,
                     video_model, video_sub_mode, video_ratio, video_prompt, video_upscale, video_length, video_output_count,
                     ref_path, ref_paths, start_image_path, end_image_path,
-                    queue_no, output_index, is_retry, retry_source, created_at
+                    queue_no, output_index, is_retry, retry_source, prompt_segments, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     job_payload["job_id"],
@@ -622,6 +648,7 @@ def add_jobs_bulk(job_specs, progress_cb=None, should_stop=None):
                     job_payload["output_index"] if job_payload["output_index"] is not None else next_queue_no,
                     job_payload["is_retry"],
                     job_payload["retry_source"],
+                    job_payload["prompt_segments_json"],
                     datetime.now(),
                 ),
             )
@@ -641,7 +668,7 @@ def get_all_jobs():
         "SELECT id, prompt, job_type, model, video_model, queue_no, status, assigned_account, error_message, output_count, video_output_count, "
         "output_path, output_index, is_retry, retry_source, progress_step, progress_poll_count, "
         "aspect_ratio, video_sub_mode, ref_path, ref_paths, start_image_path, video_prompt, "
-        "end_image_path, video_ratio, video_upscale, video_length "
+        "end_image_path, video_ratio, video_upscale, video_length, prompt_segments "
         "FROM jobs ORDER BY queue_no ASC, created_at ASC"
     )
     jobs = cursor.fetchall()
@@ -675,6 +702,7 @@ def get_all_jobs():
             "video_ratio": j[24],
             "video_upscale": j[25],
             "video_length": int(j[26]) if (len(j) > 26 and j[26] is not None) else 10,
+            "prompt_segments": j[27] if len(j) > 27 else None,
         }
         for j in jobs
     ]
@@ -819,6 +847,65 @@ def get_job_model(job_id):
     return ""
 
 
+def get_job_by_id(job_id):
+    """Return a single job's editable fields as a dict, or None."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, prompt, ref_paths, prompt_segments, status, "
+            "output_index, queue_no, job_type FROM jobs WHERE id = ?",
+            (job_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "prompt": row[1], "ref_paths": row[2],
+            "prompt_segments": row[3], "status": row[4],
+            "output_index": row[5], "queue_no": row[6], "job_type": row[7],
+        }
+    finally:
+        conn.close()
+
+
+def regenerate_job(job_id, new_prompt=None, new_ref_paths=None,
+                   new_segments=None, replace_prompt=False, move_to_top=True):
+    """Reset a job to 'pending' so it re-runs, PRESERVING its output_index so the
+    new image overwrites the same file (e.g. 14.jpg). When `replace_prompt` is
+    True, also swap in an edited prompt with freshly-resolved references and
+    positional segments. Unlike the failed-tab retry this does NOT flag the job
+    as a retry, so it stays a normal queue task."""
+    def _op(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT queue_no, output_index FROM jobs WHERE id = ?", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            return 0
+        out_idx = row[1] if row[1] is not None else row[0]
+        sets = [
+            "status = 'pending'", "assigned_account = ''", "error_message = ''",
+            "output_path = ''", "output_index = ?",
+            "progress_step = ''", "progress_poll_count = 0",
+        ]
+        params = [out_idx]
+        if move_to_top:
+            cur.execute("SELECT COALESCE(MIN(queue_no), 1) FROM jobs")
+            sets.append("queue_no = ?")
+            params.append(int(cur.fetchone()[0] or 1) - 1)
+        if replace_prompt:
+            sets.append("prompt = ?")
+            params.append(str(new_prompt or ""))
+            sets.append("ref_paths = ?")
+            params.append(json.dumps(new_ref_paths) if new_ref_paths else None)
+            sets.append("prompt_segments = ?")
+            params.append(json.dumps(new_segments) if new_segments else None)
+        params.append(job_id)
+        cur.execute("UPDATE jobs SET " + ", ".join(sets) + " WHERE id = ?", params)
+        return 1
+    return int(_run_write(_op) or 0)
+
+
 def retry_failed_jobs_to_top(job_updates, retry_source="failed_tab"):
     updates = []
     for item in list(job_updates or []):
@@ -836,9 +923,6 @@ def retry_failed_jobs_to_top(job_updates, retry_source="failed_tab"):
 
     def _op(conn):
         cursor = conn.cursor()
-        cursor.execute("SELECT COALESCE(MIN(queue_no), 1) FROM jobs")
-        min_queue_no = int(cursor.fetchone()[0] or 1)
-        next_queue_no = min_queue_no - len(updates)
         updated = 0
 
         for item in updates:
@@ -852,7 +936,11 @@ def retry_failed_jobs_to_top(job_updates, retry_source="failed_tab"):
 
             original_queue_no = row[0]
             original_output_index = row[1]
+            # The job's canonical NUMBER = its output_index (e.g. 82). Retrying
+            # sends it back to that exact slot: same queue position (so it shows
+            # as #82) AND same output_index (so the saved file is 82.jpg).
             preserved_output_index = original_output_index if original_output_index is not None else original_queue_no
+            preserved_queue_no = preserved_output_index
 
             cursor.execute(
                 """
@@ -874,11 +962,10 @@ def retry_failed_jobs_to_top(job_updates, retry_source="failed_tab"):
                     item["prompt"],
                     preserved_output_index,
                     item["retry_source"],
-                    next_queue_no,
+                    preserved_queue_no,
                     item["job_id"],
                 ),
             )
-            next_queue_no += 1
             updated += 1
 
         return updated
@@ -1219,6 +1306,107 @@ def clear_ref_media_cache(project_id=None):
         )
     else:
         _run_write(lambda conn: conn.execute("DELETE FROM ref_media_cache"))
+
+
+# ── Reference library (named @character / @location photos) ────────────────
+
+def _normalize_ref_name(name):
+    """Tag names are matched case-insensitively and stored lower-cased,
+    with any leading '@' stripped. Whitespace collapses to single spaces."""
+    n = str(name or "").strip().lstrip("@").strip().lower()
+    return " ".join(n.split())
+
+
+def add_reference(name, category, photo_path):
+    """Add or update a named reference. `category` is 'character' or
+    'location'. Returns the normalized name that was stored."""
+    norm = _normalize_ref_name(name)
+    if not norm:
+        raise ValueError("Reference name cannot be empty")
+    cat = str(category or "character").strip().lower()
+    if cat not in ("character", "location"):
+        cat = "character"
+    _run_write(
+        lambda conn: conn.execute(
+            '''
+            INSERT INTO reference_library (name, category, photo_path)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                category = excluded.category,
+                photo_path = excluded.photo_path
+            ''',
+            (norm, cat, str(photo_path or "")),
+        )
+    )
+    return norm
+
+
+def get_references(category=None):
+    """List references (optionally filtered by category) as dicts:
+    {name, category, photo_path}."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        if category:
+            cursor.execute(
+                "SELECT name, category, photo_path FROM reference_library "
+                "WHERE category = ? ORDER BY name ASC",
+                (str(category).strip().lower(),),
+            )
+        else:
+            cursor.execute(
+                "SELECT name, category, photo_path FROM reference_library "
+                "ORDER BY category ASC, name ASC"
+            )
+        return [
+            {"name": r[0], "category": r[1], "photo_path": r[2]}
+            for r in cursor.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def get_reference_by_name(name):
+    """Return one reference dict by (normalized) name, or None."""
+    norm = _normalize_ref_name(name)
+    if not norm:
+        return None
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, category, photo_path FROM reference_library WHERE name = ?",
+            (norm,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"name": row[0], "category": row[1], "photo_path": row[2]}
+    finally:
+        conn.close()
+
+
+def delete_reference(name):
+    """Delete a reference by (normalized) name."""
+    norm = _normalize_ref_name(name)
+    if not norm:
+        return
+    _run_write(
+        lambda conn: conn.execute(
+            "DELETE FROM reference_library WHERE name = ?", (norm,)
+        )
+    )
+
+
+def delete_all_references():
+    """Remove every reference from the library. Returns the count deleted."""
+    def _op(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM reference_library")
+        n = int(cur.fetchone()[0] or 0)
+        cur.execute("DELETE FROM reference_library")
+        return n
+    return _run_write(_op)
 
 
 # Initialize on import

@@ -1557,7 +1557,7 @@ class SidebarNav(QFrame):
         self.lbl_title = QLabel("G-Labs\nAutomation")
         self.lbl_title.setObjectName("sidebarTitle")
         title_layout.addWidget(self.lbl_title)
-        self.lbl_byline = QLabel("by MegaShoeb")
+        self.lbl_byline = QLabel("by Shaniyal Malik")
         self.lbl_byline.setObjectName("sidebarByline")
         title_layout.addWidget(self.lbl_byline)
         root.addWidget(title_wrap)
@@ -2088,7 +2088,7 @@ class MainWindow(QMainWindow):
         self.current_pipe_ref_paths = []
         self.bulk_panels = {}
 
-        saved_slots = max(1, min(40, get_int_setting("slots_per_account", 5)))
+        saved_slots = max(1, min(40, get_int_setting("slots_per_account", 2)))
         self._mode_tab_scrolls = {}
 
         self.mode_tabs = QTabWidget()
@@ -2188,6 +2188,14 @@ class MainWindow(QMainWindow):
             self.btn_add_to_queue.setText("+  Add to Queue")
         self.btn_add_to_queue.setFixedHeight(34)
         self.btn_add_to_queue.clicked.connect(self.add_prompts_to_queue)
+
+        # Reference Library — manage @character / @location photos + defaults
+        # used for character/location consistency in image prompts.
+        self.btn_references = QPushButton("📎  References (@character / @location)")
+        self.btn_references.setFixedHeight(30)
+        self.btn_references.clicked.connect(self._open_reference_library)
+        prompts_layout.addWidget(self.btn_references)
+
         prompts_layout.addWidget(self.btn_add_to_queue)
         self._apply_card_shadow(self.prompts_group, blur=24, y_offset=8)
         self.prompts_input_widget = self.prompts_group
@@ -2224,7 +2232,7 @@ class MainWindow(QMainWindow):
         queue_header.setSectionResizeMode(1, QHeaderView.Stretch)  # Prompt
         queue_header.setSectionResizeMode(2, QHeaderView.Fixed)    # Type
         queue_header.setSectionResizeMode(3, QHeaderView.Fixed)    # Status
-        self.queue_table.setColumnWidth(0, 30)
+        self.queue_table.setColumnWidth(0, 46)  # wide enough for 2-3 digit row numbers (was 30 → "10" elided to "...")
         self.queue_table.setColumnWidth(2, 60)
         self.queue_table.setColumnWidth(3, 80)
         self.queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -5039,7 +5047,7 @@ class MainWindow(QMainWindow):
 
         self.spin_slots_per_account = QSpinBox()
         self.spin_slots_per_account.setRange(1, 40)
-        self.spin_slots_per_account.setValue(max(1, min(40, get_int_setting("slots_per_account", 5))))
+        self.spin_slots_per_account.setValue(max(1, min(40, get_int_setting("slots_per_account", 2))))
         self.spin_slots_per_account.setToolTip(
             "How many generation jobs run in parallel per account. More slots = more RAM and CPU usage."
         )
@@ -11125,6 +11133,15 @@ class MainWindow(QMainWindow):
 
         self.prompts_input.setPlainText(content)
 
+    def _open_reference_library(self):
+        """Open the Reference Library dialog (character/location tags + defaults)."""
+        try:
+            from src.ui.reference_dialog import ReferenceLibraryDialog
+            dlg = ReferenceLibraryDialog(self)
+            dlg.exec()
+        except Exception as exc:
+            self._toast_error("References", f"Could not open Reference Library: {exc}")
+
     def add_prompts_to_queue(self):
         if hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == 4:
             self._toast_info("Use Pipeline Add Button", "Use the Pipeline tab's 'Add All to Queue' button.")
@@ -11151,16 +11168,37 @@ class MainWindow(QMainWindow):
             return
         
         prompts = [p.strip() for p in text.split('\n') if p.strip()]
+
+        # For IMAGE jobs, resolve @character/@location tags (with global
+        # defaults for untagged lines) into per-prompt reference photos, and
+        # strip the tags out of the prompt text. See reference_resolver.
+        _is_image_job = current_settings["job_type"] == "image"
+        _missing_tags = set()
+        if _is_image_job:
+            from src.core.reference_resolver import resolve_prompt_references
+
         job_specs = []
         for prompt_text in prompts:
+            spec_prompt = prompt_text
+            spec_ref_paths = current_settings.get("ref_paths")
+            spec_segments = None
+            if _is_image_job:
+                resolved = resolve_prompt_references(prompt_text)
+                spec_prompt = resolved["clean_prompt"] or prompt_text
+                if resolved["ref_paths"]:
+                    spec_ref_paths = resolved["ref_paths"]
+                # positional inline reference markers (Flow-native format)
+                spec_segments = resolved.get("segments")
+                _missing_tags.update(resolved["missing_tags"])
             job_specs.append({
                 "job_id": str(uuid.uuid4()),
-                "prompt": prompt_text,
+                "prompt": spec_prompt,
+                "prompt_segments": spec_segments,
                 "model": current_settings["model"],
                 "aspect_ratio": current_settings["aspect_ratio"],
                 "output_count": current_settings["output_count"],
                 "ref_path": current_settings["ref_path"],
-                "ref_paths": current_settings.get("ref_paths"),
+                "ref_paths": spec_ref_paths,
                 "job_type": current_settings["job_type"],
                 "video_model": current_settings["video_model"],
                 "video_sub_mode": current_settings["video_sub_mode"],
@@ -11185,6 +11223,12 @@ class MainWindow(QMainWindow):
                 f"[CREDITS] Estimated cost: ~{estimate} credits for {len(prompts)} prompt(s) x {current_settings['video_output_count']} output(s)"
             )
         success_logs.append(f"Added {len(prompts)} prompts to queue.")
+        if _missing_tags:
+            success_logs.append(
+                "[REFERENCES] ⚠ Unknown tag(s) ignored: "
+                + ", ".join("@" + t for t in sorted(_missing_tags))
+                + " — add them in the References panel."
+            )
         self._start_bulk_queue_add(
             job_specs,
             success_logs=success_logs,
@@ -11227,24 +11271,130 @@ class MainWindow(QMainWindow):
 
     def show_queue_context_menu(self, position):
         from PySide6.QtWidgets import QMenu
+        index = self.queue_table.indexAt(position)
+        if not index.isValid():
+            selected_rows = self.queue_table.selectionModel().selectedRows()
+            index = selected_rows[0] if selected_rows else None
+        row = index.row() if (index is not None and index.isValid()) else -1
+
         menu = QMenu()
+        regen_action = menu.addAction("♻  Regenerate this image")
+        edit_action = menu.addAction("✎  Edit prompt && regenerate")
+        menu.addSeparator()
         remove_action = menu.addAction("Remove Selected Task")
         action = menu.exec(self.queue_table.viewport().mapToGlobal(position))
-        
+
+        if row < 0 or action is None:
+            return
         if action == remove_action:
-            index = self.queue_table.indexAt(position)
-            if not index.isValid():
-                selected_rows = self.queue_table.selectionModel().selectedRows()
-                index = selected_rows[0] if selected_rows else None
-            if index is not None and index.isValid():
-                row = index.row()
-                job_id = self.queue_model.job_id_at(row)
-                from src.db.db_manager import delete_job
-                self._start_background_task(
-                    delete_job,
-                    job_id,
-                    on_finished=lambda _result, job_id=job_id: self._on_manual_job_removed(job_id),
-                )
+            job_id = self.queue_model.job_id_at(row)
+            from src.db.db_manager import delete_job
+            self._start_background_task(
+                delete_job,
+                job_id,
+                on_finished=lambda _result, job_id=job_id: self._on_manual_job_removed(job_id),
+            )
+        elif action == regen_action:
+            self._regenerate_queue_row(row)
+        elif action == edit_action:
+            self._edit_queue_row(row)
+
+    # ── Per-job regenerate / edit (queue context menu) ──────────────
+
+    def _after_regenerate(self, msg):
+        self.append_log(f"[REGEN] {msg}")
+        self.load_queue_table()
+        if not (self.queue_manager and self.queue_manager.isRunning()):
+            self.append_log("[REGEN] Click Start to run the regenerated task(s).")
+
+    def _regenerate_queue_row(self, row):
+        job_id = self.queue_model.job_id_at(row)
+        if not job_id:
+            return
+        from src.db.db_manager import regenerate_job
+        self._start_background_task(
+            regenerate_job,
+            job_id,
+            on_finished=lambda _r: self._after_regenerate(
+                "Marked task for regeneration (same image will be overwritten)."
+            ),
+        )
+
+    def _reconstruct_tagged_prompt(self, job):
+        """Rebuild an @tagged prompt from the stored positional segments so the
+        user edits references naturally. Falls back to the stored clean prompt."""
+        import json as _json
+        segs = job.get("prompt_segments")
+        if isinstance(segs, str) and segs.strip():
+            try:
+                segs = _json.loads(segs)
+            except Exception:
+                segs = None
+        if not segs or not isinstance(segs, list):
+            return job.get("prompt") or ""
+        from src.db import db_manager as _db
+        by_key = {}
+        for r in _db.get_references():
+            p = r.get("photo_path") or ""
+            if p:
+                by_key[os.path.normpath(p).lower()] = r["name"]
+                by_key[os.path.basename(p).lower()] = r["name"]
+        parts = []
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") == "ref":
+                path = seg.get("path", "") or ""
+                nm = (by_key.get(os.path.normpath(path).lower())
+                      or by_key.get(os.path.basename(path).lower())
+                      or os.path.splitext(seg.get("name", "") or "")[0])
+                parts.append("@" + nm)
+            else:
+                parts.append(seg.get("text", "") or "")
+        return "".join(parts).strip() or (job.get("prompt") or "")
+
+    def _edit_queue_row(self, row):
+        from PySide6.QtWidgets import QInputDialog
+        from src.db.db_manager import get_job_by_id, regenerate_job
+        job_id = self.queue_model.job_id_at(row)
+        if not job_id:
+            return
+        job = get_job_by_id(job_id)
+        if not job:
+            self._toast_warning("Not found", "Could not load that task.")
+            return
+        tagged = self._reconstruct_tagged_prompt(job)
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Edit prompt & regenerate",
+            "Edit the prompt (use @tags for references). It will re-run and "
+            "overwrite the same image:",
+            tagged,
+        )
+        if not ok:
+            return
+        text = (text or "").strip()
+        if not text:
+            self._toast_warning("Empty prompt", "Prompt cannot be empty.")
+            return
+        try:
+            from src.core.reference_resolver import resolve_prompt_references
+            resolved = resolve_prompt_references(text)
+            clean = resolved["clean_prompt"] or text
+            ref_paths = resolved["ref_paths"]
+            segments = resolved.get("segments")
+        except Exception:
+            clean, ref_paths, segments = text, None, None
+        self._start_background_task(
+            regenerate_job,
+            job_id,
+            new_prompt=clean,
+            new_ref_paths=ref_paths,
+            new_segments=segments,
+            replace_prompt=True,
+            on_finished=lambda _r: self._after_regenerate(
+                "Prompt edited — task marked for regeneration."
+            ),
+        )
 
     def _on_manual_job_removed(self, job_id):
         self.append_log("Removed job manually.")

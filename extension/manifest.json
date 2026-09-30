@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "G-Labs Studio Helper",
-  "version": "2.7.0",
+  "version": "2.8.5",
   "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image/video generation (Flow + Genspark + Grok + Dola)",
   "permissions": [
     "tabs",
