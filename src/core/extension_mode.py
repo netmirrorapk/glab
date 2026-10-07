@@ -228,8 +228,10 @@ def _resolve_image_ratio(ratio_name):
 def _resolve_image_model_ui(model_name):
     """Map a model (UI name OR resolved API enum) to the exact label Flow's
     model dropdown shows, for the UI-drive path. Verified live against Flow's
-    'Select model family' menu: 'Nano Banana Pro', 'Nano Banana 2',
-    'Nano Banana 2 Lite'. Empty string = leave Flow's current selection."""
+    'Select model family' menu: 'Nano Banana Pro', 'Nano Banana 2.1',
+    'Nano Banana 2 Lite' (Flow renamed the standard model 'Nano Banana 2' ->
+    'Nano Banana 2.1' on 2026-10-07). Empty string = leave Flow's current
+    selection. Old 'Nano Banana 2' / NARWHAL inputs map to the current 2.1."""
     raw = str(model_name or "").strip()
     lower = raw.lower()
     # API enums (from _resolve_image_model)
@@ -238,11 +240,11 @@ def _resolve_image_model_ui(model_name):
     if raw in ("HARBOR_SEAL",) or ("lite" in lower and "nano banana" in lower):
         return "Nano Banana 2 Lite"
     if raw in ("NARWHAL",) or "nano banana" in lower:
-        return "Nano Banana 2"
+        return "Nano Banana 2.1"
     # Imagen and anything unknown → default to the standard model.
     if "imagen" in lower:
-        return "Nano Banana 2"
-    return "Nano Banana 2"
+        return "Nano Banana 2.1"
+    return "Nano Banana 2.1"
 
 
 def _resolve_image_ratio_ui(ratio_name):
@@ -2353,7 +2355,7 @@ class ExtensionModeManager:
             return None
 
         bucket_to_name = {
-            "standard": "Nano Banana 2",
+            "standard": "Nano Banana 2.1",
             "lite": "Nano Banana 2 Lite",
             "pro": "Nano Banana Pro",
         }
@@ -2378,8 +2380,8 @@ class ExtensionModeManager:
         # first, Pro (premium) last.
         rotation_map = {
             "standard": ["Nano Banana 2 Lite", "Nano Banana Pro"],
-            "lite":     ["Nano Banana 2",      "Nano Banana Pro"],
-            "pro":      ["Nano Banana 2",      "Nano Banana 2 Lite"],
+            "lite":     ["Nano Banana 2.1",    "Nano Banana Pro"],
+            "pro":      ["Nano Banana 2.1",    "Nano Banana 2 Lite"],
         }
         candidates = rotation_map.get(current_bucket, [])
 
@@ -2412,7 +2414,7 @@ class ExtensionModeManager:
             if account_email:
                 self._log(
                     f"[ExtMode] ⛔ Account {account_email}: ALL 3 IMAGE "
-                    f"MODELS have hit quota (Nano Banana 2, Nano Banana 2 "
+                    f"MODELS have hit quota (Nano Banana 2.1, Nano Banana 2 "
                     f"Lite, Nano Banana Pro). Account is out for the current "
                     f"6-hour quota window. Use a different account; this "
                     f"one will become usable again automatically as Google's "
@@ -2422,7 +2424,7 @@ class ExtensionModeManager:
                     self.qm.signals.show_warning.emit(
                         f"Account '{account_email}' has exhausted ALL 3 image "
                         f"model quotas.\n\n"
-                        f"• Nano Banana 2 — quota reached\n"
+                        f"• Nano Banana 2.1 — quota reached\n"
                         f"• Nano Banana 2 Lite — quota reached\n"
                         f"• Nano Banana Pro — quota reached\n\n"
                         f"Use a different account for now. Quotas will reset "
@@ -2489,7 +2491,7 @@ class ExtensionModeManager:
             return requested_model
 
         bucket_to_name = {
-            "standard": "Nano Banana 2",
+            "standard": "Nano Banana 2.1",
             "lite": "Nano Banana 2 Lite",
             "pro": "Nano Banana Pro",
         }
@@ -2502,8 +2504,8 @@ class ExtensionModeManager:
         # pick the first sibling that is still live.
         rotation_map = {
             "standard": ["Nano Banana 2 Lite", "Nano Banana Pro"],
-            "lite":     ["Nano Banana 2",      "Nano Banana Pro"],
-            "pro":      ["Nano Banana 2",      "Nano Banana 2 Lite"],
+            "lite":     ["Nano Banana 2.1",    "Nano Banana Pro"],
+            "pro":      ["Nano Banana 2.1",    "Nano Banana 2 Lite"],
         }
         for cand in rotation_map.get(bucket, []):
             if cand.lower() not in exhausted:

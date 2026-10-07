@@ -3463,11 +3463,11 @@ class MainWindow(QMainWindow):
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self.img_cmb_model = self._create_setting_combo([
-            ("Nano Banana 2", "Nano Banana 2"),
+            ("Nano Banana 2.1", "Nano Banana 2.1"),
             ("Nano Banana 2 Lite", "Nano Banana 2 Lite"),
             ("Nano Banana Pro", "Nano Banana Pro"),
             ("Imagen 4", "Imagen 4"),
-        ], current_data="Nano Banana 2")
+        ], current_data="Nano Banana 2.1")
         self.img_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
             ("Standard (4:3)", "Standard (4:3)"),
@@ -3990,7 +3990,7 @@ class MainWindow(QMainWindow):
         self.pipe_cmb_img_model = self._create_setting_combo([
             ("Imagen 4", "Imagen 4"),
             ("Nano Banana Pro", "Nano Banana Pro"),
-            ("Nano Banana 2", "Nano Banana 2"),
+            ("Nano Banana 2.1", "Nano Banana 2.1"),
             ("Nano Banana 2 Lite", "Nano Banana 2 Lite"),
         ], current_data="Imagen 4")
         self.pipe_cmb_img_ratio = self._create_setting_combo([
@@ -6760,7 +6760,7 @@ class MainWindow(QMainWindow):
             # image model. Show a distinct banner so the user knows to switch
             # accounts; it auto-clears on the next successful generation.
             return True, "🚫 Quota Exhausted", (
-                "All image models (Nano Banana 2 / Lite / Pro) hit their "
+                "All image models (Nano Banana 2.1 / Lite / Pro) hit their "
                 "per-account quota. Resets in ~6h — use another account meanwhile."
             )
 
@@ -11660,7 +11660,7 @@ class MainWindow(QMainWindow):
             self._runtime_auth_status[account_name] = "quota_exhausted"
             self.append_log(
                 f"[{account_name}] 🚫 Quota exhausted — all image models "
-                f"({message or 'Nano Banana 2 / Lite / Pro'}) hit their limit. "
+                f"({message or 'Nano Banana 2.1 / Lite / Pro'}) hit their limit. "
                 f"This account is paused; other accounts keep running. "
                 f"Quotas reset within ~6h."
             )
